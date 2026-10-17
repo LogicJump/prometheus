@@ -11,6 +11,7 @@ import { loadMemory } from "./memory.ts";
 import { SUBAGENT_TOOLS, ALL_TOOLS } from "./tools/index.ts";
 import { loadProjectInstructions } from "./instructions.ts";
 import { captureBefore } from "./checkpoints.ts";
+import { loadHooks, hooksFor, runHooks, type Hook } from "./hooks.ts";
 
 const MAX_RETRIES = 3;
 
@@ -38,6 +39,8 @@ export class Agent {
   onBeforeMutate: ((toolName: string, input: Record<string, unknown>) => void) | null = null;
   /** Mutable so MCP tools can be added after startup. */
   private tools: Tool[];
+  /** Hooks loaded at construction (PreToolUse can veto a tool). */
+  private hooks: Hook[] = [];
   private readonly permissions: Permissions;
   private readonly isSubagent: boolean;
   private abortController: AbortController | null = null;
@@ -64,6 +67,7 @@ export class Agent {
       this.messages.push({ role: "system", content: this.systemPrompt() });
     }
     this.ui.setModelName?.(config.model);
+    if (!isSubagent) this.hooks = loadHooks(process.cwd());
   }
 
   /** Replace the system prompt (mode or model changed mid-session). */
@@ -119,6 +123,15 @@ Prefer dedicated file tools over bash for reading and editing. Use bash for buil
 Use the remember tool for durable facts about the user or project. Do not save transient task state.
 ${memory ? `\n# Existing memory\n${memory}` : ""}
 ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""}`;
+  }
+
+  /** Fire the session-lifecycle hooks; callers do not await the Stop hook. */
+  async fireSessionHooks(event: "SessionStart" | "Stop", extra: Record<string, unknown> = {}): Promise<void> {
+    const hooks = hooksFor(this.hooks, event);
+    if (hooks.length === 0) return;
+    const results = await runHooks(hooks, event, extra, process.cwd());
+    const noise = results.map((result) => result.output).filter(Boolean).join("\n");
+    if (noise) this.ui.dim(`[${event}] ${noise}`);
   }
 
   /** Add tools at runtime (MCP servers connect after the first turn may start). */
@@ -301,6 +314,21 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       /* diff snapshots must never block a tool */
     }
 
+    // User hooks run before the permission check so a guard script can veto a
+    // tool even in auto mode.
+    const preHooks = hooksFor(this.hooks, "PreToolUse", name);
+    if (preHooks.length > 0) {
+      const results = await runHooks(preHooks, "PreToolUse", { tool: name, input }, process.cwd());
+      const blocked = results.find((result) => result.blocked);
+      if (blocked) {
+        const reason = blocked.output || `hook exited with code ${blocked.code}`;
+        this.ui.toolEnd(name, false, `blocked by hook: ${reason.slice(0, 120)}`);
+        return { content: `Error: a PreToolUse hook blocked this call: ${reason}` };
+      }
+      const noise = results.map((result) => result.output).filter(Boolean).join("\n");
+      if (noise) this.ui.toolOutput?.(name, noise);
+    }
+
     const ctx: ToolContext = {
       cwd: process.cwd(),
       signal,
@@ -315,6 +343,12 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       const result = await tool.execute(input, ctx);
       this.ui.toolEnd(name, !result.isError, result.display ?? "");
       this.ui.toolOutput?.(name, result.content);
+      const postHooks = hooksFor(this.hooks, "PostToolUse", name);
+      if (postHooks.length > 0) {
+        const results = await runHooks(postHooks, "PostToolUse", { tool: name, input, output: result.content }, process.cwd());
+        const noise = results.map((entry) => entry.output).filter(Boolean).join("\n");
+        if (noise) this.ui.toolOutput?.(name, noise);
+      }
       return { content: result.isError ? `Error: ${result.content}` : result.content };
     } catch (err) {
       const message = (err as Error).message ?? String(err);

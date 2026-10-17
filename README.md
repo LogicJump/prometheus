@@ -206,3 +206,20 @@ npx tsc --noEmit # type check (requires typescript installed
 
 The tests spin up a local fake `/chat/completions` server, so they run offline
 and never spend tokens.
+
+## Hooks
+
+`~/.prometheus/hooks.json` or `<workspace>/.prometheus/hooks.json` can run
+local commands around agent activity. Each hook receives a JSON payload on
+stdin; a failing `PreToolUse` hook blocks the tool and its output is returned to
+the model as the reason.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{ "matcher": "^bash$", "command": "./scripts/guard.sh" }],
+    "PostToolUse": [{ "command": "npm run lint --silent" }],
+    "Stop": [{ "command": "echo turn finished" }]
+  }
+}
+```

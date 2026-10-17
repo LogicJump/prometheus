@@ -372,6 +372,7 @@ async function runPrompt(text) {
     emitChanges();
     send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
     void emitGitStatus();
+    void agent?.fireSessionHooks("Stop", { sessionId });
   }
 }
 
@@ -401,6 +402,7 @@ async function handle(cmd) {
       send({ type: "ready" });
       void emitGitStatus();
       void startMcp();
+      void agent?.fireSessionHooks("SessionStart", { sessionId });
       void refreshCatalog(false);
       return;
     }
