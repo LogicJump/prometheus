@@ -906,11 +906,61 @@ svg {
 /* ---------- transcript ---------- */
 
 .transcript {
+  position: relative;
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 32px 0 16px;
   min-height: 0;
+}
+
+.find-bar {
+  position: sticky;
+  top: 0;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -24px auto 8px;
+  padding: 5px 8px;
+  width: min(520px, calc(100% - 32px));
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+}
+
+.transcript.with-workbench .find-bar {
+  margin: 6px 16px 8px;
+}
+
+.find-bar input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12.5px;
+}
+
+.find-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+mark.find-hit {
+  background: rgba(232, 160, 90, 0.32);
+  color: inherit;
+  border-radius: 2px;
+}
+
+mark.find-hit.current {
+  background: var(--accent);
+  color: #fff;
 }
 
 .transcript.with-workbench {
@@ -1126,6 +1176,15 @@ svg {
 
 .tool-row.running .tool-glyph {
   color: var(--accent);
+}
+
+.tool-row.openable {
+  cursor: pointer;
+}
+
+.tool-row.openable:hover {
+  background: var(--surface);
+  border-radius: 6px;
 }
 
 .tool-row.failed .tool-glyph,

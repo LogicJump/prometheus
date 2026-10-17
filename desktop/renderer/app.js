@@ -110,6 +110,7 @@ function applyLocale(locale, { announce = false } = {}) {
   const search = $("session-search");
   search.placeholder = t.searchSessions;
   search.title = t.searchSessions;
+  $("find-input").placeholder = t.findPlaceholder;
   $("theme-button").title = state.theme === "light" ? "Dark" : "Light";
   modelPicker.title = t.refreshModels;
   if (state.sessions.length > 0) renderSessions(state.sessions);
@@ -315,10 +316,22 @@ function addToolRow(name, summary) {
       `<button class="tool-expand" hidden>${escapeHtml(t.details)}</button>` +
       `</div>`,
   );
+  // The summary of a file tool is its path; clicking opens it in the
+  // workbench, like clicking a path in an editor's output pane.
+  if (FILE_TOOLS.has(name) && summary) {
+    node.classList.add("openable");
+    node.title = `${t.openFile}: ${summary}`;
+    node.addEventListener("click", (event) => {
+      if (event.target.closest(".tool-expand")) return;
+      openFile(summary);
+    });
+  }
   state.currentTool = { node, name, summary };
   state.lastToolNode = node;
   return node;
 }
+
+const FILE_TOOLS = new Set(["read_file", "write_file", "edit_file"]);
 
 function lastToolRow() {
   return state.lastToolNode && state.lastToolNode.isConnected ? state.lastToolNode : null;
@@ -397,6 +410,112 @@ function setStatus(key) {
   statusDot.className = `status-dot ${dotKind}`;
   statusText.textContent = statusLabel(key);
 }
+
+/* ---------- in-conversation search ---------- */
+
+const findBar = $("find-bar");
+const findInput = $("find-input");
+let findHits = [];
+let findIndex = 0;
+
+function clearFindMarks() {
+  transcript.querySelectorAll("mark.find-hit").forEach((mark) => {
+    const parent = mark.parentNode;
+    if (!parent) return;
+    parent.replaceChild(document.createTextNode(mark.textContent), mark);
+    parent.normalize();
+  });
+  findHits = [];
+}
+
+function openFind() {
+  findBar.hidden = false;
+  findInput.focus();
+  findInput.select();
+}
+
+function closeFind() {
+  findBar.hidden = true;
+  clearFindMarks();
+  $("find-count").textContent = "";
+  input.focus();
+}
+
+/**
+ * Highlight every literal occurrence of `query` in the transcript. Only text
+ * nodes are touched, so markup and tool rows survive.
+ */
+function runFind() {
+  clearFindMarks();
+  const query = findInput.value.trim();
+  if (!query) {
+    $("find-count").textContent = "";
+    return;
+  }
+  const needle = query.toLowerCase();
+  const walker = document.createTreeWalker(transcriptScroll, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => {
+      if (!node.nodeValue || !node.nodeValue.toLowerCase().includes(needle)) return NodeFilter.FILTER_REJECT;
+      const parent = node.parentElement;
+      if (!parent || parent.closest(".find-bar, .empty-state, script, style")) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const targets = [];
+  while (walker.nextNode()) targets.push(walker.currentNode);
+
+  for (const node of targets) {
+    const text = node.nodeValue;
+    const fragment = document.createDocumentFragment();
+    let from = 0;
+    for (;;) {
+      const at = text.toLowerCase().indexOf(needle, from);
+      if (at < 0) {
+        fragment.appendChild(document.createTextNode(text.slice(from)));
+        break;
+      }
+      if (at > from) fragment.appendChild(document.createTextNode(text.slice(from, at)));
+      const mark = document.createElement("mark");
+      mark.className = "find-hit";
+      mark.textContent = text.slice(at, at + needle.length);
+      fragment.appendChild(mark);
+      findHits.push(mark);
+      from = at + needle.length;
+    }
+    node.parentNode.replaceChild(fragment, node);
+  }
+
+  findIndex = 0;
+  focusFindHit();
+}
+
+function focusFindHit() {
+  findHits.forEach((hit, index) => hit.classList.toggle("current", index === findIndex));
+  const current = findHits[findIndex];
+  if (current) current.scrollIntoView({ block: "center", behavior: "smooth" });
+  $("find-count").textContent = findHits.length === 0 ? t.findNone : `${findIndex + 1}/${findHits.length}`;
+}
+
+function stepFind(delta) {
+  if (findHits.length === 0) return;
+  findIndex = (findIndex + delta + findHits.length) % findHits.length;
+  focusFindHit();
+}
+
+let findTimer = null;
+findInput.addEventListener("input", () => {
+  clearTimeout(findTimer);
+  findTimer = setTimeout(runFind, 120);
+});
+findInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    stepFind(event.shiftKey ? -1 : 1);
+  }
+});
+$("find-next").addEventListener("click", () => stepFind(1));
+$("find-prev").addEventListener("click", () => stepFind(-1));
+$("find-close").addEventListener("click", closeFind);
 
 /* ---------- @ file references ---------- */
 
@@ -1309,6 +1428,10 @@ stopButton.addEventListener("click", () => api.send({ cmd: "abort" }));
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    if (!findBar.hidden) {
+      closeFind();
+      return;
+    }
     if (!settingsDialog.hidden || !shortcutsDialog.hidden) {
       closeModal(settingsDialog);
       closeModal(shortcutsDialog);
@@ -1328,7 +1451,10 @@ document.addEventListener("keydown", (event) => {
   const mod = event.ctrlKey || event.metaKey;
   if (!mod) return;
   const key = event.key.toLowerCase();
-  if (key === "n") {
+  if (key === "f") {
+    event.preventDefault();
+    openFind();
+  } else if (key === "n") {
     event.preventDefault();
     api.send({ cmd: "newSession" });
   } else if (key === "b") {
@@ -1526,6 +1652,7 @@ function openShortcuts() {
   const mod = api.platform === "darwin" ? "⌘" : "Ctrl";
   const rows = [
     [t.shortcutNewChat, `${mod}+N`],
+    [t.shortcutFind, `${mod}+F`],
     [t.shortcutSettings, `${mod}+,`],
     [t.shortcutShortcuts, `${mod}+/`],
     [t.shortcutToggleSidebar, `${mod}+B`],
