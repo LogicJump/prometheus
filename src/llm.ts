@@ -41,6 +41,8 @@ export interface ChatClientOptions {
   apiKey: string;
   model: string;
   maxTokens: number;
+  /** "auto" leaves the endpoint default; low/medium/high are sent as reasoning_effort. */
+  reasoningEffort?: "auto" | "low" | "medium" | "high";
   timeoutMs?: number;
 }
 
@@ -86,6 +88,8 @@ export class ChatClient {
       body.tools = tools;
       body.tool_choice = "auto";
     }
+    const effort = this.options.reasoningEffort;
+    if (effort && effort !== "auto") body.reasoning_effort = effort;
     if (this.stream) body.stream_options = { include_usage: true };
 
     const controller = new AbortController();

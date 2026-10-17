@@ -1,18 +1,30 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Config, PermissionMode } from "./types.ts";
+import type { Config, PermissionMode, ThinkingEffort } from "./types.ts";
 
 const HOME_DIR = join(homedir(), ".prometheus");
 export const CONFIG_HOME = HOME_DIR;
 export const SESSIONS_DIR = join(HOME_DIR, "sessions");
 
 export const DEFAULT_MODEL = "glm-5.3-flash";
-/** Models this deployment is authorized to use. Override with PROMETHEUS_MODELS=a,b. */
-export const ALLOWED_MODELS = (process.env.PROMETHEUS_MODELS ?? "glm-5.3-flash,deepseek-v4.1-flash")
+/**
+ * Optional allowlist. Empty (the default) means "whatever the endpoint
+ * advertises", discovered at startup from GET /models. Set PROMETHEUS_MODELS
+ * to a comma list to restrict the picker anyway.
+ */
+export const ALLOWED_MODELS: string[] = (process.env.PROMETHEUS_MODELS ?? "")
   .split(",")
   .map((m) => m.trim())
   .filter(Boolean);
+
+export function isModelAllowed(model: string): boolean {
+  return ALLOWED_MODELS.length === 0 || ALLOWED_MODELS.includes(model);
+}
+
+export function allowedModelError(model: string): string {
+  return `model "${model}" is not permitted on this deployment. Allowed: ${ALLOWED_MODELS.join(", ")}.`;
+}
 
 interface FileConfig {
   baseUrl?: string;
@@ -20,6 +32,7 @@ interface FileConfig {
   model?: string;
   maxTokens?: number;
   permissionMode?: PermissionMode;
+  thinkingEffort?: ThinkingEffort;
   contextWindow?: number;
   maxTurns?: number;
   allowedDirs?: string[];
@@ -38,6 +51,10 @@ function readJson(path: string): FileConfig {
 
 function validMode(value: string | undefined): PermissionMode | undefined {
   return value === "ask" || value === "auto" || value === "plan" ? value : undefined;
+}
+
+function validEffort(value: string | undefined): ThinkingEffort | undefined {
+  return value === "auto" || value === "low" || value === "medium" || value === "high" ? value : undefined;
 }
 
 export function loadConfig(cli: Partial<Config> = {}): Config {
@@ -61,11 +78,8 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
     "https://api.openai.com/v1"
   ).replace(/\/+$/, "");
   const model = cli.model || process.env.PROMETHEUS_MODEL || file.model || DEFAULT_MODEL;
-  if (!ALLOWED_MODELS.includes(model)) {
-    throw new Error(
-      `model "${model}" is not permitted on this deployment. Allowed: ${ALLOWED_MODELS.join(", ")}. ` +
-        `Set PROMETHEUS_MODELS to change the allowlist.`,
-    );
+  if (!isModelAllowed(model)) {
+    throw new Error(`${allowedModelError(model)} Set PROMETHEUS_MODELS to change the allowlist.`);
   }
 
   const config: Config = {
@@ -78,6 +92,11 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
       validMode(process.env.PROMETHEUS_PERMISSION_MODE) ??
       file.permissionMode ??
       "ask",
+    thinkingEffort:
+      validEffort(cli.thinkingEffort) ??
+      validEffort(process.env.PROMETHEUS_THINKING_EFFORT) ??
+      validEffort(file.thinkingEffort) ??
+      "auto",
     contextWindow: cli.contextWindow ?? file.contextWindow ?? 1_000_000,
     maxTurns: cli.maxTurns ?? file.maxTurns ?? 60,
     allowedDirs: cli.allowedDirs ?? file.allowedDirs ?? [],

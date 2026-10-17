@@ -13,6 +13,7 @@ import { listSessions, loadSession, newSessionId, saveSession, type SessionFile 
 import { CONFIG_HOME, ALLOWED_MODELS } from "./config.ts";
 import { compactForce } from "./context.ts";
 import { ALL_TOOLS } from "./tools/index.ts";
+import { discoverModels } from "./models.ts";
 
 export interface ReplOptions {
   config: Config;
@@ -22,7 +23,9 @@ export interface ReplOptions {
 const HELP = `${style.bold("Commands")}
   /help                show this help
   /model [name]        show or switch the model
+  /models [refresh]    list models advertised by the endpoint
   /mode [ask|auto|plan] show or switch the permission mode
+  /effort [auto|low|medium|high] show or switch thinking effort
   /plan                shortcut for /mode plan
   /yolo                shortcut for /mode auto (no confirmation prompts)
   /clear               reset the conversation
@@ -58,6 +61,7 @@ export class Repl {
       apiKey: this.config.apiKey,
       model: this.config.model,
       maxTokens: this.config.maxTokens,
+      reasoningEffort: this.config.thinkingEffort,
       timeoutMs: 300_000,
     });
     this.rl = readline.createInterface({
@@ -67,7 +71,7 @@ export class Repl {
       historySize: 500,
       completer: (line: string) => {
         const commands = [
-          "/help", "/model", "/mode", "/plan", "/yolo", "/clear", "/compact", "/cost",
+          "/help", "/model", "/models", "/mode", "/effort", "/plan", "/yolo", "/clear", "/compact", "/cost",
           "/context", "/sessions", "/resume", "/memory", "/init", "/exit",
         ];
         if (!line.startsWith("/")) return [[], line];
@@ -115,6 +119,7 @@ export class Repl {
 
   async start(): Promise<void> {
     this.printBanner();
+    void this.listModels(false);
 
     this.rl.on("SIGINT", () => {
       if (this.agent.busy) {
@@ -234,8 +239,12 @@ export class Repl {
         return;
       case "model":
         if (!arg) {
-          this.ui.info(`model: ${this.config.model}\nallowed: ${ALLOWED_MODELS.join(", ")}\nbase URL: ${this.config.baseUrl}`);
-        } else if (!ALLOWED_MODELS.includes(arg)) {
+          const source = this.catalogSource ? `\nmodels (${this.catalogSource})` : "";
+          this.ui.info(
+            `model: ${this.config.model}\nbase URL: ${this.config.baseUrl}` +
+              `${source}\nallowed: ${ALLOWED_MODELS.length ? ALLOWED_MODELS.join(", ") : "all advertised by the endpoint"}`,
+          );
+        } else if (!ALLOWED_MODELS.includes(arg) && ALLOWED_MODELS.length > 0) {
           this.ui.error(`model "${arg}" is not permitted. Allowed: ${ALLOWED_MODELS.join(", ")}`);
         } else {
           this.config = { ...this.config, model: arg };
@@ -243,6 +252,9 @@ export class Repl {
           this.rebuildAgent();
           this.ui.dim(`model set to ${arg}`);
         }
+        return;
+      case "models":
+        await this.listModels(arg === "refresh");
         return;
       case "mode": {
         const mode = arg as Config["permissionMode"];
@@ -253,6 +265,17 @@ export class Repl {
         this.config = { ...this.config, permissionMode: mode };
         this.rebuildAgent();
         this.ui.dim(`mode set to ${mode}`);
+        return;
+      }
+      case "effort": {
+        const level = arg as Config["thinkingEffort"];
+        if (!["auto", "low", "medium", "high"].includes(level)) {
+          this.ui.info(`thinking effort: ${this.config.thinkingEffort} (use /effort auto|low|medium|high)`);
+          return;
+        }
+        this.config = { ...this.config, thinkingEffort: level };
+        this.client.options.reasoningEffort = level;
+        this.ui.dim(`thinking effort set to ${level}`);
         return;
       }
       case "plan":
@@ -317,6 +340,29 @@ export class Repl {
       default:
         this.ui.warn(`unknown command: /${cmd} - try /help`);
     }
+  }
+
+  private catalogSource = "";
+
+  private async listModels(refresh: boolean): Promise<void> {
+    const catalog = await discoverModels(this.config.baseUrl, this.config.apiKey, { force: refresh });
+    this.catalogSource = catalog.source;
+    if (catalog.models.length === 0) {
+      this.ui.warn("no models were advertised by the endpoint");
+      return;
+    }
+    const lines = catalog.models.map((model) => {
+      const mark = model.id === this.config.model ? style.green("●") : style.gray("○");
+      const meta = [
+        model.contextLength ? `${Math.round(model.contextLength / 1000)}K ctx` : "",
+        model.supportsReasoning ? "reasoning" : "",
+        model.supportsVision ? "vision" : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return `  ${mark} ${style.cyan(model.id)}${meta ? `  ${style.dim(meta)}` : ""}`;
+    });
+    this.ui.info(`${style.bold("Models")} ${style.dim(`(${catalog.source})`)}\n${lines.join("\n")}\n\nSwitch with /model <id>`);
   }
 
   private async initProject(): Promise<void> {

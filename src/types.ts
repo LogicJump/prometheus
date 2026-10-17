@@ -1,6 +1,7 @@
 /** Shared types for the Prometheus agent runtime. */
 
 export type PermissionMode = "ask" | "auto" | "plan";
+export type ThinkingEffort = "auto" | "low" | "medium" | "high";
 
 export interface Config {
   baseUrl: string;
@@ -8,6 +9,7 @@ export interface Config {
   model: string;
   maxTokens: number;
   permissionMode: PermissionMode;
+  thinkingEffort: ThinkingEffort;
   contextWindow: number;
   maxTurns: number;
   /** Extra directories the agent may touch outside cwd. */

@@ -11,110 +11,149 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="app">
-      <header class="titlebar">
-        <div class="brand">
-          <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M12 2.5c3.2 2.4 4.9 5.6 4.9 9.2 0 2.2-.7 4.1-1.9 5.6l-3-1.6-3 1.6a8.6 8.6 0 0 1-1.9-5.6c0-3.6 1.7-6.8 4.9-9.2Z" />
-            <path d="M12 9.4c1.1 1 1.7 2.2 1.7 3.7 0 1-.3 1.8-.8 2.5l-.9-.5-.9.5a4.5 4.5 0 0 1-.8-2.5c0-1.5.6-2.7 1.7-3.7Z" opacity=".55" />
-          </svg>
-          <span class="wordmark">Prometheus</span>
-        </div>
-
-        <button class="workspace" id="workspace-button" title="Change workspace folder">
-          <span class="workspace-label">Workspace</span>
-          <span class="workspace-path" id="workspace-path">…</span>
-        </button>
-
-        <div class="titlebar-spacer"></div>
-
-        <div class="titlebar-status">
-          <span class="status-dot" id="status-dot"></span>
-          <span class="status-text" id="status-text">starting</span>
-        </div>
-
-        <button class="icon-button" id="clear-button" title="Clear conversation (new session)">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12" /></svg>
-        </button>
-        <button class="icon-button" id="sessions-button" title="Sessions">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
-        </button>
-      </header>
-
-      <main class="transcript" id="transcript" aria-live="polite">
-        <section class="empty-state" id="empty-state">
-          <h1>What should we build?</h1>
-          <p>Prometheus reads, edits, and runs your code. It asks before changing files unless you switch the mode.</p>
-          <div class="suggestions">
-            <button class="suggestion" data-prompt="Summarize this project and list the main entry points.">
-              Summarize this project
-            </button>
-            <button class="suggestion" data-prompt="Find failing tests and fix them. Verify with the project's test command.">
-              Fix the failing tests
-            </button>
-            <button class="suggestion" data-prompt="Create a PROMETHEUS.md describing how this project is built, tested, and organized.">
-              Document the repo
-            </button>
-          </div>
-        </section>
-      </main>
-
-      <section class="composer-region" id="composer-region">
-        <div class="pending-permission" id="pending-permission" hidden>
-          <div class="pending-question" id="pending-question"></div>
-          <div class="pending-actions">
-            <button class="btn btn-primary" data-permission="yes">Allow</button>
-            <button class="btn" data-permission="always">Always allow</button>
-            <button class="btn btn-quiet" data-permission="no">Deny</button>
+    <div class="shell">
+      <!-- Sidebar: sessions, workspace, settings (Claude Desktop / Codex layout) -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-head">
+          <div class="brand">
+            <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 2.5c3.2 2.4 4.9 5.6 4.9 9.2 0 2.2-.7 4.1-1.9 5.6l-3-1.6-3 1.6a8.6 8.6 0 0 1-1.9-5.6c0-3.6 1.7-6.8 4.9-9.2Z" />
+              <path d="M12 9.4c1.1 1 1.7 2.2 1.7 3.7 0 1-.3 1.8-.8 2.5l-.9-.5-.9.5a4.5 4.5 0 0 1-.8-2.5c0-1.5.6-2.7 1.7-3.7Z" opacity=".55" />
+            </svg>
+            <span class="wordmark">Prometheus</span>
           </div>
         </div>
 
-        <div class="composer">
-          <textarea
-            id="input"
-            rows="1"
-            placeholder="Ask Prometheus to change, explain, or build something…"
-            spellcheck="false"
-          ></textarea>
-          <div class="composer-actions">
-            <button class="stop-button" id="stop-button" hidden title="Stop (Esc)">Stop</button>
-            <button class="send-button" id="send-button" title="Send (Enter)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m0 0-6 6m6-6 6 6" /></svg>
-            </button>
-          </div>
+        <div class="sidebar-actions">
+          <button class="new-chat" id="new-session">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+            <span data-i18n="newSession">New chat</span>
+          </button>
         </div>
 
-        <footer class="composer-footer">
-          <div class="controls">
-            <div class="segmented" id="mode-control" role="radiogroup" aria-label="Permission mode">
-              <button role="radio" data-mode="ask" class="active">Ask</button>
-              <button role="radio" data-mode="auto">Auto</button>
-              <button role="radio" data-mode="plan">Plan</button>
+        <button class="workspace-card" id="workspace-button" title="Change workspace folder">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h6l2 2h10v10H3z" /></svg>
+          <span class="workspace-copy">
+            <span class="workspace-label" data-i18n="workspace">Workspace</span>
+            <span class="workspace-path" id="workspace-path">…</span>
+          </span>
+        </button>
+
+        <div class="sidebar-section-head">
+          <span data-i18n="sessions">Sessions</span>
+          <button class="icon-button small" id="refresh-sessions" title="Refresh">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6M20 20v-6h-6" /><path d="M4.5 15a8 8 0 0 0 14-3M19.5 9a8 8 0 0 0-14 3" /></svg>
+          </button>
+        </div>
+        <nav class="session-list" id="session-list" aria-label="Sessions"></nav>
+
+        <div class="sidebar-foot">
+          <div class="locale-switch" id="locale-switch" role="group" aria-label="Language">
+            <button data-locale="en" title="English">EN</button>
+            <button data-locale="zh" title="中文">中文</button>
+          </div>
+          <button class="icon-button small" id="theme-button" title="Toggle theme">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6l1.4 1.4m10 10 1.4 1.4m0-12.8-1.4 1.4m-10 10L5.6 18.4" /><circle cx="12" cy="12" r="3.2" /></svg>
+          </button>
+        </div>
+      </aside>
+
+      <!-- Main column -->
+      <div class="main">
+        <header class="topbar">
+          <button class="icon-button" id="sidebar-toggle" title="Toggle sidebar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
+          </button>
+          <div class="topbar-title" id="topbar-title" data-i18n="appName">Prometheus</div>
+          <div class="titlebar-spacer"></div>
+          <div class="titlebar-status">
+            <span class="status-dot" id="status-dot"></span>
+            <span class="status-text" id="status-text" data-i18n="statusStarting">starting</span>
+          </div>
+          <button class="icon-button" id="clear-button" title="Clear conversation">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12" /></svg>
+          </button>
+        </header>
+
+        <main class="transcript" id="transcript" aria-live="polite">
+          <section class="empty-state" id="empty-state">
+            <svg class="empty-mark" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 2.5c3.2 2.4 4.9 5.6 4.9 9.2 0 2.2-.7 4.1-1.9 5.6l-3-1.6-3 1.6a8.6 8.6 0 0 1-1.9-5.6c0-3.6 1.7-6.8 4.9-9.2Z" />
+            </svg>
+            <h1 data-i18n="emptyTitle">What should we build?</h1>
+            <p data-i18n="emptyBody">Prometheus reads, edits, and runs your code. It asks before changing files unless you switch the mode.</p>
+            <div class="suggestions">
+              <button class="suggestion" data-prompt-key="suggestionSummarizePrompt" data-i18n="suggestionSummarize" data-prompt="Summarize this project and list the main entry points.">
+                Summarize this project
+              </button>
+              <button class="suggestion" data-prompt-key="suggestionFailingTestsPrompt" data-i18n="suggestionFailingTests" data-prompt="Find failing tests and fix them. Verify with the project's test command.">
+                Fix the failing tests
+              </button>
+              <button class="suggestion" data-prompt-key="suggestionDocumentPrompt" data-i18n="suggestionDocument" data-prompt="Create a PROMETHEUS.md describing how this project is built, tested, and organized.">
+                Document the repo
+              </button>
             </div>
-            <div class="segmented model-control" id="model-control" role="radiogroup" aria-label="Model"></div>
+          </section>
+        </main>
+
+        <section class="composer-region" id="composer-region">
+          <div class="pending-permission" id="pending-permission" hidden>
+            <div class="pending-question" id="pending-question"></div>
+            <div class="pending-actions">
+              <button class="btn btn-primary" data-permission="yes" data-i18n="allow">Allow</button>
+              <button class="btn" data-permission="always" data-i18n="alwaysAllow">Always allow</button>
+              <button class="btn btn-quiet" data-permission="no" data-i18n="deny">Deny</button>
+            </div>
           </div>
-          <div class="meter">
-            <span id="context-label">0%</span>
-            <div class="meter-track"><div class="meter-fill" id="context-fill"></div></div>
-            <span class="meter-sep"></span>
-            <span id="usage-label">0 tok</span>
+
+          <div class="composer">
+            <textarea
+              id="input"
+              rows="1"
+              placeholder="Ask Prometheus to change, explain, or build something…"
+              spellcheck="false"
+            ></textarea>
+            <div class="composer-actions">
+              <button class="stop-button" id="stop-button" data-i18n="stop" hidden title="Stop (Esc)">Stop</button>
+              <button class="send-button" id="send-button" title="Send (Enter)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m0 0-6 6m6-6 6 6" /></svg>
+              </button>
+            </div>
           </div>
-        </footer>
-      </section>
+
+          <footer class="composer-footer">
+            <div class="controls">
+              <div class="segmented" id="mode-control" role="radiogroup" aria-label="Permission mode">
+                <button role="radio" data-mode="ask" class="active" data-i18n="modeAsk">Ask</button>
+                <button role="radio" data-mode="auto" data-i18n="modeAuto">Auto</button>
+                <button role="radio" data-mode="plan" data-i18n="modePlan">Plan</button>
+              </div>
+              <div class="segmented effort-control" id="effort-control" role="radiogroup" aria-label="Thinking effort">
+                <span class="segment-label" data-i18n="effortLabel">Thinking</span>
+                <button role="radio" data-effort="auto" class="active" data-i18n="effortAuto">Auto</button>
+                <button role="radio" data-effort="low" data-i18n="effortLow">Low</button>
+                <button role="radio" data-effort="medium" data-i18n="effortMedium">Med</button>
+                <button role="radio" data-effort="high" data-i18n="effortHigh">High</button>
+              </div>
+              <div class="model-control" id="model-control">
+                <button class="model-picker" id="model-picker" aria-haspopup="listbox" aria-expanded="false">
+                  <span id="model-label" data-i18n="loadingModels">loading models…</span>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+                </button>
+                <div class="model-menu" id="model-menu" role="listbox" hidden></div>
+              </div>
+            </div>
+            <div class="meter">
+              <span id="context-label">0%</span>
+              <div class="meter-track"><div class="meter-fill" id="context-fill"></div></div>
+              <span class="meter-sep"></span>
+              <span id="usage-label">0 tok</span>
+            </div>
+          </footer>
+        </section>
+      </div>
     </div>
 
-    <aside class="drawer" id="drawer" hidden>
-      <div class="drawer-head">
-        <h2>Sessions</h2>
-        <button class="icon-button" id="drawer-close" title="Close">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
-        </button>
-      </div>
-      <button class="btn btn-block" id="new-session">New session</button>
-      <div class="session-list" id="session-list"></div>
-    </aside>
-
-    <div class="scrim" id="scrim" hidden></div>
 
     <script type="module" src="app.js"></script>
   </body>

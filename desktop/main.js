@@ -10,7 +10,7 @@ import { createInterface } from "node:readline";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const HOST = join(here, "host.js");
-const cliArgs = process.argv.slice(2).filter((arg) => !arg.startsWith("-psn"));
+const cliArgs = process.argv.slice(2).filter((arg) => !arg.startsWith("-psn") && !arg.startsWith("--user-data-dir"));
 
 if (process.env.PROMETHEUS_DEBUG_ARGV) {
   try {
@@ -157,10 +157,19 @@ function startWindow() {
   };
 
   win.webContents.on("did-finish-load", () => {
+    if (process.env.PROMETHEUS_SCREENSHOT) {
+      try {
+        require("node:fs").appendFileSync(
+          `${process.env.PROMETHEUS_SCREENSHOT}.log`,
+          `did-finish-load ${new Date().toISOString()}\n`,
+        );
+      } catch {
+        /* ignore */
+      }
+    }
     sendToHost({ cmd: "init", cwd: startCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
     if (cliArgs.length > 0) rememberWorkspace(startCwd, true);
   });
-
   win.on("closed", () => {
     host.kill();
   });

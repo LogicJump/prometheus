@@ -1,5 +1,7 @@
 /** Prometheus desktop renderer. */
 
+import { detectLocale, getDict } from "./i18n.js";
+
 const api = window.prometheus;
 
 const $ = (id) => document.getElementById(id);
@@ -12,28 +14,80 @@ const statusDot = $("status-dot");
 const statusText = $("status-text");
 const workspacePath = $("workspace-path");
 const modeControl = $("mode-control");
-const modelControl = $("model-control");
+const effortControl = $("effort-control");
+const modelPicker = $("model-picker");
+const modelMenu = $("model-menu");
+const modelLabel = $("model-label");
 const contextLabel = $("context-label");
 const contextFill = $("context-fill");
 const usageLabel = $("usage-label");
 const pendingPermission = $("pending-permission");
 const pendingQuestion = $("pending-question");
-const drawer = $("drawer");
-const scrim = $("scrim");
 const sessionList = $("session-list");
+const localeSwitch = $("locale-switch");
 
 const state = {
   busy: false,
   mode: "ask",
+  effort: "auto",
   model: "",
-  allowed: [],
+  models: [],
+  modelsSource: "",
   sessionId: "",
+  sessions: [],
+  locale: detectLocale(),
+  theme: localStorage.getItem("prometheus.theme") || "dark",
+  statusKey: "statusStarting",
   currentAssistant: null,
   currentThinking: null,
   currentTool: null,
   lastToolNode: null,
   pendingPermissionId: null,
+  changedFiles: [],
 };
+
+let t = getDict(state.locale);
+
+/* ---------- localization ---------- */
+
+function applyLocale(locale, { announce = false } = {}) {
+  state.locale = locale;
+  t = getDict(locale);
+  localStorage.setItem("prometheus.locale", locale);
+  document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+  document.querySelectorAll("[data-i18n]").forEach((node) => {
+    const value = t[node.dataset.i18n];
+    if (typeof value === "string") node.textContent = value;
+  });
+  document.querySelectorAll("[data-prompt-key]").forEach((node) => {
+    node.dataset.prompt = t[node.dataset.promptKey] || "";
+  });
+  document.querySelectorAll("[data-i18n-title]").forEach((node) => {
+    const value = t[node.dataset.i18nTitle];
+    if (typeof value === "string") node.title = value;
+  });
+  input.placeholder = t.placeholder;
+  sendButton.title = `${t.send} (Enter)`;
+  stopButton.title = `${t.stop} (Esc)`;
+  $("workspace-button").title = t.changeWorkspace;
+  $("clear-button").title = t.clearSession;
+  $("sidebar-toggle").title = t.sessions;
+  $("refresh-sessions").title = t.sessions;
+  $("theme-button").title = state.theme === "light" ? "Dark" : "Light";
+  modelPicker.title = t.refreshModels;
+  if (state.sessions.length > 0) renderSessions(state.sessions);
+  localeSwitch.querySelectorAll("button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.locale === locale);
+  });
+  setStatus(state.statusKey);
+  if (state.models.length > 0) renderModelMenu();
+  if (announce) api.send({ cmd: "setLocale", locale });
+  void announce;
+}
+
+function statusLabel(key) {
+  return t[key] ?? key;
+}
 
 /* ---------- utilities ---------- */
 
@@ -50,8 +104,7 @@ function renderMarkdown(source) {
 
   const flushParagraph = () => {
     if (paragraph.length === 0) return;
-    const text = inline(paragraph.join(" "));
-    out.push(`<p>${text}</p>`);
+    out.push(`<p>${inline(paragraph.join(" "))}</p>`);
     paragraph = [];
   };
 
@@ -76,7 +129,7 @@ function renderMarkdown(source) {
       i++; // closing fence
       out.push(
         `<pre><div class="code-head"><span>${escapeHtml(lang)}</span>` +
-          `<button class="code-copy" data-code>copy</button></div>` +
+          `<button class="code-copy" data-code>${escapeHtml(t.copy)}</button></div>` +
           `<code>${escapeHtml(body.join("\n"))}</code></pre>`,
       );
       continue;
@@ -154,7 +207,6 @@ function addUserTurn(text) {
 }
 
 function addAssistantTurn() {
-  // Keep a comfortable gap between tool activity and the answer that follows.
   const last = transcript.lastElementChild;
   const node = addNode(`<div class="turn assistant"><div class="markdown"></div></div>`);
   if (last && last.classList.contains("tool-row")) node.classList.add("after-tools");
@@ -182,20 +234,20 @@ function bindCodeCopy(root) {
     button.addEventListener("click", async () => {
       const code = button.closest("pre").querySelector("code").textContent;
       await navigator.clipboard.writeText(code);
-      button.textContent = "copied";
-      setTimeout(() => (button.textContent = "copy"), 1200);
+      button.textContent = t.copied;
+      setTimeout(() => (button.textContent = t.copy), 1200);
     });
   });
 }
 
 function addToolRow(name, summary) {
-  const glyph = name === "bash" ? "›" : name === "read_file" || name === "list_files" || name === "grep" || name === "glob" ? "◦" : "✦";
+  const glyph = name === "bash" ? "›" : ["read_file", "list_files", "grep", "glob"].includes(name) ? "◦" : "✦";
   const node = addNode(
     `<div class="tool-row running">` +
       `<span class="tool-glyph">${glyph}</span>` +
       `<span class="tool-name">${escapeHtml(name)}</span>` +
       `<span class="tool-summary">${escapeHtml(summary || "")}</span>` +
-      `<button class="tool-expand" hidden>details</button>` +
+      `<button class="tool-expand" hidden>${escapeHtml(t.details)}</button>` +
       `</div>`,
   );
   state.currentTool = { node, name, summary };
@@ -224,7 +276,7 @@ function attachToolOutput(node, name, output) {
   button.hidden = false;
   button.addEventListener("click", () => {
     outputNode.hidden = !outputNode.hidden;
-    button.textContent = outputNode.hidden ? "details" : "hide";
+    button.textContent = outputNode.hidden ? t.details : t.hide;
     row.classList.toggle("open", !outputNode.hidden);
     if (!outputNode.hidden) outputNode.scrollTop = outputNode.scrollHeight;
   });
@@ -232,7 +284,7 @@ function attachToolOutput(node, name, output) {
 
 function startThinking() {
   if (state.currentThinking) return;
-  state.currentThinking = addNode(`<div class="thinking">thinking…</div>`);
+  state.currentThinking = addNode(`<div class="thinking">${escapeHtml(t.thinking)}</div>`);
 }
 
 function endThinking() {
@@ -253,7 +305,7 @@ function renderPlan(items) {
   if (!items || items.length === 0) return;
   addNode(
     `<div class="plan"><div class="plan-card">` +
-      `<div class="plan-title">Plan</div>` +
+      `<div class="plan-title">${escapeHtml(t.plan)}</div>` +
       items
         .map(
           (item) =>
@@ -271,13 +323,14 @@ function setBusy(busy) {
   state.busy = busy;
   stopButton.hidden = !busy;
   sendButton.disabled = busy;
-  statusDot.className = `status-dot ${busy ? "working" : "ready"}`;
-  statusText.textContent = busy ? "working" : "ready";
+  setStatus(busy ? "statusWorking" : "statusReady");
 }
 
-function setStatus(kind, text) {
-  statusDot.className = `status-dot ${kind}`;
-  statusText.textContent = text;
+function setStatus(key) {
+  state.statusKey = key;
+  const dotKind = key === "statusWorking" || key === "statusConnecting" ? "working" : key.startsWith("statusError") || key === "statusHostStopped" || key === "statusConfigError" ? "error" : "ready";
+  statusDot.className = `status-dot ${dotKind}`;
+  statusText.textContent = statusLabel(key);
 }
 
 function updateMeter(context, usage) {
@@ -289,7 +342,7 @@ function updateMeter(context, usage) {
   }
   if (usage) {
     const total = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
-    usageLabel.textContent = total >= 1000 ? `${(total / 1000).toFixed(1)}k tok` : `${total} tok`;
+    usageLabel.textContent = total >= 1000 ? `${(total / 1000).toFixed(1)}k ${t.tokens}` : `${total} ${t.tokens}`;
   }
 }
 
@@ -300,20 +353,80 @@ function setMode(mode) {
   });
 }
 
-function renderModels(allowed, current) {
-  state.allowed = allowed || [];
+function setEffort(effort) {
+  state.effort = effort;
+  effortControl.querySelectorAll("button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.effort === effort);
+  });
+}
+
+/* ---------- model picker ---------- */
+
+function renderModels(models, current, source) {
+  state.models = models || [];
   state.model = current;
-  modelControl.innerHTML = "";
-  for (const model of state.allowed) {
-    const button = document.createElement("button");
-    button.textContent = model;
-    button.dataset.model = model;
-    button.classList.toggle("active", model === current);
-    button.addEventListener("click", () => {
-      if (model !== state.model) api.send({ cmd: "setModel", model });
-    });
-    modelControl.appendChild(button);
+  state.modelsSource = source || "";
+  if (current) {
+    modelLabel.textContent = current;
+    modelPicker.classList.remove("unavailable");
   }
+  if (!modelMenu.hidden) renderModelMenu();
+}
+function renderModelMenu() {
+  modelMenu.innerHTML = "";
+  if (state.models.length === 0) {
+    modelMenu.innerHTML = `<div class="model-empty">${escapeHtml(t.modelsUnavailable)}</div>`;
+    return;
+  }
+  for (const model of state.models) {
+    const option = document.createElement("button");
+    option.className = `model-option${model.id === state.model ? " active" : ""}`;
+    option.setAttribute("role", "option");
+    option.setAttribute("aria-selected", String(model.id === state.model));
+    const meta = [
+      model.contextLength ? `${formatContext(model.contextLength)}` : "",
+      model.supportsReasoning ? "reasoning" : "",
+      model.supportsVision ? "vision" : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    option.innerHTML =
+      `<span class="model-id">${escapeHtml(model.id)}</span>` +
+      (model.name && model.name !== model.id ? `<span class="model-name">${escapeHtml(model.name)}</span>` : "") +
+      (meta ? `<span class="model-meta">${escapeHtml(meta)}</span>` : "");
+    option.addEventListener("click", () => {
+      api.send({ cmd: "setModel", model: model.id });
+      closeModelMenu();
+    });
+    modelMenu.appendChild(option);
+  }
+  const footer = document.createElement("button");
+  footer.className = "model-refresh";
+  footer.textContent = t.refreshModels;
+  footer.addEventListener("click", () => {
+    modelMenu.innerHTML = `<div class="model-empty">${escapeHtml(t.loadingModels)}</div>`;
+    api.send({ cmd: "refreshModels" });
+  });
+  modelMenu.appendChild(footer);
+}
+
+function formatContext(value) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1)}M`;
+  if (value >= 1000) return `${Math.round(value / 1000)}K`;
+  return String(value);
+}
+
+function openModelMenu() {
+  renderModelMenu();
+  modelMenu.hidden = false;
+  modelPicker.setAttribute("aria-expanded", "true");
+  const active = modelMenu.querySelector(".model-option.active");
+  if (active) active.scrollIntoView({ block: "center" });
+}
+
+function closeModelMenu() {
+  modelMenu.hidden = true;
+  modelPicker.setAttribute("aria-expanded", "false");
 }
 
 /* ---------- host events ---------- */
@@ -321,25 +434,36 @@ function renderModels(allowed, current) {
 function handleEvent(message) {
   switch (message.type) {
     case "hello":
-      setStatus("working", "connecting");
+      setStatus("statusConnecting");
       break;
 
     case "ready":
       setBusy(false);
-      setStatus("ready", "ready");
+      if (state.statusKey !== "statusError") setStatus("statusReady");
       break;
 
     case "state":
       state.sessionId = message.sessionId;
+      state.locale = message.locale || state.locale;
+      applyLocale(state.locale);
       setMode(message.mode);
-      renderModels(message.allowedModels, message.model);
+      setEffort(message.effort || "auto");
+      if (Array.isArray(message.models) && message.models.length > 0) {
+        renderModels(message.models, message.model, message.modelsSource);
+      } else if (message.model) {
+        renderModels(state.models, message.model, state.modelsSource);
+      }
       workspacePath.textContent = message.cwd;
       workspacePath.title = message.cwd;
       updateMeter(message.context, message.usage);
       break;
 
-    case "model":
-      renderModels(message.allowed, message.model);
+    case "models":
+      renderModels(message.models, message.model, message.source);
+      break;
+
+    case "locale":
+      applyLocale(message.locale);
       break;
 
     case "run_start":
@@ -430,7 +554,7 @@ function handleEvent(message) {
       endThinking();
       addNode(`<div class="notice error">${escapeHtml(message.message)}</div>`);
       setBusy(false);
-      setStatus("error", "error");
+      setStatus("statusError");
       scrollToBottom();
       break;
 
@@ -440,11 +564,10 @@ function handleEvent(message) {
       setBusy(false);
       updateMeter(message.context, message.usage);
       if (message.files && message.files.length > 0) {
-        const list = message.files
-          .slice(0, 8)
-          .map((f) => `${f.path}`)
-          .join(", ");
-        addNode(`<div class="notice dim">changed ${message.files.length} file${message.files.length === 1 ? "" : "s"}: ${escapeHtml(list)}${message.files.length > 8 ? "…" : ""}</div>`);
+        const list = message.files.slice(0, 8).map((f) => f.path).join(", ");
+        addNode(
+          `<div class="notice dim">${escapeHtml(t.changedFiles(message.files.length, list + (message.files.length > 8 ? "…" : "")))}</div>`,
+        );
       }
       break;
 
@@ -453,22 +576,26 @@ function handleEvent(message) {
       state.currentAssistant = null;
       state.currentThinking = null;
       state.currentTool = null;
+      state.lastToolNode = null;
       for (const item of message.messages || []) {
         if (item.role === "user") addUserTurn(item.text);
         else if (item.role === "assistant") {
           const node = addNode(`<div class="turn assistant"><div class="markdown">${renderMarkdown(item.text)}</div></div>`);
           bindCodeCopy(node);
         } else if (item.role === "tool") {
-          const node = addNode(
+          addNode(
             `<div class="tool-row"><span class="tool-glyph">✦</span><span class="tool-name">${escapeHtml(item.name)}</span>` +
               `<span class="tool-summary">${escapeHtml(item.summary || "")}</span></div>`,
           );
-          void node;
         }
       }
       if ((message.messages || []).length === 0) {
         transcript.appendChild(emptyState);
         emptyState.hidden = false;
+      }
+      if (message.cwd) {
+        workspacePath.textContent = message.cwd;
+        workspacePath.title = message.cwd;
       }
       scrollToBottom(true);
       break;
@@ -477,15 +604,19 @@ function handleEvent(message) {
       renderSessions(message.sessions);
       break;
 
+    case "session_saved":
+      api.send({ cmd: "listSessions" });
+      break;
+
     case "host_exit":
       setBusy(false);
-      setStatus("error", "host stopped");
+      setStatus("statusHostStopped");
       break;
 
     case "fatal":
       setBusy(false);
-      setStatus("error", "config error");
-      addNode(`<div class="notice error">${escapeHtml(message.message)}</div>`);
+      setStatus("statusConfigError");
+      addNode(`<div class="notice error">${escapeHtml(t.configError(message.message))}</div>`);
       break;
 
     default:
@@ -495,35 +626,50 @@ function handleEvent(message) {
 
 /* ---------- sessions ---------- */
 
+function relativeDate(iso) {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const minutes = Math.round((Date.now() - then) / 60000);
+  if (minutes < 1) return state.locale === "zh" ? "刚刚" : "just now";
+  if (minutes < 60) return state.locale === "zh" ? `${minutes} 分钟前` : `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return state.locale === "zh" ? `${hours} 小时前` : `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days === 1) return state.locale === "zh" ? "昨天" : "yesterday";
+  if (days < 7) return state.locale === "zh" ? `${days} 天前` : `${days}d ago`;
+  return new Date(iso).toLocaleDateString(state.locale === "zh" ? "zh-CN" : "en-US");
+}
+
 function renderSessions(sessions) {
+  state.sessions = sessions || [];
   sessionList.innerHTML = "";
-  if (!sessions || sessions.length === 0) {
-    sessionList.innerHTML = `<div class="notice dim" style="padding:0">No saved sessions yet.</div>`;
+  if (state.sessions.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "sidebar-empty";
+    empty.textContent = t.noSessions;
+    sessionList.appendChild(empty);
     return;
   }
-  for (const session of sessions) {
+  for (const session of state.sessions) {
     const button = document.createElement("button");
     button.className = `session-item${session.id === state.sessionId ? " active" : ""}`;
+    const title = session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages;
     button.innerHTML =
-      `<div class="session-title">${escapeHtml(session.summary || "(no messages)")}</div>` +
-      `<div class="session-meta">${escapeHtml(new Date(session.updatedAt).toLocaleString())} · ${escapeHtml(session.id)}</div>`;
+      `<div class="session-title">${escapeHtml(title)}</div>` +
+      `<div class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</div>`;
+    button.title = `${title}\n${session.id}`;
     button.addEventListener("click", () => {
       api.send({ cmd: "loadSession", id: session.id });
-      closeDrawer();
     });
     sessionList.appendChild(button);
   }
 }
 
-function openDrawer() {
-  api.send({ cmd: "listSessions" });
-  drawer.hidden = false;
-  scrim.hidden = false;
-}
-
-function closeDrawer() {
-  drawer.hidden = true;
-  scrim.hidden = true;
+function setTheme(theme) {
+  state.theme = theme;
+  document.documentElement.dataset.theme = theme;
+  localStorage.setItem("prometheus.theme", theme);
+  $("theme-button").title = theme === "light" ? "Dark" : "Light";
 }
 
 /* ---------- composer ---------- */
@@ -555,12 +701,12 @@ stopButton.addEventListener("click", () => api.send({ cmd: "abort" }));
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    if (!pendingPermission.hidden) {
-      answerPermission("no");
+    if (!modelMenu.hidden) {
+      closeModelMenu();
       return;
     }
-    if (!drawer.hidden) {
-      closeDrawer();
+    if (!pendingPermission.hidden) {
+      answerPermission("no");
       return;
     }
     if (state.busy) api.send({ cmd: "abort" });
@@ -569,10 +715,14 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     api.send({ cmd: "newSession" });
   }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
     event.preventDefault();
-    closeDrawer();
+    toggleSidebar();
   }
+});
+
+document.addEventListener("click", (event) => {
+  if (!modelMenu.hidden && !event.target.closest(".model-control")) closeModelMenu();
 });
 
 function answerPermission(answer) {
@@ -593,25 +743,49 @@ modeControl.querySelectorAll("button").forEach((button) => {
   });
 });
 
+effortControl.querySelectorAll("button").forEach((button) => {
+  button.addEventListener("click", () => {
+    if (button.dataset.effort !== state.effort) api.send({ cmd: "setEffort", effort: button.dataset.effort });
+  });
+});
+
+modelPicker.addEventListener("click", (event) => {
+  event.stopPropagation();
+  if (modelMenu.hidden) openModelMenu();
+  else closeModelMenu();
+});
+
+localeSwitch.querySelectorAll("button").forEach((button) => {
+  button.addEventListener("click", () => {
+    const locale = button.dataset.locale;
+    if (locale !== state.locale) applyLocale(locale, { announce: true });
+  });
+});
+
 $("workspace-button").addEventListener("click", async () => {
   const dir = await api.pickDirectory();
   if (dir) api.send({ cmd: "setCwd", cwd: dir });
 });
 
-$("sessions-button").addEventListener("click", openDrawer);
 $("clear-button").addEventListener("click", () => {
-  if (confirm("Start a new conversation? This session is already saved.")) api.send({ cmd: "newSession" });
+  if (confirm(t.clearConfirm)) api.send({ cmd: "newSession" });
 });
-$("drawer-close").addEventListener("click", closeDrawer);
-scrim.addEventListener("click", closeDrawer);
-$("new-session").addEventListener("click", () => {
-  api.send({ cmd: "newSession" });
-  closeDrawer();
+$("new-session").addEventListener("click", () => api.send({ cmd: "newSession" }));
+$("refresh-sessions").addEventListener("click", () => api.send({ cmd: "listSessions" }));
+
+function toggleSidebar() {
+  document.querySelector(".shell").classList.toggle("collapsed");
+}
+
+$("sidebar-toggle").addEventListener("click", toggleSidebar);
+
+$("theme-button").addEventListener("click", () => {
+  setTheme(state.theme === "light" ? "dark" : "light");
 });
 
 document.querySelectorAll(".suggestion").forEach((button) => {
   button.addEventListener("click", () => {
-    input.value = button.dataset.prompt;
+    input.value = button.dataset.prompt || "";
     autoSize();
     input.focus();
   });
@@ -627,4 +801,8 @@ transcript.addEventListener("click", (event) => {
 
 api.onEvent(handleEvent);
 if (api.platform) document.documentElement.classList.add(`platform-${api.platform}`);
+applyLocale(state.locale);
+setTheme(state.theme);
+api.send({ cmd: "listSessions" });
+api.send({ cmd: "setLocale", locale: state.locale });
 input.focus();

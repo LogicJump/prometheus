@@ -14,13 +14,15 @@
 
 import process from "node:process";
 import { existsSync } from "node:fs";
-import { loadConfig, ALLOWED_MODELS } from "../src/config.ts";
+import { loadConfig, ALLOWED_MODELS, isModelAllowed } from "../src/config.ts";
 import { ChatClient } from "../src/llm.ts";
 import { Agent } from "../src/agent.ts";
 import { Permissions } from "../src/permissions.ts";
 import { ALL_TOOLS } from "../src/tools/index.ts";
 import { listSessions, loadSession, newSessionId, saveSession } from "../src/sessions.ts";
 import { compactForce } from "../src/context.ts";
+import { discoverModels, FALLBACK_MODELS } from "../src/models.ts";
+import { detectLocale, isLocale } from "../src/i18n.ts";
 
 let config;
 let client;
@@ -32,9 +34,37 @@ let cwd = process.cwd();
 let pendingPermissions = new Map();
 let permissionSeq = 0;
 let running = false;
+let locale = detectLocale();
+/** Discovered model catalog; replaced whenever /models is (re)read. */
+let catalog = { models: FALLBACK_MODELS, fetchedAt: new Date().toISOString(), source: "fallback" };
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function pickerModels() {
+  const usable = catalog.models.filter((m) => m.supportsTools);
+  const models = ALLOWED_MODELS.length > 0 ? usable.filter((m) => ALLOWED_MODELS.includes(m.id)) : usable;
+  return models.length > 0 ? models : catalog.models;
+}
+
+function configModelAllowed(model) {
+  return isModelAllowed(model) && pickerModels().some((m) => m.id === model);
+}
+
+async function refreshCatalog(force = false) {
+  if (!config?.baseUrl) return;
+  const next = await discoverModels(config.baseUrl, config.apiKey, { force });
+  catalog = next;
+  // Keep the active model if the endpoint still lists it; otherwise fall back to
+  // the first advertised model so the next turn can actually run.
+  if (config.model && !pickerModels().some((m) => m.id === config.model) && next.models.length > 0) {
+    const replacement = pickerModels()[0].id;
+    config.model = replacement;
+    if (client) client.options.model = replacement;
+    if (agent) agent.refreshSystemPrompt();
+  }
+  send({ type: "models", models: pickerModels(), model: config.model, source: next.source, fetchedAt: next.fetchedAt });
 }
 
 class HostUi {
@@ -44,7 +74,8 @@ class HostUi {
     this.spinner = null;
   }
   setModelName(name) {
-    send({ type: "model", model: name, allowed: ALLOWED_MODELS });
+    // emitState() carries the catalog; this hook only records the active model.
+    this.model = name;
   }
   info(text) {
     send({ type: "notice", level: "info", text });
@@ -113,7 +144,6 @@ class HostUi {
   takeLineDirty() {
     return false;
   }
-  echoUser() {}
 }
 
 const ui = new HostUi();
@@ -152,6 +182,7 @@ function sessionRecord() {
 function persist() {
   try {
     saveSession(sessionRecord());
+    send({ type: "session_saved", sessionId });
   } catch (err) {
     send({ type: "notice", level: "warn", text: `could not save session: ${err.message}` });
   }
@@ -162,9 +193,12 @@ function emitState() {
     type: "state",
     sessionId,
     cwd,
+    locale,
     mode: config.permissionMode,
+    effort: config.thinkingEffort,
     model: config.model,
-    allowedModels: ALLOWED_MODELS,
+    models: pickerModels(),
+    modelsSource: catalog.source,
     baseUrl: config.baseUrl,
     context: agent ? agent.contextUsage() : { tokens: 0, percent: 0 },
     usage: agent ? agent.usage : { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
@@ -213,6 +247,7 @@ function handle(cmd) {
         cwd = cmd.cwd;
         process.chdir(cwd);
       }
+      if (isLocale(cmd.locale)) locale = cmd.locale;
       try {
         config = loadConfig({ permissionMode: cmd.mode });
       } catch (err) {
@@ -224,10 +259,29 @@ function handle(cmd) {
         apiKey: config.apiKey,
         model: config.model,
         maxTokens: config.maxTokens,
+        reasoningEffort: config.thinkingEffort,
         timeoutMs: 300_000,
       });
       createAgent([]);
       send({ type: "ready" });
+      void refreshCatalog(false);
+      return;
+    }
+    case "refreshModels":
+      void refreshCatalog(true);
+      return;
+    case "setEffort": {
+      if (!["auto", "low", "medium", "high"].includes(cmd.effort)) return;
+      config.thinkingEffort = cmd.effort;
+      client.options.reasoningEffort = cmd.effort;
+      emitState();
+      return;
+    }
+    case "setLocale": {
+      if (!isLocale(cmd.locale)) return;
+      locale = cmd.locale;
+      send({ type: "locale", locale });
+      if (config) emitState();
       return;
     }
     case "prompt":
@@ -253,8 +307,16 @@ function handle(cmd) {
       return;
     }
     case "setModel": {
-      if (!ALLOWED_MODELS.includes(cmd.model)) {
-        send({ type: "notice", level: "error", text: `model "${cmd.model}" is not permitted` });
+      if (!configModelAllowed(cmd.model)) {
+        const fallback = pickerModels()[0]?.id;
+        if (fallback) {
+          config.model = fallback;
+          client.options.model = fallback;
+          agent.refreshSystemPrompt();
+          ui.setModelName(fallback);
+          emitState();
+          send({ type: "notice", level: "warn", text: `model "${cmd.model}" is not in the endpoint's tool-capable list; switched to ${fallback}` });
+        }
         return;
       }
       config.model = cmd.model;
@@ -302,8 +364,23 @@ function handle(cmd) {
         cwd = cmd.cwd;
         process.chdir(cwd);
         sessionId = newSessionId();
+        try {
+          config = loadConfig({ permissionMode: config.permissionMode });
+          client = new ChatClient({
+            baseUrl: config.baseUrl,
+            apiKey: config.apiKey,
+            model: config.model,
+            maxTokens: config.maxTokens,
+            reasoningEffort: config.thinkingEffort,
+            timeoutMs: 300_000,
+          });
+        } catch (err) {
+          send({ type: "fatal", message: err.message });
+          return;
+        }
         createAgent([]);
         send({ type: "session_loaded", messages: [], cwd });
+        void refreshCatalog(false);
       }
       return;
     }

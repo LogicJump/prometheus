@@ -13,6 +13,7 @@ const { values, positionals } = parseArgs({
     "base-url": { type: "string" },
     key: { type: "string" },
     mode: { type: "string" },
+    effort: { type: "string" },
     resume: { type: "string", short: "r" },
     "max-tokens": { type: "string" },
     "context-window": { type: "string" },
@@ -33,6 +34,7 @@ Options:
       --base-url <url>        OpenAI-compatible base URL (default: $OPENAI_BASE_URL or https://api.openai.com/v1)
       --key <key>             API key (default: $OPENAI_API_KEY)
       --mode <mode>           ask | auto | plan (default: ask)
+      --effort <level>        thinking effort: auto | low | medium | high
   -r, --resume <session-id>   resume a saved session
       --max-tokens <n>        per-response token cap (default: 16000)
       --context-window <n>    context window for compaction (default: 128000)
@@ -62,6 +64,12 @@ if (mode && mode !== "ask" && mode !== "auto" && mode !== "plan") {
   process.exit(2);
 }
 
+const effort = values.effort;
+if (effort && !["auto", "low", "medium", "high"].includes(effort)) {
+  console.error(`Invalid --effort "${effort}". Use auto, low, medium, or high.`);
+  process.exit(2);
+}
+
 let config;
 try {
   config = loadConfig({
@@ -69,6 +77,7 @@ try {
     baseUrl: values["base-url"],
     apiKey: values.key,
     permissionMode: mode,
+    thinkingEffort: effort,
     maxTokens: values["max-tokens"] ? Number(values["max-tokens"]) : undefined,
     contextWindow: values["context-window"] ? Number(values["context-window"]) : undefined,
     maxTurns: values["max-turns"] ? Number(values["max-turns"]) : undefined,
@@ -98,6 +107,7 @@ if (positionals.length > 0) {
     apiKey: config.apiKey,
     model: config.model,
     maxTokens: config.maxTokens,
+    reasoningEffort: config.thinkingEffort,
     timeoutMs: 300_000,
   });
   const agent = new Agent(config, ui, client, undefined, undefined, session?.messages ?? []);
