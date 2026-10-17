@@ -4,3 +4,7 @@ dist/
 *.log
 .env
 models.json
+release/
+shot-*.png
+release2/
+release-old/

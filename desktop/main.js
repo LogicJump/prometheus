@@ -2,7 +2,8 @@
 
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
@@ -11,7 +12,29 @@ const here = dirname(fileURLToPath(import.meta.url));
 const HOST = join(here, "host.js");
 const cliArgs = process.argv.slice(2).filter((arg) => !arg.startsWith("-psn"));
 
+/** Packaged apps start from a temp extraction dir; remember the user's last workspace instead. */
+function initialWorkspace() {
+  const fromArgs = cliArgs.find((arg) => !arg.startsWith("-") && existsSync(arg));
+  if (fromArgs) return fromArgs;
+  try {
+    const saved = JSON.parse(readFileSync(join(app.getPath("userData"), "workspace.json"), "utf8"));
+    if (saved.cwd && existsSync(saved.cwd)) return saved.cwd;
+  } catch {
+    /* first launch */
+  }
+  return app.isPackaged ? homedir() : process.cwd();
+}
+
+function rememberWorkspace(cwd) {
+  try {
+    writeFileSync(join(app.getPath("userData"), "workspace.json"), JSON.stringify({ cwd }), "utf8");
+  } catch {
+    /* persistence is best-effort */
+  }
+}
+
 function startWindow() {
+  const startCwd = initialWorkspace();
   const win = new BrowserWindow({
     width: 1360,
     height: 880,
@@ -20,6 +43,7 @@ function startWindow() {
     show: false,
     backgroundColor: "#0e0e10",
     title: "Prometheus",
+    icon: join(here, "..", "build", "icon.png"),
     titleBarStyle: "hidden",
     titleBarOverlay:
       process.platform === "win32"
@@ -59,13 +83,14 @@ function startWindow() {
   }
 
   const host = spawn(process.execPath, [HOST], {
-    cwd: process.cwd(),
+    cwd: startCwd,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
 
   const sendToRenderer = (message) => {
+    if (message.type === "state" && message.cwd) rememberWorkspace(message.cwd);
     if (!win.isDestroyed()) win.webContents.send("host-event", message);
   };
 
@@ -88,7 +113,7 @@ function startWindow() {
   };
 
   win.webContents.on("did-finish-load", () => {
-    sendToHost({ cmd: "init", cwd: process.cwd(), mode: process.env.PROMETHEUS_PERMISSION_MODE });
+    sendToHost({ cmd: "init", cwd: startCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
   });
 
   win.on("closed", () => {
@@ -126,11 +151,3 @@ app.whenReady().then(() => {
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
-
-// Allow launching the app with `electron . <cwd>`
-if (cliArgs.length > 0) {
-  const candidate = cliArgs[0];
-  if (existsSync(candidate)) {
-    process.chdir(candidate);
-  }
-}
