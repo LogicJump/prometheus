@@ -141,11 +141,10 @@ function startWindow() {
           await new Promise((resolve) => setTimeout(resolve, 60_000));
         }
         const image = await win.webContents.capturePage();
-        const { writeFileSync } = await import("node:fs");
         writeFileSync(process.env.PROMETHEUS_SCREENSHOT, image.toPNG());
         if (process.env.PROMETHEUS_SCREENSHOT_KEEP) return;
         app.quit();
-      }, prompt ? 1500 : 3500);
+      }, prompt || process.env.PROMETHEUS_DEMO_JS ? 1500 : 3500);
     });
   }
 

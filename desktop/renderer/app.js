@@ -725,6 +725,11 @@ function handleEvent(message) {
     case "ready":
       setBusy(false);
       if (state.statusKey !== "statusError") setStatus("statusReady");
+      if (state.needsSetup) {
+        state.needsSetup = false;
+        $("setup-button").hidden = true;
+        addNode(`<div class="notice dim">${escapeHtml(t.setupBody)}</div>`);
+      }
       break;
 
     case "state":
@@ -986,7 +991,13 @@ function handleEvent(message) {
     case "fatal":
       setBusy(false);
       setStatus("statusConfigError");
-      addNode(`<div class="notice error">${escapeHtml(t.configError(message.message))}</div>`);
+      state.needsSetup = true;
+      $("setup-button").hidden = false;
+      addNode(
+        `<div class="notice error">${escapeHtml(t.configError(message.message))} ` +
+          `<button class="link-button" id="inline-setup">${escapeHtml(t.setupTitle)}</button></div>`,
+      );
+      $("inline-setup")?.addEventListener("click", openSetup);
       break;
 
     default:
@@ -1591,8 +1602,19 @@ function openSettings() {
   openModal(settingsDialog);
 }
 
+/** First-run path: open Settings on the connection fields with a short prompt. */
+function openSetup() {
+  $("models-hint").textContent = t.setupHint;
+  $("models-hint").hidden = false;
+  openSettings();
+  setTimeout(() => $("setting-base-url").focus(), 60);
+}
+
+$("setup-button").addEventListener("click", openSetup);
+
 function fillSettings(s) {
   $("setting-base-url").value = s.baseUrl || "";
+  $("models-hint").hidden = true;
   $("setting-api-key").value = s.apiKeyMasked || "";
   $("setting-api-key").dataset.masked = "1";
   const modelSelect = $("setting-model");
