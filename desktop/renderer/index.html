@@ -43,6 +43,26 @@
             <span class="workspace-path" id="workspace-path">…</span>
           </span>
         </button>
+        <button class="worktree-card" id="worktree-button" title="Isolated worktree">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="6" r="2.2" /><circle cx="7" cy="18" r="2.2" /><circle cx="17" cy="8" r="2.2" /><path d="M7 8.2v7.6M17 10.2c0 3-2.4 4-5 4.4-2.2.3-4 1-4 3.4" /></svg>
+          <span class="workspace-copy">
+            <span class="workspace-label" data-i18n="worktreeLabel">Isolated worktree</span>
+            <span class="workspace-path" id="worktree-state" data-i18n="worktreeOff">Off</span>
+          </span>
+        </button>
+        <div class="worktree-panel" id="worktree-panel" hidden>
+          <p class="worktree-copy" id="worktree-copy" data-i18n="worktreeExplain">
+            Run this session in its own git worktree so your working copy stays untouched.
+          </p>
+          <div class="worktree-actions" id="worktree-actions-off">
+            <button class="btn btn-primary small" id="worktree-enable" data-i18n="worktreeEnable">Start isolated</button>
+          </div>
+          <div class="worktree-actions" id="worktree-actions-on" hidden>
+            <button class="btn small" id="worktree-diff" data-i18n="worktreeDiff">View diff</button>
+            <button class="btn small" id="worktree-merge" data-i18n="worktreeMerge">Merge back</button>
+            <button class="btn btn-quiet small" id="worktree-discard" data-i18n="worktreeDiscard">Discard</button>
+          </div>
+        </div>
 
         <div class="sidebar-section-head">
           <span data-i18n="sessions">Sessions</span>

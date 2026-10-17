@@ -74,6 +74,8 @@ const state = {
   pane: "diff",
   sidebarTab: "files",
   git: null,
+  worktree: null,
+  worktreeDiffText: "",
   queuedCount: 0,
   sessionQuery: "",
   commands: [],
@@ -915,7 +917,15 @@ function handleEvent(message) {
 
     case "git_status":
       state.git = message;
+      state.worktree = message.worktree ?? null;
       renderGitBar();
+      renderWorktree();
+      break;
+
+    case "worktree_diff":
+      state.worktreeDiffText = message.diff || "";
+      addNotice("dim", `${t.worktreeDiff} · ${message.branch}`);
+      showWorktreeDiff();
       break;
 
     case "git_commit": {
@@ -1213,6 +1223,17 @@ $("terminal-restart").addEventListener("click", () => {
   terminalOutput.textContent = "";
   api.send({ cmd: "terminalRestart" });
 });
+
+function showWorktreeDiff() {
+  // openWorkbench("diff") renders the session diff, so paint over it with the
+  // worktree diff afterwards.
+  openWorkbench("diff");
+  workbenchMeta.textContent = t.worktreeDiff;
+  diffFilelist.hidden = true;
+  diffRoot.innerHTML = state.worktreeDiffText
+    ? `<pre class="raw-diff">${escapeHtml(state.worktreeDiffText)}</pre>`
+    : `<div class="diff-empty">${escapeHtml(t.noChanges)}</div>`;
+}
 
 function renderDiff() {
   const scope = state.diffScope;
@@ -1696,6 +1717,30 @@ localeSwitch.querySelectorAll("button").forEach((button) => {
 $("workspace-button").addEventListener("click", async () => {
   const dir = await api.pickDirectory();
   if (dir) api.send({ cmd: "setCwd", cwd: dir });
+});
+
+/* ---------- isolated worktree ---------- */
+
+function renderWorktree() {
+  const active = state.worktree;
+  $("worktree-state").textContent = active ? active.branch : t.worktreeOff;
+  $("worktree-card").classList.toggle("active", Boolean(active));
+  $("worktree-actions-off").hidden = Boolean(active);
+  $("worktree-actions-on").hidden = !active;
+  $("worktree-copy").textContent = active ? `${t.worktreeActive} ${active.path}` : t.worktreeExplain;
+}
+
+$("worktree-button").addEventListener("click", () => {
+  $("worktree-panel").hidden = !$("worktree-panel").hidden;
+});
+
+$("worktree-enable").addEventListener("click", () => api.send({ cmd: "worktreeStart" }));
+$("worktree-diff").addEventListener("click", () => api.send({ cmd: "worktreeDiff" }));
+$("worktree-merge").addEventListener("click", () => {
+  if (confirm(t.worktreeMergeConfirm)) api.send({ cmd: "worktreeMerge" });
+});
+$("worktree-discard").addEventListener("click", () => {
+  if (confirm(t.worktreeDiscardConfirm)) api.send({ cmd: "worktreeDiscard" });
 });
 
 $("clear-button").addEventListener("click", () => {

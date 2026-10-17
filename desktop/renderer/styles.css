@@ -657,6 +657,16 @@ svg {
   text-decoration-color: rgba(217, 112, 94, 0.55);
 }
 
+.raw-diff {
+  margin: 0;
+  padding: 12px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .diff-empty {
   padding: 24px;
   color: var(--text-faint);
@@ -1730,6 +1740,58 @@ mark.find-hit.current {
   margin-bottom: 6px;
   padding-top: 2px;
   padding-bottom: 2px;
+}
+
+.worktree-card {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 10px;
+  margin-top: 4px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  text-align: left;
+  transition: background 120ms ease;
+}
+
+.worktree-card:hover {
+  background: var(--surface);
+}
+
+.worktree-card.active {
+  color: var(--accent);
+}
+
+.worktree-card svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+}
+
+.worktree-panel {
+  margin: 2px 8px 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.worktree-copy {
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  word-break: break-all;
+}
+
+.worktree-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 /* ---------- git ---------- */

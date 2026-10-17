@@ -33,6 +33,7 @@ import { gitCommit, gitStatus } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
 import { loadMcpTools } from "../src/mcp.ts";
 import { sessionToMarkdown, exportFilename, markRunActive, clearRunActive, findInterruptedRun } from "../src/export.ts";
+import { createWorktree, commitWorktree, worktreeDiff, mergeWorktree, removeWorktree } from "../src/worktree.ts";
 
 let config;
 let client;
@@ -48,6 +49,10 @@ let running = false;
 let terminal = null;
 /** MCP servers started for the current workspace. */
 let mcpClients = [];
+/** Set when this session runs in an isolated worktree. */
+let worktree = null;
+/** The workspace the session started from, before switching into a worktree. */
+let baseCwd = null;
 const persistedUi = readUiSettings();
 let locale = isLocale(persistedUi.locale) ? persistedUi.locale : detectLocale();
 /** Discovered model catalog; replaced whenever /models is (re)read. */
@@ -351,9 +356,14 @@ function stopMcp() {
   mcpClients = [];
 }
 
+/** Git status responses are async; ignore the ones overtaken by a workspace change. */
+let gitStatusGeneration = 0;
+
 async function emitGitStatus() {
+  const generation = ++gitStatusGeneration;
   const status = await gitStatus(cwd);
-  send({ type: "git_status", ...status });
+  if (generation !== gitStatusGeneration) return status;
+  send({ type: "git_status", ...status, worktree: worktree ? { branch: worktree.branch, path: worktree.path, base: baseCwd } : null });
   return status;
 }
 
@@ -680,6 +690,71 @@ async function handle(cmd) {
     case "exportSession": {
       const markdown = sessionToMarkdown(sessionRecord());
       send({ type: "export_ready", markdown, filename: exportFilename(sessionRecord()) });
+      return;
+    }
+    case "worktreeStart": {
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      if (worktree) return send({ type: "notice", level: "dim", text: "this session is already isolated" });
+      baseCwd = cwd;
+      const created = await createWorktree(cwd, sessionId);
+      if (!created.ok) {
+        baseCwd = null;
+        return send({ type: "notice", level: "error", text: `worktree: ${created.error}` });
+      }
+      worktree = created.worktree;
+      cwd = worktree.path;
+      process.chdir(cwd);
+      disposeTerminal();
+      createAgent([]);
+      send({ type: "session_loaded", messages: [], cwd });
+      send({ type: "notice", level: "info", text: `worktree: ${worktree.branch}` });
+      void emitGitStatus();
+      void startMcp();
+      return;
+    }
+    case "worktreeDiff": {
+      if (!worktree) return;
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      const committed = await commitWorktree(worktree, `Prometheus session ${sessionId}`);
+      if (!committed.ok) send({ type: "notice", level: "warn", text: `worktree commit: ${committed.error}` });
+      const diff = await worktreeDiff(worktree);
+      send({ type: "worktree_diff", diff, branch: worktree.branch });
+      return;
+    }
+    case "worktreeMerge": {
+      if (!worktree || !baseCwd) return;
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      const committed = await commitWorktree(worktree, `Prometheus session ${sessionId}`);
+      if (!committed.ok) return send({ type: "notice", level: "error", text: `worktree commit: ${committed.error}` });
+      const merged = await mergeWorktree(baseCwd, worktree);
+      if (!merged.ok) return send({ type: "notice", level: "error", text: merged.error });
+      const leaving = worktree;
+      worktree = null;
+      cwd = baseCwd;
+      baseCwd = null;
+      process.chdir(cwd);
+      disposeTerminal();
+      createAgent([]);
+      send({ type: "session_loaded", messages: [], cwd });
+      send({ type: "notice", level: "info", text: `merged ${leaving.branch}` });
+      void removeWorktree(cwd, leaving);
+      void emitGitStatus();
+      return;
+    }
+    case "worktreeDiscard": {
+      if (!worktree || !baseCwd) return;
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      const leaving = worktree;
+      worktree = null;
+      cwd = baseCwd;
+      baseCwd = null;
+      process.chdir(cwd);
+      disposeTerminal();
+      createAgent([]);
+      send({ type: "session_loaded", messages: [], cwd });
+      send({ type: "notice", level: "warn", text: `discarded ${leaving.branch}` });
+      void removeWorktree(cwd, leaving);
+      void emitGitStatus();
       return;
     }
     case "clearHistory": {
