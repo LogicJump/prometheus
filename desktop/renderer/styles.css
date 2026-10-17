@@ -493,6 +493,29 @@ svg {
   white-space: nowrap;
 }
 
+.diff-scope {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  flex: 0 0 auto;
+}
+
+.diff-scope button {
+  padding: 2px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.diff-scope button.active {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
 .workbench-body {
   flex: 1;
   display: flex;

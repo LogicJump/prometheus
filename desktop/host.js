@@ -83,9 +83,12 @@ async function refreshCatalog(force = false) {
 
 /** Per-session change set: prior content of every file the agent touched. */
 const changeBaseline = new Map();
+/** Same, but reset at each turn so the UI can show just the last turn's diff. */
+let turnBaseline = new Map();
 
 function resetChanges() {
   changeBaseline.clear();
+  turnBaseline.clear();
 }
 
 function recordChange(name, input) {
@@ -99,6 +102,7 @@ function recordChange(name, input) {
     before = null;
   }
   changeBaseline.set(abs, before);
+  if (!turnBaseline.has(abs)) turnBaseline.set(abs, before);
 }
 
 function resolvePathForChange(root, inputPath) {
@@ -107,9 +111,9 @@ function resolvePathForChange(root, inputPath) {
   return rel.startsWith("..") || isAbsolute(rel) ? null : abs;
 }
 
-function computeChanges() {
+function computeChanges(baseline = changeBaseline) {
   const files = [];
-  for (const [abs, before] of changeBaseline) {
+  for (const [abs, before] of baseline) {
     let after = null;
     try {
       after = existsSync(abs) ? readFileSync(abs, "utf8") : null;
@@ -128,7 +132,7 @@ function computeChanges() {
 }
 
 function emitChanges() {
-  send({ type: "changes", ...computeChanges() });
+  send({ type: "changes", ...computeChanges(), lastTurn: computeChanges(turnBaseline) });
 }
 
 class HostUi {
@@ -350,6 +354,7 @@ async function runPrompt(text) {
     return;
   }
   running = true;
+  turnBaseline = new Map();
   send({ type: "queued", count: 0 });
   send({ type: "run_start" });
   try {
@@ -611,8 +616,7 @@ async function handle(cmd) {
     }
     case "getChanges":
       emitChanges();
-      return;
-    case "getTree":
+      return;    case "getTree":
       send({ type: "tree", path: cmd.path ?? ".", nodes: readWorkspaceTree(cwd, cmd.path ?? ".") });
       return;
     case "searchFiles":

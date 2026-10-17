@@ -75,6 +75,7 @@ const state = {
   queuedCount: 0,
   sessionQuery: "",
   commands: [],
+  diffScope: "session",
 };
 
 let t = getDict(state.locale);
@@ -817,7 +818,12 @@ function handleEvent(message) {
       break;
 
     case "changes":
-      state.changes = { files: message.files ?? [], additions: message.additions ?? 0, deletions: message.deletions ?? 0 };
+      state.changes = {
+        files: message.files ?? [],
+        additions: message.additions ?? 0,
+        deletions: message.deletions ?? 0,
+        lastTurn: message.lastTurn ?? { files: [], additions: 0, deletions: 0 },
+      };
       if (message.files?.length > 0 && !message.files.some((file) => file.path === state.selectedChange)) {
         state.selectedChange = message.files[0].path;
       }
@@ -1090,6 +1096,7 @@ function openWorkbench(pane) {
   const showTerminal = state.pane === "terminal";
   diffRoot.hidden = !showDiff;
   diffFilelist.hidden = !showDiff || state.changes.files.length === 0;
+  $("diff-scope").hidden = !showDiff;
   fileRoot.hidden = state.pane !== "file";
   terminalRoot.hidden = !showTerminal;
   if (showDiff) renderDiff();
@@ -1163,8 +1170,10 @@ $("terminal-restart").addEventListener("click", () => {
 });
 
 function renderDiff() {
-  const files = state.changes.files;
-  renderDiffFileList();
+  const scope = state.diffScope;
+  const active = scope === "turn" ? state.changes.lastTurn ?? { files: [], additions: 0, deletions: 0 } : state.changes;
+  const files = active.files;
+  renderDiffFileList(files);
   diffRoot.innerHTML = "";
   if (files.length === 0) {
     diffRoot.innerHTML = `<div class="diff-empty">${escapeHtml(t.noChanges)}</div>`;
@@ -1200,9 +1209,9 @@ function renderDiff() {
   }
 }
 
-function renderDiffFileList() {
+function renderDiffFileList(files = state.changes.files) {
   diffFilelist.innerHTML = "";
-  for (const file of state.changes.files) {
+  for (const file of files) {
     const row = document.createElement("button");
     row.className = `change-row${file.path === state.selectedChange ? " active" : ""}`;
     row.innerHTML =
@@ -1664,6 +1673,17 @@ workbenchTabs.querySelectorAll("button").forEach((button) => {
 });
 
 $("close-workbench").addEventListener("click", closeWorkbench);
+
+$("diff-scope").querySelectorAll("button").forEach((button) => {
+  button.addEventListener("click", () => {
+    state.diffScope = button.dataset.scope;
+    $("diff-scope").querySelectorAll("button").forEach((node) => {
+      node.classList.toggle("active", node === button);
+    });
+    state.selectedChange = null;
+    renderDiff();
+  });
+});
 
 $("theme-button").addEventListener("click", () => {
   setTheme(state.theme === "light" ? "dark" : "light");
