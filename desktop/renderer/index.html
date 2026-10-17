@@ -359,6 +359,14 @@
               <span data-i18n="settingsMaxTokens">Max response tokens</span>
               <input id="setting-max-tokens" type="number" min="256" max="128000" step="256" />
             </label>
+            <label class="field">
+              <span data-i18n="settingsAutoApprove">Auto-approve tools</span>
+              <input id="setting-auto-approve" type="text" spellcheck="false" placeholder="read_file, glob, grep" />
+            </label>
+            <label class="field">
+              <span data-i18n="settingsContext">Context window</span>
+              <input id="setting-context" type="number" min="8000" max="4000000" step="1000" />
+            </label>
           </section>
           <section class="settings-section">
             <h3 data-i18n="settingsAppearance">Appearance</h3>

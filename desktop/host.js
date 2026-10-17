@@ -73,6 +73,15 @@ function configModelAllowed(model) {
   return isModelAllowed(model) && pickerModels().some((m) => m.id === model);
 }
 
+
+/** Adopt the endpoint's context length for the active model, if it reports one. */
+function applyModelContext(id) {
+  const entry = catalog.models.find((model) => model.id === id);
+  if (!entry || !Number.isFinite(entry.contextLength) || entry.contextLength <= 0) return;
+  config.contextWindow = entry.contextLength;
+  if (agent) agent.config.contextWindow = entry.contextLength;
+}
+
 async function refreshCatalog(force = false) {
   if (!config?.baseUrl) return;
   const next = await discoverModels(config.baseUrl, config.apiKey, { force });
@@ -85,6 +94,8 @@ async function refreshCatalog(force = false) {
     if (client) client.options.model = replacement;
     if (agent) agent.refreshSystemPrompt();
   }
+  applyModelContext(config.model);
+  emitState();
   send({ type: "models", models: pickerModels(), model: config.model, source: next.source, fetchedAt: next.fetchedAt });
 }
 
@@ -482,6 +493,9 @@ async function handle(cmd) {
           mode: config?.permissionMode ?? "ask",
           effort: config?.thinkingEffort ?? "auto",
           maxTokens: config?.maxTokens ?? 16000,
+          autoApprove: config?.autoApprove ?? [],
+          contextWindow: config?.contextWindow ?? 1_000_000,
+          modelContext: config ? catalog.models.find((model) => model.id === config.model)?.contextLength ?? null : null,
           locale,
           theme: persistedUi.theme ?? "dark",
         },
@@ -499,6 +513,13 @@ async function handle(cmd) {
       if (["ask", "auto", "plan"].includes(patch.mode)) filePatch.permissionMode = patch.mode;
       if (["auto", "low", "medium", "high"].includes(patch.effort)) filePatch.thinkingEffort = patch.effort;
       if (Number.isFinite(Number(patch.maxTokens))) filePatch.maxTokens = Math.max(256, Math.min(128000, Number(patch.maxTokens)));
+      if (Number.isFinite(Number(patch.contextWindow))) {
+        filePatch.contextWindow = Math.max(8_000, Math.min(4_000_000, Number(patch.contextWindow)));
+      }
+      if (typeof patch.autoApprove === "string" || Array.isArray(patch.autoApprove)) {
+        const list = Array.isArray(patch.autoApprove) ? patch.autoApprove : String(patch.autoApprove).split(",");
+        filePatch.autoApprove = list.map((name) => String(name).trim()).filter(Boolean);
+      }
       try {
         writeConfigFile(filePatch);
         if (isLocale(patch.locale) || patch.theme === "dark" || patch.theme === "light") {
@@ -520,6 +541,8 @@ async function handle(cmd) {
         permissions.mode = config.permissionMode;
         agent.config.model = config.model;
         agent.config.maxTokens = config.maxTokens;
+        agent.config.contextWindow = config.contextWindow;
+        agent.config.autoApprove = config.autoApprove;
         agent.config.thinkingEffort = config.thinkingEffort;
         agent.config.permissionMode = config.permissionMode;
         agent.refreshSystemPrompt();
@@ -581,6 +604,7 @@ async function handle(cmd) {
       }
       config.model = cmd.model;
       client.options.model = cmd.model;
+      applyModelContext(cmd.model);
       agent.refreshSystemPrompt();
       ui.setModelName(cmd.model);
       emitState();

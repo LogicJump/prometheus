@@ -664,6 +664,9 @@ function renderModels(models, current, source) {
   if (current) {
     modelLabel.textContent = current;
     modelPicker.classList.remove("unavailable");
+    // The meter is a share of the model's real context, not a placeholder.
+    const active = state.models.find((model) => model.id === current);
+    if (active && Number.isFinite(active.contextLength)) state.contextWindow = active.contextLength;
   }
   if (!modelMenu.hidden) renderModelMenu();
 }
@@ -2055,6 +2058,16 @@ function fillSettings(s) {
   $("setting-mode").value = s.mode;
   $("setting-effort").value = s.effort;
   $("setting-max-tokens").value = s.maxTokens;
+  $("setting-auto-approve").value = (s.autoApprove ?? []).join(", ");
+  $("setting-context").value = s.contextWindow;
+  const modelContext = $("setting-context").parentElement.querySelector(".field-hint");
+  if (modelContext) modelContext.remove();
+  if (s.modelContext) {
+    const hint = document.createElement("span");
+    hint.className = "field-hint";
+    hint.textContent = t.contextFromEndpoint(Math.round(s.modelContext / 1000));
+    $("setting-context").parentElement.appendChild(hint);
+  }
   $("setting-locale").value = s.locale;
   $("setting-theme").value = s.theme;
   $("setting-density").value = state.density;
@@ -2078,6 +2091,8 @@ function saveSettings() {
       mode: $("setting-mode").value,
       effort: $("setting-effort").value,
       maxTokens: Number($("setting-max-tokens").value),
+      autoApprove: $("setting-auto-approve").value,
+      contextWindow: Number($("setting-context").value),
       locale: $("setting-locale").value,
       theme: $("setting-theme").value,
     },

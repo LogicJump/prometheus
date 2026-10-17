@@ -2369,6 +2369,13 @@ mark.find-hit.current {
   color: var(--text-faint);
 }
 
+.field-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
 .about-row {
   display: flex;
   align-items: center;
