@@ -17,3 +17,5 @@ release9/
 release10/
 argv.log
 release3/
+.research/
+.claude/launch.json
