@@ -10,6 +10,7 @@ import { compact, estimateTokens } from "./context.ts";
 import { loadMemory } from "./memory.ts";
 import { SUBAGENT_TOOLS, ALL_TOOLS } from "./tools/index.ts";
 import { loadProjectInstructions } from "./instructions.ts";
+import { captureBefore } from "./checkpoints.ts";
 
 const MAX_RETRIES = 3;
 
@@ -31,6 +32,10 @@ export class Agent {
   readonly client: ChatClient;
   readonly todos: TodoList = { items: [] };
   usage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  /** Set by the host so file mutations can be checkpointed per session. */
+  sessionId = "";
+  /** Called before a mutating tool runs; used to snapshot file state for diffs. */
+  onBeforeMutate: ((toolName: string, input: Record<string, unknown>) => void) | null = null;
   private readonly tools: Tool[];
   private readonly permissions: Permissions;
   private readonly isSubagent: boolean;
@@ -239,6 +244,20 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       }
     }
     void allowed;
+
+    // Snapshot mutating file tools before they run so the session can be rewound.
+    if (this.sessionId && (name === "write_file" || name === "edit_file") && typeof input.path === "string") {
+      try {
+        captureBefore(this.sessionId, name, process.cwd(), input.path);
+      } catch {
+        /* checkpointing must never block a tool */
+      }
+    }
+    try {
+      this.onBeforeMutate?.(name, input);
+    } catch {
+      /* diff snapshots must never block a tool */
+    }
 
     const ctx: ToolContext = {
       cwd: process.cwd(),

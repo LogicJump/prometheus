@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "codex-preview", "runtimeExecutable": "python", "runtimeArgs": ["-I", "-m", "http.server", "8899", "--bind", "127.0.0.1", "--directory", "G:/Develop/Prometheus/.research/codex/site"], "port": 8899 }
+  ]
+}

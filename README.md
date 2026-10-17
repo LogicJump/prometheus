@@ -1,4 +1,5 @@
 # Prometheus
+> 通用终端编程代理 —— 连接任意 OpenAI 兼容接口，在仓库中直接干活。
 
 A general-purpose terminal coding agent, with a desktop app. It talks to any
 OpenAI-compatible `/chat/completions` endpoint, streams responses, and works on

@@ -13,7 +13,8 @@
  */
 
 import process from "node:process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import { loadConfig, ALLOWED_MODELS, isModelAllowed } from "../src/config.ts";
 import { ChatClient } from "../src/llm.ts";
 import { Agent } from "../src/agent.ts";
@@ -23,6 +24,10 @@ import { listSessions, loadSession, newSessionId, saveSession } from "../src/ses
 import { compactForce } from "../src/context.ts";
 import { discoverModels, FALLBACK_MODELS } from "../src/models.ts";
 import { detectLocale, isLocale } from "../src/i18n.ts";
+import { buildChange } from "../src/diff.ts";
+import { loadCheckpoints, restoreTo, clearCheckpoints, captureBefore } from "../src/checkpoints.ts";
+import { loadFilePreview, readWorkspaceTree } from "../src/workspace.ts";
+import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
 
 let config;
 let client;
@@ -34,7 +39,8 @@ let cwd = process.cwd();
 let pendingPermissions = new Map();
 let permissionSeq = 0;
 let running = false;
-let locale = detectLocale();
+const persistedUi = readUiSettings();
+let locale = isLocale(persistedUi.locale) ? persistedUi.locale : detectLocale();
 /** Discovered model catalog; replaced whenever /models is (re)read. */
 let catalog = { models: FALLBACK_MODELS, fetchedAt: new Date().toISOString(), source: "fallback" };
 
@@ -65,6 +71,56 @@ async function refreshCatalog(force = false) {
     if (agent) agent.refreshSystemPrompt();
   }
   send({ type: "models", models: pickerModels(), model: config.model, source: next.source, fetchedAt: next.fetchedAt });
+}
+
+/** Per-session change set: prior content of every file the agent touched. */
+const changeBaseline = new Map();
+
+function resetChanges() {
+  changeBaseline.clear();
+}
+
+function recordChange(name, input) {
+  if ((name !== "write_file" && name !== "edit_file") || typeof input.path !== "string") return;
+  const abs = resolvePathForChange(cwd, input.path);
+  if (!abs || changeBaseline.has(abs)) return;
+  let before = null;
+  try {
+    before = existsSync(abs) ? readFileSync(abs, "utf8") : null;
+  } catch {
+    before = null;
+  }
+  changeBaseline.set(abs, before);
+}
+
+function resolvePathForChange(root, inputPath) {
+  const abs = isAbsolute(inputPath) ? resolve(inputPath) : resolve(root, inputPath);
+  const rel = relative(resolve(root), abs);
+  return rel.startsWith("..") || isAbsolute(rel) ? null : abs;
+}
+
+function computeChanges() {
+  const files = [];
+  for (const [abs, before] of changeBaseline) {
+    let after = null;
+    try {
+      after = existsSync(abs) ? readFileSync(abs, "utf8") : null;
+    } catch {
+      after = null;
+    }
+    if (before === after) continue;
+    files.push(buildChange(relative(cwd, abs).split("\\").join("/"), before, after));
+  }
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    files,
+    additions: files.reduce((sum, file) => sum + file.additions, 0),
+    deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+  };
+}
+
+function emitChanges() {
+  send({ type: "changes", ...computeChanges() });
 }
 
 class HostUi {
@@ -208,9 +264,14 @@ function emitState() {
 function createAgent(messages = []) {
   permissions = new Permissions(config, ui);
   agent = new Agent(config, ui, client, ALL_TOOLS, permissions, messages);
+  agent.sessionId = sessionId;
+  agent.onBeforeMutate = (name, input) => recordChange(name, input);
+  resetChanges();
   sessionCreatedAt = new Date().toISOString();
   ui.setModelName(config.model);
   emitState();
+  send({ type: "changes", files: [], additions: 0, deletions: 0 });
+  send({ type: "checkpoints", sessionId, entries: [] });
 }
 
 async function runPrompt(text) {
@@ -237,6 +298,8 @@ async function runPrompt(text) {
       todos: agent.todos.items,
       files: changedFiles(),
     });
+    emitChanges();
+    send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
   }
 }
 
@@ -280,8 +343,69 @@ function handle(cmd) {
     case "setLocale": {
       if (!isLocale(cmd.locale)) return;
       locale = cmd.locale;
+      writeUiSettings({ locale });
       send({ type: "locale", locale });
       if (config) emitState();
+      return;
+    }
+    case "getSettings":
+      send({
+        type: "settings",
+        settings: {
+          baseUrl: config?.baseUrl ?? "",
+          apiKeyMasked: maskKey(config?.apiKey ?? ""),
+          model: config?.model ?? "",
+          models: pickerModels(),
+          mode: config?.permissionMode ?? "ask",
+          effort: config?.thinkingEffort ?? "auto",
+          maxTokens: config?.maxTokens ?? 16000,
+          locale,
+          theme: persistedUi.theme ?? "dark",
+        },
+      });
+      return;
+    case "saveSettings": {
+      const patch = cmd.settings ?? {};
+      const filePatch = {};
+      if (typeof patch.baseUrl === "string" && patch.baseUrl.trim()) filePatch.baseUrl = patch.baseUrl.trim().replace(/\/+$/, "");
+      // An unchanged masked key is left alone; a typed replacement is saved as-is.
+      if (typeof patch.apiKey === "string" && patch.apiKey.trim() && !patch.apiKey.includes("•")) {
+        filePatch.apiKey = patch.apiKey.trim();
+      }
+      if (typeof patch.model === "string" && patch.model) filePatch.model = patch.model;
+      if (["ask", "auto", "plan"].includes(patch.mode)) filePatch.permissionMode = patch.mode;
+      if (["auto", "low", "medium", "high"].includes(patch.effort)) filePatch.thinkingEffort = patch.effort;
+      if (Number.isFinite(Number(patch.maxTokens))) filePatch.maxTokens = Math.max(256, Math.min(128000, Number(patch.maxTokens)));
+      try {
+        writeConfigFile(filePatch);
+        if (isLocale(patch.locale) || patch.theme === "dark" || patch.theme === "light") {
+          writeUiSettings({
+            ...(isLocale(patch.locale) ? { locale: patch.locale } : {}),
+            ...(patch.theme === "dark" || patch.theme === "light" ? { theme: patch.theme } : {}),
+          });
+        }
+        if (isLocale(patch.locale)) locale = patch.locale;
+        config = loadConfig({ permissionMode: config.permissionMode });
+        client = new ChatClient({
+          baseUrl: config.baseUrl,
+          apiKey: config.apiKey,
+          model: config.model,
+          maxTokens: config.maxTokens,
+          reasoningEffort: config.thinkingEffort,
+          timeoutMs: 300_000,
+        });
+        permissions.mode = config.permissionMode;
+        agent.config.model = config.model;
+        agent.config.maxTokens = config.maxTokens;
+        agent.config.thinkingEffort = config.thinkingEffort;
+        agent.config.permissionMode = config.permissionMode;
+        agent.refreshSystemPrompt();
+        emitState();
+        void refreshCatalog(true);
+        send({ type: "settings_saved", ok: true });
+      } catch (err) {
+        send({ type: "settings_saved", ok: false, error: err.message });
+      }
       return;
     }
     case "prompt":
@@ -391,6 +515,41 @@ function handle(cmd) {
       send({ type: "run_end", context: agent.contextUsage(), usage: agent.usage, todos: agent.todos.items, files: changedFiles() });
       return;
     }
+    case "getChanges":
+      emitChanges();
+      return;
+    case "getTree":
+      send({ type: "tree", path: cmd.path ?? ".", nodes: readWorkspaceTree(cwd, cmd.path ?? ".") });
+      return;
+    case "getFile":
+      try {
+        send({ type: "file", file: loadFilePreview(cwd, String(cmd.path)) });
+      } catch (err) {
+        send({ type: "notice", level: "error", text: err.message });
+      }
+      return;
+    case "getCheckpoints":
+      send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
+      return;
+    case "restoreCheckpoint": {
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      const result = restoreTo(sessionId, cmd.id);
+      resetChanges();
+      send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
+      emitChanges();
+      send({
+        type: "notice",
+        level: result.errors.length ? "warn" : "info",
+        text: result.errors.length
+          ? `restored ${result.restored.length} file(s); ${result.errors.join("; ")}`
+          : `restored ${result.restored.length} file(s)`,
+      });
+      return;
+    }
+    case "clearCheckpoints":
+      clearCheckpoints(sessionId);
+      send({ type: "checkpoints", sessionId, entries: [] });
+      return;
     case "initProject": {
       void runPrompt(
         "Create a PROMETHEUS.md file in the workspace root. Inspect the repository structure and key config files first. " +

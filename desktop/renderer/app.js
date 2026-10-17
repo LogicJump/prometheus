@@ -29,6 +29,18 @@ const pendingPermission = $("pending-permission");
 const pendingQuestion = $("pending-question");
 const sessionList = $("session-list");
 const localeSwitch = $("locale-switch");
+const transcriptScroll = $("transcript-scroll");
+const workbench = $("workbench");
+const workbenchTabs = $("workbench-tabs");
+const workbenchMeta = $("workbench-meta");
+const diffFilelist = $("diff-filelist");
+const diffRoot = $("diff-root");
+const fileRoot = $("file-root");
+const fileTree = $("file-tree");
+const changesList = $("changes-list");
+const changesSummary = $("changes-summary");
+const checkpointList = $("checkpoint-list");
+const sidebarTabs = $("sidebar-tabs");
 
 const state = {
   busy: false,
@@ -48,6 +60,13 @@ const state = {
   lastToolNode: null,
   pendingPermissionId: null,
   changedFiles: [],
+  changes: { files: [], additions: 0, deletions: 0 },
+  checkpoints: [],
+  selectedChange: null,
+  selectedFile: null,
+  tree: [],
+  pane: "diff",
+  sidebarTab: "files",
 };
 
 let t = getDict(state.locale);
@@ -186,8 +205,9 @@ function renderMarkdown(source) {
 }
 
 function scrollToBottom(force = false) {
-  const nearBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 140;
-  if (force || nearBottom) transcript.scrollTop = transcript.scrollHeight;
+  const target = transcriptScroll || transcript;
+  const nearBottom = target.scrollHeight - target.scrollTop - target.clientHeight < 140;
+  if (force || nearBottom) target.scrollTop = target.scrollHeight;
 }
 
 function hideEmptyState() {
@@ -199,7 +219,7 @@ function addNode(html) {
   const wrapper = document.createElement("div");
   wrapper.innerHTML = html;
   const node = wrapper.firstElementChild;
-  transcript.appendChild(node);
+  (transcriptScroll || transcript).appendChild(node);
   scrollToBottom();
   return node;
 }
@@ -466,6 +486,46 @@ function handleEvent(message) {
       renderModels(message.models, message.model, message.source);
       break;
 
+    case "changes":
+      state.changes = { files: message.files ?? [], additions: message.additions ?? 0, deletions: message.deletions ?? 0 };
+      if (message.files?.length > 0 && !message.files.some((file) => file.path === state.selectedChange)) {
+        state.selectedChange = message.files[0].path;
+      }
+      renderChangesPanel();
+      if (state.pane === "diff" && !workbench.hidden) renderDiff();
+      break;
+
+    case "checkpoints":
+      state.checkpoints = message.entries ?? [];
+      renderCheckpoints();
+      break;
+
+    case "tree": {
+      const target = pendingTreeTarget ?? fileTree;
+      pendingTreeTarget = null;
+      target.innerHTML = "";
+      for (const node of message.nodes ?? []) target.appendChild(treeRow(node));
+      break;
+    }
+
+    case "file":
+      renderFilePreview(message.file);
+      break;
+
+    case "settings":
+      fillSettings(message.settings);
+      break;
+
+    case "settings_saved":
+      if (message.ok) {
+        $("settings-note").textContent = t.settingsSaved;
+        setTimeout(() => closeModal(settingsDialog), 700);
+      } else {
+        $("settings-note").textContent = `${t.settingsError} ${message.error ?? ""}`;
+        $("settings-note").style.color = "var(--danger)";
+      }
+      break;
+
     case "locale":
       applyLocale(message.locale);
       break;
@@ -576,7 +636,9 @@ function handleEvent(message) {
       break;
 
     case "session_loaded":
-      transcript.querySelectorAll(".turn, .tool-row, .tool-output, .notice, .plan, .thinking").forEach((node) => node.remove());
+      (transcriptScroll || transcript)
+        .querySelectorAll(".turn, .tool-row, .tool-output, .notice, .plan, .thinking")
+        .forEach((node) => node.remove());
       state.currentAssistant = null;
       state.currentThinking = null;
       state.currentTool = null;
@@ -594,12 +656,13 @@ function handleEvent(message) {
         }
       }
       if ((message.messages || []).length === 0) {
-        transcript.appendChild(emptyState);
+        (transcriptScroll || transcript).appendChild(emptyState);
         emptyState.hidden = false;
       }
       if (message.cwd) {
         workspacePath.textContent = message.cwd;
         workspacePath.title = message.cwd;
+        api.send({ cmd: "getTree", path: "." });
       }
       scrollToBottom(true);
       break;
@@ -626,6 +689,215 @@ function handleEvent(message) {
     default:
       if (message.type) console.debug("unhandled host event", message);
   }
+}
+
+/* ---------- workbench: diff, file, tree, checkpoints ---------- */
+
+function openWorkbench(pane) {
+  state.pane = pane ?? state.pane;
+  workbench.hidden = false;
+  transcript.classList.add("with-workbench");
+  workbenchTabs.querySelectorAll("button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.pane === state.pane);
+  });
+  const showDiff = state.pane === "diff";
+  diffRoot.hidden = !showDiff;
+  diffFilelist.hidden = !showDiff || state.changes.files.length === 0;
+  fileRoot.hidden = showDiff;
+  if (showDiff) renderDiff();
+}
+
+function closeWorkbench() {
+  workbench.hidden = true;
+  transcript.classList.remove("with-workbench");
+}
+
+function renderDiff() {
+  const files = state.changes.files;
+  renderDiffFileList();
+  diffRoot.innerHTML = "";
+  if (files.length === 0) {
+    diffRoot.innerHTML = `<div class="diff-empty">${escapeHtml(t.noChanges)}</div>`;
+    workbenchMeta.textContent = "";
+    return;
+  }
+  const selected = files.find((file) => file.path === state.selectedChange) ?? files[0];
+  state.selectedChange = selected.path;
+  workbenchMeta.innerHTML =
+    `<span class="add">+${selected.additions}</span> <span class="del">−${selected.deletions}</span> · ${escapeHtml(selected.path)}`;
+  if (selected.skipped) {
+    diffRoot.innerHTML = `<div class="diff-empty">${escapeHtml(selected.skipped)}</div>`;
+    return;
+  }
+  for (const hunk of selected.hunks) {
+    const header = document.createElement("div");
+    header.className = "diff-hunk-header";
+    header.textContent = `@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`;
+    diffRoot.appendChild(header);
+    for (const line of hunk.lines) {
+      const row = document.createElement("div");
+      row.className = `diff-line ${line.kind}`;
+      const marker = line.kind === "add" ? "+" : line.kind === "del" ? "−" : " ";
+      const gutter = document.createElement("span");
+      gutter.className = "diff-gutter";
+      gutter.textContent = `${line.oldNo ?? ""}`.padStart(5) + " " + `${line.newNo ?? ""}`.padStart(5);
+      const text = document.createElement("span");
+      text.className = "diff-text";
+      text.textContent = `${marker} ${line.text}`;
+      row.append(gutter, text);
+      diffRoot.appendChild(row);
+    }
+  }
+}
+
+function renderDiffFileList() {
+  diffFilelist.innerHTML = "";
+  for (const file of state.changes.files) {
+    const row = document.createElement("button");
+    row.className = `change-row${file.path === state.selectedChange ? " active" : ""}`;
+    row.innerHTML =
+      `<span class="change-path">${escapeHtml(file.path)}</span>` +
+      `<span class="change-stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`;
+    row.addEventListener("click", () => {
+      state.selectedChange = file.path;
+      openWorkbench("diff");
+      renderDiff();
+    });
+    diffFilelist.appendChild(row);
+  }
+}
+
+function renderChangesPanel() {
+  changesList.innerHTML = "";
+  const { files, additions, deletions } = state.changes;
+  changesSummary.innerHTML = files.length
+    ? `${files.length} file${files.length === 1 ? "" : "s"} · <span class="add">+${additions}</span> <span class="del">−${deletions}</span>`
+    : escapeHtml(t.noChanges);
+  for (const file of files) {
+    const row = document.createElement("button");
+    row.className = "change-row";
+    row.innerHTML =
+      `<span class="change-path">${escapeHtml(file.path)}</span>` +
+      `<span class="change-stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`;
+    row.addEventListener("click", () => {
+      selectSidebarTab("changes");
+      state.selectedChange = file.path;
+      openWorkbench("diff");
+      renderDiff();
+    });
+    changesList.appendChild(row);
+  }
+}
+
+function renderCheckpoints() {
+  checkpointList.innerHTML = "";
+  const entries = state.checkpoints;
+  if (entries.length === 0) {
+    checkpointList.innerHTML = `<div class="sidebar-empty">${escapeHtml(t.noCheckpoints)}</div>`;
+    return;
+  }
+  const restoreAll = document.createElement("button");
+  restoreAll.className = "restore-start";
+  restoreAll.textContent = t.restoreStart;
+  restoreAll.addEventListener("click", () => {
+    if (confirm(t.restoreConfirm)) api.send({ cmd: "restoreCheckpoint", id: "start" });
+  });
+  checkpointList.appendChild(restoreAll);
+
+  for (const entry of [...entries].reverse()) {
+    const row = document.createElement("button");
+    row.className = "checkpoint-row";
+    const time = new Date(entry.at).toLocaleTimeString(state.locale === "zh" ? "zh-CN" : "en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    row.innerHTML =
+      `<span class="checkpoint-time">${escapeHtml(time)}</span>` +
+      `<span class="checkpoint-path">${escapeHtml(entry.path)}</span>`;
+    row.title = `${entry.tool} · ${t.restore}`;
+    row.addEventListener("click", () => {
+      if (confirm(`${t.restore} ${entry.path}?`)) api.send({ cmd: "restoreCheckpoint", id: entry.id });
+    });
+    checkpointList.appendChild(row);
+  }
+}
+
+function renderTree() {
+  fileTree.innerHTML = "";
+  const nodes = state.tree ?? [];
+  if (nodes.length === 0) {
+    fileTree.innerHTML = `<div class="sidebar-empty">…</div>`;
+    return;
+  }
+  for (const node of nodes) fileTree.appendChild(treeRow(node));
+}
+
+function treeRow(node) {
+  const row = document.createElement("button");
+  row.className = "tree-row";
+  row.innerHTML =
+    `<span class="twisty">${node.type === "dir" ? "▸" : ""}</span>` +
+    `<span class="tree-name">${escapeHtml(node.name)}</span>`;
+  row.title = node.path;
+  row.addEventListener("click", () => {
+    if (node.type === "file") {
+      openFile(node.path);
+      return;
+    }
+    const existing = row.nextElementSibling;
+    if (existing && existing.classList.contains("tree-children")) {
+      existing.hidden = !existing.hidden;
+      row.querySelector(".twisty").textContent = existing.hidden ? "▸" : "▾";
+      return;
+    }
+    const container = document.createElement("div");
+    container.className = "tree-children";
+    row.after(container);
+    row.querySelector(".twisty").textContent = "▾";
+    api.send({ cmd: "getTree", path: node.path });
+    pendingTreeTarget = container;
+  });
+  return row;
+}
+
+let pendingTreeTarget = null;
+
+function openFile(path) {
+  state.selectedFile = path;
+  openWorkbench("file");
+  fileRoot.innerHTML = `<div class="diff-empty">…</div>`;
+  api.send({ cmd: "getFile", path });
+  transcript.classList.add("with-workbench");
+}
+
+function renderFilePreview(file) {
+  if (!file || file.path !== state.selectedFile) return;
+  workbenchMeta.textContent = `${file.path}${file.truncated ? " · truncated" : ""}`;
+  if (file.binary) {
+    fileRoot.innerHTML = `<div class="diff-empty">binary file</div>`;
+    return;
+  }
+  const lines = file.content.replace(/\r\n/g, "\n").split("\n");
+  fileRoot.innerHTML = `<pre class="file-view-code">${lines
+    .map((line, index) => {
+      const gutter = `<span class="diff-gutter">${String(index + 1).padStart(4)}</span>`;
+      return `<div class="file-line">${gutter}<span class="diff-text">${escapeHtml(line)}</span></div>`;
+    })
+    .join("")}</pre>`;
+}
+
+function selectSidebarTab(tab) {
+  state.sidebarTab = tab;
+  sidebarTabs.querySelectorAll("button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.tab === tab);
+  });
+  document.querySelectorAll(".panel-view").forEach((view) => {
+    view.hidden = view.dataset.view !== tab;
+  });
+  if (tab === "files") api.send({ cmd: "getTree", path: "." });
+  if (tab === "changes") renderChangesPanel();
+  if (tab === "history") api.send({ cmd: "getCheckpoints" });
 }
 
 /* ---------- sessions ---------- */
@@ -705,6 +977,11 @@ stopButton.addEventListener("click", () => api.send({ cmd: "abort" }));
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    if (!settingsDialog.hidden || !shortcutsDialog.hidden) {
+      closeModal(settingsDialog);
+      closeModal(shortcutsDialog);
+      return;
+    }
     if (!modelMenu.hidden) {
       closeModelMenu();
       return;
@@ -714,14 +991,42 @@ document.addEventListener("keydown", (event) => {
       return;
     }
     if (state.busy) api.send({ cmd: "abort" });
+    return;
   }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+  const mod = event.ctrlKey || event.metaKey;
+  if (!mod) return;
+  const key = event.key.toLowerCase();
+  if (key === "n") {
     event.preventDefault();
     api.send({ cmd: "newSession" });
-  }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
+  } else if (key === "b") {
     event.preventDefault();
     toggleSidebar();
+  } else if (key === ",") {
+    event.preventDefault();
+    openSettings();
+  } else if (key === "/" || key === "?") {
+    event.preventDefault();
+    openShortcuts();
+  } else if (key === "1" || key === "2" || key === "3") {
+    event.preventDefault();
+    const mode = key === "1" ? "ask" : key === "2" ? "auto" : "plan";
+    if (mode !== state.mode) api.send({ cmd: "setMode", mode });
+  } else if (key === "d" && event.shiftKey) {
+    event.preventDefault();
+    selectSidebarTab("changes");
+    openWorkbench("diff");
+  } else if (key === "e" && event.shiftKey) {
+    event.preventDefault();
+    selectSidebarTab("files");
+  } else if (key === "e") {
+    event.preventDefault();
+    const order = ["auto", "low", "medium", "high"];
+    const next = order[(order.indexOf(state.effort) + 1) % order.length];
+    api.send({ cmd: "setEffort", effort: next });
+  } else if (key === "\\") {
+    event.preventDefault();
+    closeWorkbench();
   }
 });
 
@@ -783,8 +1088,134 @@ function toggleSidebar() {
 
 $("sidebar-toggle").addEventListener("click", toggleSidebar);
 
+sidebarTabs.querySelectorAll("button").forEach((button) => {
+  button.addEventListener("click", () => selectSidebarTab(button.dataset.tab));
+});
+
+workbenchTabs.querySelectorAll("button").forEach((button) => {
+  button.addEventListener("click", () => openWorkbench(button.dataset.pane));
+});
+
+$("close-workbench").addEventListener("click", closeWorkbench);
+
 $("theme-button").addEventListener("click", () => {
   setTheme(state.theme === "light" ? "dark" : "light");
+});
+
+/* ---------- settings dialog ---------- */
+
+const settingsDialog = $("settings-dialog");
+const shortcutsDialog = $("shortcuts-dialog");
+const modalScrim = $("modal-scrim");
+
+function openModal(dialog) {
+  modalScrim.hidden = false;
+  dialog.hidden = false;
+  dialog.showModal?.();
+}
+
+function closeModal(dialog) {
+  dialog.hidden = true;
+  dialog.close?.();
+  if (settingsDialog.hidden && shortcutsDialog.hidden) modalScrim.hidden = true;
+}
+
+function openSettings() {
+  api.send({ cmd: "getSettings" });
+  openModal(settingsDialog);
+}
+
+function fillSettings(s) {
+  $("setting-base-url").value = s.baseUrl || "";
+  $("setting-api-key").value = s.apiKeyMasked || "";
+  $("setting-api-key").dataset.masked = "1";
+  const modelSelect = $("setting-model");
+  modelSelect.innerHTML = "";
+  for (const model of s.models || []) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.id;
+    modelSelect.appendChild(option);
+  }
+  if (s.model && ![...modelSelect.options].some((o) => o.value === s.model)) {
+    const option = document.createElement("option");
+    option.value = s.model;
+    option.textContent = s.model;
+    modelSelect.appendChild(option);
+  }
+  modelSelect.value = s.model;
+  $("setting-mode").value = s.mode;
+  $("setting-effort").value = s.effort;
+  $("setting-max-tokens").value = s.maxTokens;
+  $("setting-locale").value = s.locale;
+  $("setting-theme").value = s.theme;
+  $("settings-note").textContent = "";
+}
+
+$("setting-api-key").addEventListener("focus", (event) => {
+  if (event.target.dataset.masked === "1") {
+    event.target.value = "";
+    event.target.dataset.masked = "";
+  }
+});
+
+function saveSettings() {
+  api.send({
+    cmd: "saveSettings",
+    settings: {
+      baseUrl: $("setting-base-url").value,
+      apiKey: $("setting-api-key").value,
+      model: $("setting-model").value,
+      mode: $("setting-mode").value,
+      effort: $("setting-effort").value,
+      maxTokens: Number($("setting-max-tokens").value),
+      locale: $("setting-locale").value,
+      theme: $("setting-theme").value,
+    },
+  });
+}
+
+$("settings-button").addEventListener("click", openSettings);
+$("settings-close").addEventListener("click", () => closeModal(settingsDialog));
+$("settings-cancel").addEventListener("click", () => closeModal(settingsDialog));
+$("settings-save").addEventListener("click", saveSettings);
+
+/* ---------- shortcuts sheet ---------- */
+
+function openShortcuts() {
+  const mod = api.platform === "darwin" ? "⌘" : "Ctrl";
+  const rows = [
+    [t.shortcutNewChat, `${mod}+N`],
+    [t.shortcutSettings, `${mod}+,`],
+    [t.shortcutShortcuts, `${mod}+/`],
+    [t.shortcutToggleSidebar, `${mod}+B`],
+    [t.shortcutStop, "Esc"],
+    [t.shortcutChanges, `${mod}+Shift+D`],
+    [t.shortcutFiles, `${mod}+Shift+E`],
+    [t.shortcutClosePane, `${mod}+\\`],
+    [t.shortcutModeAsk, `${mod}+1`],
+    [t.shortcutModeAuto, `${mod}+2`],
+    [t.shortcutModePlan, `${mod}+3`],
+    [t.shortcutEffort, `${mod}+Shift+E`],
+  ];
+  const grid = $("shortcut-grid");
+  grid.innerHTML = "";
+  for (const [label, keys] of rows) {
+    const labelNode = document.createElement("div");
+    labelNode.className = "label";
+    labelNode.textContent = label;
+    const keyNode = document.createElement("kbd");
+    keyNode.textContent = keys;
+    grid.append(labelNode, keyNode);
+  }
+  openModal(shortcutsDialog);
+}
+
+$("shortcuts-button").addEventListener("click", openShortcuts);
+$("shortcuts-close").addEventListener("click", () => closeModal(shortcutsDialog));
+modalScrim.addEventListener("click", () => {
+  closeModal(settingsDialog);
+  closeModal(shortcutsDialog);
 });
 
 document.querySelectorAll(".suggestion").forEach((button) => {
@@ -808,5 +1239,6 @@ if (api.platform) document.documentElement.classList.add(`platform-${api.platfor
 applyLocale(state.locale);
 setTheme(state.theme);
 api.send({ cmd: "listSessions" });
+api.send({ cmd: "getTree", path: "." });
 api.send({ cmd: "setLocale", locale: state.locale });
 input.focus();

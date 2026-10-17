@@ -22,6 +22,11 @@
             </svg>
             <span class="wordmark">Prometheus</span>
           </div>
+          <div class="sidebar-head-actions">
+            <button class="icon-button small" id="sidebar-toggle" title="Toggle sidebar">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
+            </button>
+          </div>
         </div>
 
         <div class="sidebar-actions">
@@ -47,6 +52,24 @@
         </div>
         <nav class="session-list" id="session-list" aria-label="Sessions"></nav>
 
+        <div class="sidebar-tabs" id="sidebar-tabs" role="tablist">
+          <button role="tab" data-tab="files" class="active" data-i18n="tabFiles">Files</button>
+          <button role="tab" data-tab="changes" data-i18n="tabChanges">Changes</button>
+          <button role="tab" data-tab="history" data-i18n="tabHistory">History</button>
+        </div>
+        <div class="sidebar-panel" id="sidebar-panel">
+          <div class="panel-view" data-view="files">
+            <div class="file-tree" id="file-tree"></div>
+          </div>
+          <div class="panel-view" data-view="changes" hidden>
+            <div class="changes-summary" id="changes-summary"></div>
+            <div class="changes-list" id="changes-list"></div>
+          </div>
+          <div class="panel-view" data-view="history" hidden>
+            <div class="checkpoint-list" id="checkpoint-list"></div>
+          </div>
+        </div>
+
         <div class="sidebar-foot">
           <div class="locale-switch" id="locale-switch" role="group" aria-label="Language">
             <button data-locale="en" title="English">EN</button>
@@ -61,21 +84,25 @@
       <!-- Main column -->
       <div class="main">
         <header class="topbar">
-          <button class="icon-button" id="sidebar-toggle" title="Toggle sidebar">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
-          </button>
           <div class="topbar-title" id="topbar-title" data-i18n="appName">Prometheus</div>
           <div class="titlebar-spacer"></div>
           <div class="titlebar-status">
             <span class="status-dot" id="status-dot"></span>
             <span class="status-text" id="status-text" data-i18n="statusStarting">starting</span>
           </div>
+          <button class="icon-button" id="shortcuts-button" title="Keyboard shortcuts">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2.5" /><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M7 14h10" /></svg>
+          </button>
+          <button class="icon-button" id="settings-button" title="Settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" /></svg>
+          </button>
           <button class="icon-button" id="clear-button" title="Clear conversation">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12" /></svg>
           </button>
         </header>
 
         <main class="transcript" id="transcript" aria-live="polite">
+          <div class="transcript-scroll" id="transcript-scroll">
           <section class="empty-state" id="empty-state">
             <svg class="empty-mark" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 2.5c3.2 2.4 4.9 5.6 4.9 9.2 0 2.2-.7 4.1-1.9 5.6l-3-1.6-3 1.6a8.6 8.6 0 0 1-1.9-5.6c0-3.6 1.7-6.8 4.9-9.2Z" />
@@ -92,6 +119,24 @@
               <button class="suggestion" data-prompt-key="suggestionDocumentPrompt" data-i18n="suggestionDocument" data-prompt="Create a PROMETHEUS.md describing how this project is built, tested, and organized.">
                 Document the repo
               </button>
+            </div>
+          </section>
+          </div>
+          <section class="workbench" id="workbench" hidden>
+            <div class="workbench-head">
+              <div class="workbench-tabs" id="workbench-tabs" role="tablist">
+                <button role="tab" data-pane="diff" class="active" data-i18n="paneDiff">Changes</button>
+                <button role="tab" data-pane="file" data-i18n="paneFile">File</button>
+              </div>
+              <div class="workbench-meta" id="workbench-meta"></div>
+              <button class="icon-button small" id="close-workbench" title="Close pane">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+              </button>
+            </div>
+            <div class="workbench-body">
+              <aside class="diff-filelist" id="diff-filelist" hidden></aside>
+              <div class="diff-root" id="diff-root"></div>
+              <div class="file-root" id="file-root" hidden></div>
             </div>
           </section>
         </main>
@@ -154,6 +199,91 @@
       </div>
     </div>
 
+    <div class="modal-scrim" id="modal-scrim" hidden></div>
+
+    <dialog class="settings-dialog" id="settings-dialog" hidden>
+      <form method="dialog" class="settings-form" id="settings-form">
+        <header class="dialog-head">
+          <h2 data-i18n="settings">Settings</h2>
+          <button type="button" class="icon-button" id="settings-close" title="Close">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+          </button>
+        </header>
+        <div class="dialog-body">
+          <section class="settings-section">
+            <h3 data-i18n="settingsConnection">Connection</h3>
+            <label class="field">
+              <span data-i18n="settingsBaseUrl">Base URL</span>
+              <input id="setting-base-url" type="text" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span data-i18n="settingsApiKey">API key</span>
+              <input id="setting-api-key" type="password" spellcheck="false" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span data-i18n="settingsDefaultModel">Default model</span>
+              <select id="setting-model"></select>
+            </label>
+          </section>
+          <section class="settings-section">
+            <h3 data-i18n="settingsDefaults">Defaults</h3>
+            <label class="field">
+              <span data-i18n="settingsMode">Permission mode</span>
+              <select id="setting-mode">
+                <option value="ask" data-i18n="modeAsk">Ask</option>
+                <option value="auto" data-i18n="modeAuto">Auto</option>
+                <option value="plan" data-i18n="modePlan">Plan</option>
+              </select>
+            </label>
+            <label class="field">
+              <span data-i18n="settingsEffort">Thinking effort</span>
+              <select id="setting-effort">
+                <option value="auto" data-i18n="effortAuto">Auto</option>
+                <option value="low" data-i18n="effortLow">Low</option>
+                <option value="medium" data-i18n="effortMedium">Med</option>
+                <option value="high" data-i18n="effortHigh">High</option>
+              </select>
+            </label>
+            <label class="field">
+              <span data-i18n="settingsMaxTokens">Max response tokens</span>
+              <input id="setting-max-tokens" type="number" min="256" max="128000" step="256" />
+            </label>
+          </section>
+          <section class="settings-section">
+            <h3 data-i18n="settingsAppearance">Appearance</h3>
+            <label class="field">
+              <span data-i18n="language">Language</span>
+              <select id="setting-locale">
+                <option value="en">English</option>
+                <option value="zh">中文</option>
+              </select>
+            </label>
+            <label class="field">
+              <span data-i18n="settingsTheme">Theme</span>
+              <select id="setting-theme">
+                <option value="dark" data-i18n="themeDark">Dark</option>
+                <option value="light" data-i18n="themeLight">Light</option>
+              </select>
+            </label>
+          </section>
+        </div>
+        <footer class="dialog-foot">
+          <span class="settings-note" id="settings-note"></span>
+          <button type="button" class="btn" id="settings-cancel" data-i18n="cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="settings-save" data-i18n="save">Save</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog class="shortcuts-dialog" id="shortcuts-dialog" hidden>
+      <header class="dialog-head">
+        <h2 data-i18n="shortcuts">Keyboard shortcuts</h2>
+        <button type="button" class="icon-button" id="shortcuts-close" title="Close">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+        </button>
+      </header>
+      <div class="shortcut-grid" id="shortcut-grid"></div>
+    </dialog>
 
     <script type="module" src="app.js"></script>
   </body>
