@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { browserNavigate, browserSnapshot, closeBrowser, openBrowser, setBrowserBounds } from "./browser.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const HOST = join(here, "host.js");
@@ -241,6 +242,32 @@ app.whenReady().then(() => {
 
   ipcMain.handle("open-external", async (_event, url) => {
     if (/^https?:\/\//.test(url)) await shell.openExternal(url);
+  });
+
+  ipcMain.handle("browser-open", async (event, url) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const view = openBrowser(win, url);
+    return Boolean(view);
+  });
+
+  ipcMain.handle("browser-bounds", async (event, bounds) => {
+    setBrowserBounds(BrowserWindow.fromWebContents(event.sender), bounds);
+    return true;
+  });
+
+  ipcMain.handle("browser-navigate", async (event, action, arg) => {
+    return browserNavigate(BrowserWindow.fromWebContents(event.sender), action, arg);
+  });
+
+  ipcMain.handle("browser-snapshot", async (event) => {
+    const snapshot = browserSnapshot(BrowserWindow.fromWebContents(event.sender));
+    if (!snapshot) return null;
+    return { url: snapshot.url, title: snapshot.title, text: await snapshot.text };
+  });
+
+  ipcMain.handle("browser-close", async (event) => {
+    closeBrowser(BrowserWindow.fromWebContents(event.sender));
+    return true;
   });
 
   ipcMain.handle("notify", async (event, { title, body }) => {

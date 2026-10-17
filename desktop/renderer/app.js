@@ -1074,21 +1074,30 @@ function openWorkbench(pane) {
   const showDiff = state.pane === "diff";
   const showTerminal = state.pane === "terminal";
   const showArtifact = state.pane === "artifact";
+  const showBrowser = state.pane === "browser";
   diffRoot.hidden = !showDiff;
   diffFilelist.hidden = !showDiff || state.changes.files.length === 0;
   $("diff-scope").hidden = !showDiff;
   fileRoot.hidden = state.pane !== "file";
   terminalRoot.hidden = !showTerminal;
   $("artifact-root").hidden = !showArtifact;
+  $("browser-root").hidden = !showBrowser;
   if (showDiff) renderDiff();
   if (showTerminal) {
     openTerminal();
   }
+  if (showBrowser) {
+    void api.browserOpen();
+    scheduleBrowserBounds();
+  }
+  if (!showBrowser) void api.browserClose?.();
 }
 
 function closeWorkbench() {
   workbench.hidden = true;
   transcript.classList.remove("with-workbench");
+  // The page view floats above the window, so it must be removed explicitly.
+  void api.browserClose?.();
 }
 
 /* ---------- terminal pane ---------- */
@@ -1397,6 +1406,74 @@ function selectSidebarTab(tab) {
   if (tab === "history") api.send({ cmd: "getCheckpoints" });
   if (tab === "artifacts") api.send({ cmd: "getArtifacts" });
 }
+
+/* ---------- browser pane ---------- */
+
+let browserBoundsTimer = null;
+
+/** The page is a native view overlaying the window; keep it over its slot. */
+function syncBrowserBounds() {
+  if (state.pane !== "browser" || workbench.hidden) return;
+  const slot = $("browser-page");
+  if (!slot) return;
+  const rect = slot.getBoundingClientRect();
+  // Electron view bounds are in device-independent pixels, same as CSS pixels.
+  void api.browserBounds({
+    x: rect.left,
+    y: rect.top,
+    width: rect.width,
+    height: rect.height,
+  });
+}
+
+function scheduleBrowserBounds() {
+  clearTimeout(browserBoundsTimer);
+  browserBoundsTimer = setTimeout(syncBrowserBounds, 60);
+}
+
+function openBrowserPane(url) {
+  openWorkbench("browser");
+  if (url) {
+    $("browser-url").value = url;
+    void api.browserOpen(url);
+  } else {
+    void api.browserOpen("about:blank");
+  }
+  scheduleBrowserBounds();
+}
+
+function renderBrowserState(message) {
+  if (!message) return;
+  if (typeof message.url === "string" && message.url !== "about:blank" && document.activeElement !== $("browser-url")) {
+    $("browser-url").value = message.url;
+  }
+  $("browser-back").disabled = !message.canGoBack;
+  $("browser-forward").disabled = !message.canGoForward;
+  $("browser-reload").textContent = "";
+  workbenchMeta.textContent = message.title || message.url || t.paneBrowser;
+}
+
+$("browser-back").addEventListener("click", () => api.browserNavigate("back"));
+$("browser-forward").addEventListener("click", () => api.browserNavigate("forward"));
+$("browser-reload").addEventListener("click", () => api.browserNavigate("reload"));
+$("browser-url").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    api.browserNavigate("load", $("browser-url").value);
+  }
+});
+$("browser-use").addEventListener("click", async () => {
+  const snapshot = await api.browserSnapshot();
+  if (!snapshot) return;
+  const text = `${t.browserUsePrefix}\n${snapshot.url}\n\n${snapshot.text ?? ""}`;
+  input.value = input.value.trim() ? `${input.value}\n\n${text}` : text;
+  autoSize();
+  input.focus();
+  closeWorkbench();
+});
+
+window.addEventListener("resize", scheduleBrowserBounds);
+api.onBrowserState?.(renderBrowserState);
 
 /* ---------- artifacts ---------- */
 

@@ -192,6 +192,7 @@
                 <button role="tab" data-pane="file" data-i18n="paneFile">File</button>
                 <button role="tab" data-pane="terminal" data-i18n="paneTerminal">Terminal</button>
                 <button role="tab" data-pane="artifact" data-i18n="paneArtifact" hidden>Artifact</button>
+                <button role="tab" data-pane="browser" data-i18n="paneBrowser">Browser</button>
               </div>
               <div class="workbench-meta" id="workbench-meta"></div>
               <div class="diff-scope" id="diff-scope" role="radiogroup" aria-label="Diff scope" hidden>
@@ -221,6 +222,22 @@
                 </div>
               </div>
               <div class="artifact-root" id="artifact-root" hidden></div>
+              <div class="browser-root" id="browser-root" hidden>
+                <div class="browser-toolbar">
+                  <button class="icon-button small" id="browser-back" title="Back">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6" /></svg>
+                  </button>
+                  <button class="icon-button small" id="browser-forward" title="Forward">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6 6 6-6 6" /></svg>
+                  </button>
+                  <button class="icon-button small" id="browser-reload" title="Reload">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6" /><path d="M4.5 15a8 8 0 1 0 1-8.5L4 8" /></svg>
+                  </button>
+                  <input class="browser-url" id="browser-url" spellcheck="false" placeholder="https://example.com" />
+                  <button class="btn btn-quiet small" id="browser-use" data-i18n="browserUsePage">Use page</button>
+                </div>
+                <div class="browser-page" id="browser-page" data-hint="The page renders in this area."></div>
+              </div>
             </div>
           </section>
         </main>

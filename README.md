@@ -223,3 +223,19 @@ the model as the reason.
   }
 }
 ```
+
+## Panes
+
+The right-hand workbench hosts five panes:
+
+- **Changes** — per-file diffs for the session or just the last turn.
+- **File** — any workspace file with line numbers.
+- **Terminal** — a persistent shell in the workspace.
+- **Artifacts** — previewable files the session produced (markdown, HTML, SVG,
+  JSON, CSV); "Use page" is not needed here, but the browser pane has its own.
+- **Browser** — an in-app web view for docs and previews. "Use page" drops the
+  visible page text into the composer so the agent can work from it.
+
+Sessions can run in an **isolated worktree** (sidebar control) on a
+`prometheus/<session>` branch, then be viewed as a diff, merged back, or
+discarded without touching your working copy.
