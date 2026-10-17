@@ -229,6 +229,16 @@ app.whenReady().then(() => {
     if (existsSync(path)) shell.showItemInFolder(path);
   });
 
+  ipcMain.handle("save-file", async (_event, { suggestedName, content }) => {
+    const result = await dialog.showSaveDialog({
+      defaultPath: suggestedName || "export.md",
+      filters: [{ name: "Markdown", extensions: ["md"] }],
+    });
+    if (result.canceled || !result.filePath) return { saved: false };
+    writeFileSync(result.filePath, String(content ?? ""), "utf8");
+    return { saved: true, path: result.filePath };
+  });
+
   ipcMain.handle("open-external", async (_event, url) => {
     if (/^https?:\/\//.test(url)) await shell.openExternal(url);
   });

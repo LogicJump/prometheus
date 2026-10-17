@@ -108,6 +108,9 @@
             <span class="status-dot" id="status-dot"></span>
             <span class="status-text" id="status-text" data-i18n="statusStarting">starting</span>
           </div>
+          <button class="icon-button" id="export-button" title="Export conversation">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" /></svg>
+          </button>
           <button class="icon-button" id="new-window-button" title="New window">
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="7" width="12" height="12" rx="2" /><path d="M8.5 7V5.5A1.5 1.5 0 0 1 10 4h8.5A1.5 1.5 0 0 1 20 5.5V14a1.5 1.5 0 0 1-1.5 1.5H17" /></svg>
           </button>
@@ -322,6 +325,14 @@
               <select id="setting-theme">
                 <option value="dark" data-i18n="themeDark">Dark</option>
                 <option value="light" data-i18n="themeLight">Light</option>
+              </select>
+            </label>
+            <label class="field">
+              <span data-i18n="densityLabel">Density</span>
+              <select id="setting-density">
+                <option value="compact" data-i18n="densityCompact">Compact</option>
+                <option value="balanced" data-i18n="densityBalanced">Balanced</option>
+                <option value="detailed" data-i18n="densityDetailed">Detailed</option>
               </select>
             </label>
           </section>

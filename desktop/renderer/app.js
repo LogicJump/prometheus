@@ -5,6 +5,7 @@ import { detectLocale, getDict } from "./i18n.js";
 /** Saved preferences are restored here; the host gets them on init. */
 const savedLocale = localStorage.getItem("prometheus.locale");
 const savedTheme = localStorage.getItem("prometheus.theme");
+const savedDensity = localStorage.getItem("prometheus.density");
 
 const api = window.prometheus;
 
@@ -57,6 +58,7 @@ const state = {
   sessions: [],
   locale: savedLocale === "zh" || savedLocale === "en" ? savedLocale : detectLocale(),
   theme: savedTheme || "dark",
+  density: savedDensity === "compact" || savedDensity === "detailed" ? savedDensity : "balanced",
   statusKey: "statusStarting",
   currentAssistant: null,
   currentThinking: null,
@@ -848,6 +850,10 @@ function handleEvent(message) {
       if (message.query === mention?.query) renderMention(message.files ?? []);
       break;
 
+    case "export_ready":
+      exportSessionFile(message.markdown, message.filename);
+      break;
+
     case "commands":
       state.commands = message.commands ?? [];
       break;
@@ -1465,6 +1471,12 @@ function renderSessions(sessions) {
   }
 }
 
+function setDensity(density) {
+  state.density = density;
+  document.documentElement.dataset.density = density;
+  localStorage.setItem("prometheus.density", density);
+}
+
 function setTheme(theme) {
   state.theme = theme;
   document.documentElement.dataset.theme = theme;
@@ -1747,6 +1759,7 @@ function fillSettings(s) {
   $("setting-max-tokens").value = s.maxTokens;
   $("setting-locale").value = s.locale;
   $("setting-theme").value = s.theme;
+  $("setting-density").value = state.density;
   $("settings-note").textContent = "";
 }
 
@@ -1771,6 +1784,7 @@ function saveSettings() {
       theme: $("setting-theme").value,
     },
   });
+  setDensity($("setting-density").value);
 }
 
 $("settings-button").addEventListener("click", openSettings);
@@ -1813,6 +1827,14 @@ function openShortcuts() {
 
 $("shortcuts-button").addEventListener("click", openShortcuts);
 $("new-window-button").addEventListener("click", () => api.newWindow());
+
+async function exportSessionFile(markdown, filename) {
+  if (!api.saveFile) return;
+  const result = await api.saveFile(filename, markdown);
+  if (result?.saved) addNotice("dim", `${t.exportSaved} ${result.path}`);
+}
+
+$("export-button").addEventListener("click", () => api.send({ cmd: "exportSession" }));
 $("shortcuts-close").addEventListener("click", () => closeModal(shortcutsDialog));
 modalScrim.addEventListener("click", () => {
   closeModal(settingsDialog);
@@ -1839,6 +1861,7 @@ api.onEvent(handleEvent);
 if (api.platform) document.documentElement.classList.add(`platform-${api.platform}`);
 applyLocale(state.locale);
 setTheme(state.theme);
+setDensity(state.density);
 api.send({ cmd: "listSessions" });
 api.send({ cmd: "listCommands" });
 api.send({ cmd: "getTree", path: "." });

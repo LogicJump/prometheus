@@ -32,6 +32,7 @@ import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
 import { loadMcpTools } from "../src/mcp.ts";
+import { sessionToMarkdown, exportFilename, markRunActive, clearRunActive, findInterruptedRun } from "../src/export.ts";
 
 let config;
 let client;
@@ -355,6 +356,7 @@ async function runPrompt(text) {
   }
   running = true;
   turnBaseline = new Map();
+  markRunActive({ sessionId, cwd, startedAt: new Date().toISOString() });
   send({ type: "queued", count: 0 });
   send({ type: "run_start" });
   try {
@@ -364,6 +366,7 @@ async function runPrompt(text) {
     if (err?.name !== "AbortError") send({ type: "error", message });
   } finally {
     running = false;
+    clearRunActive();
     ui.assistantEnd();
     ui.thinkingEnd();
     persist();
@@ -408,6 +411,10 @@ async function handle(cmd) {
       void emitGitStatus();
       void startMcp();
       void agent?.fireSessionHooks("SessionStart", { sessionId });
+      const interrupted = findInterruptedRun(cwd);
+      if (interrupted) {
+        send({ type: "notice", level: "warn", text: `the previous run was interrupted (${interrupted.sessionId}); its files are in History` });
+      }
       void refreshCatalog(false);
       return;
     }
@@ -657,6 +664,11 @@ async function handle(cmd) {
           "Document what the project is, the build/test/lint commands, the directory layout, and conventions an agent must follow. " +
           "Keep it under 120 lines. Do not invent commands you have not confirmed exist.",
       );
+      return;
+    }
+    case "exportSession": {
+      const markdown = sessionToMarkdown(sessionRecord());
+      send({ type: "export_ready", markdown, filename: exportFilename(sessionRecord()) });
       return;
     }
     case "clearHistory": {

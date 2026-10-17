@@ -1645,6 +1645,24 @@ mark.find-hit.current {
   text-align: left;
 }
 
+/* ---------- tool density ---------- */
+
+:root[data-density="compact"] .tool-row {
+  margin-bottom: 1px;
+  min-height: 17px;
+  font-size: 12px;
+}
+
+:root[data-density="compact"] .tool-row .tool-summary {
+  max-width: 420px;
+}
+
+:root[data-density="detailed"] .tool-row {
+  margin-bottom: 6px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
 /* ---------- git ---------- */
 
 .git-bar {
