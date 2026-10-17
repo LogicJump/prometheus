@@ -232,7 +232,7 @@ The right-hand workbench hosts five panes:
 - **File** — any workspace file with line numbers.
 - **Terminal** — a persistent shell in the workspace.
 - **Artifacts** — previewable files the session produced (markdown, HTML, SVG,
-  JSON, CSV); "Use page" is not needed here, but the browser pane has its own.
+  JSON, CSV).
 - **Browser** — an in-app web view for docs and previews. "Use page" drops the
   visible page text into the composer so the agent can work from it.
 
