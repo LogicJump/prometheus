@@ -41,6 +41,7 @@ export class Agent {
   private readonly isSubagent: boolean;
   private abortController: AbortController | null = null;
   private lastCompaction = "";
+  private readonly queued: string[] = [];
 
   constructor(
     config: Config,
@@ -124,6 +125,37 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     this.messages.push({ role: "user", content: text });
   }
 
+  /**
+   * Queue text typed while a turn is already running. It is appended at the
+   * next tool boundary, so the model sees it before its next request instead
+   * of it being dropped or forcing the user to abort.
+   */
+  enqueue(text: string): void {
+    this.queued.push(text);
+  }
+
+  /** Drop queued messages (a fresh session started, or the user hit stop). */
+  clearQueue(): number {
+    const count = this.queued.length;
+    this.queued.length = 0;
+    return count;
+  }
+
+  get queuedCount(): number {
+    return this.queued.length;
+  }
+
+  /** Move queued messages into the conversation; returns how many were taken. */
+  private drainQueue(): number {
+    if (this.queued.length === 0) return 0;
+    const taken = this.queued.splice(0);
+    for (const text of taken) {
+      this.messages.push({ role: "user", content: text });
+      this.ui.echoUser?.(text);
+    }
+    return taken.length;
+  }
+
   /** Stream one assistant turn and execute any tool calls until the model stops. */
   async run(text: string): Promise<void> {
     this.pushUser(text);
@@ -200,6 +232,9 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
           this.messages.push({ role: "tool", tool_call_id: call.id, content: output.content });
         }
         if (signal.aborted) return;
+        // Text the user typed mid-turn joins the conversation before the model
+        // asks for its next step.
+        this.drainQueue();
       }
       if (!this.isSubagent) this.ui.warn(`Stopped after ${this.config.maxTurns} turns. Send another message to continue.`);
     } finally {

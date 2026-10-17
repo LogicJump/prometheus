@@ -41,6 +41,10 @@ const changesList = $("changes-list");
 const changesSummary = $("changes-summary");
 const checkpointList = $("checkpoint-list");
 const sidebarTabs = $("sidebar-tabs");
+const terminalRoot = $("terminal-root");
+const terminalOutput = $("terminal-output");
+const terminalInput = $("terminal-input");
+const terminalPrompt = $("terminal-prompt");
 
 const state = {
   busy: false,
@@ -90,6 +94,10 @@ function applyLocale(locale, { announce = false } = {}) {
     if (typeof value === "string") node.title = value;
   });
   input.placeholder = t.placeholder;
+  terminalInput.placeholder = terminalInput.disabled ? t.terminalExited : t.terminalPlaceholder;
+  $("terminal-restart").textContent = t.terminalRestart;
+  const terminalTab = workbenchTabs.querySelector('[data-pane="terminal"]');
+  if (terminalTab) terminalTab.textContent = t.paneTerminal;
   sendButton.title = `${t.send} (Enter)`;
   stopButton.title = `${t.stop} (Esc)`;
   $("workspace-button").title = t.changeWorkspace;
@@ -227,7 +235,29 @@ function addNode(html) {
 /* ---------- transcript rendering ---------- */
 
 function addUserTurn(text) {
-  addNode(`<div class="turn user"><div class="user-bubble">${escapeHtml(text)}</div></div>`);
+  const queued = state.busy;
+  const node = addNode(
+    `<div class="turn user${queued ? " queued" : ""}">` +
+      `<div class="user-bubble">${escapeHtml(text)}${queued ? `<span class="queued-tag">${escapeHtml(t.queuedTag)}</span>` : ""}</div>` +
+      `</div>`,
+  );
+  node.dataset.queued = queued ? "1" : "";
+}
+
+function markQueuedDelivered() {
+  const pending = transcript.querySelector('.turn.user.queued');
+  if (!pending) return;
+  pending.classList.remove("queued");
+  pending.dataset.queued = "";
+  pending.querySelector(".queued-tag")?.remove();
+}
+
+function setQueuedBadge(count) {
+  state.queuedCount = count;
+  const badge = $("queued-badge");
+  if (!badge) return;
+  badge.hidden = count <= 0;
+  badge.textContent = t.queuedCount(count);
 }
 
 function addAssistantTurn() {
@@ -355,6 +385,22 @@ function setStatus(key) {
   const dotKind = key === "statusWorking" || key === "statusConnecting" ? "working" : key.startsWith("statusError") || key === "statusHostStopped" || key === "statusConfigError" ? "error" : "ready";
   statusDot.className = `status-dot ${dotKind}`;
   statusText.textContent = statusLabel(key);
+}
+
+/* ---------- notifications ---------- */
+
+/** Only notify when the window is not in front; otherwise the UI already told them. */
+function notifyIfAway(title, body) {
+  if (!api.notify || !body) return;
+  if (document.visibilityState === "visible" && document.hasFocus()) return;
+  void api.notify(title, body.slice(0, 180));
+}
+
+function summariseLastAssistant() {
+  const turns = transcript.querySelectorAll(".turn.assistant .markdown");
+  const last = turns[turns.length - 1];
+  const text = last?.textContent?.trim() ?? "";
+  return text.replace(/\s+/g, " ").slice(0, 160);
 }
 
 function updateMeter(context, usage) {
@@ -512,6 +558,24 @@ function handleEvent(message) {
       renderFilePreview(message.file);
       break;
 
+    case "terminal_output":
+      appendTerminalText(message.text ?? "");
+      break;
+
+    case "terminal_state":
+      setTerminalState(message);
+      break;
+
+    case "queued":
+      setQueuedBadge(message.count ?? 0);
+      break;
+
+    case "user_queued_delivered":
+      // The host echoed the message when it reached the model, so the bubble
+      // can lose its "queued" marker.
+      markQueuedDelivered();
+      break;
+
     case "settings":
       fillSettings(message.settings);
       break;
@@ -606,6 +670,7 @@ function handleEvent(message) {
       pendingQuestion.textContent = message.question;
       pendingPermission.hidden = false;
       pendingPermission.querySelector('[data-permission="yes"]').focus();
+      notifyIfAway(t.notifyNeedsInput, message.question);
       break;
 
     case "notice":
@@ -627,6 +692,7 @@ function handleEvent(message) {
       endThinking();
       setBusy(false);
       updateMeter(message.context, message.usage);
+      notifyIfAway(t.notifyTurnDone, summariseLastAssistant());
       if (message.files && message.files.length > 0) {
         const list = message.files.slice(0, 8).map((f) => f.path).join(", ");
         addNode(
@@ -701,16 +767,80 @@ function openWorkbench(pane) {
     button.classList.toggle("active", button.dataset.pane === state.pane);
   });
   const showDiff = state.pane === "diff";
+  const showTerminal = state.pane === "terminal";
   diffRoot.hidden = !showDiff;
   diffFilelist.hidden = !showDiff || state.changes.files.length === 0;
-  fileRoot.hidden = showDiff;
+  fileRoot.hidden = state.pane !== "file";
+  terminalRoot.hidden = !showTerminal;
   if (showDiff) renderDiff();
+  if (showTerminal) {
+    openTerminal();
+  }
 }
 
 function closeWorkbench() {
   workbench.hidden = true;
   transcript.classList.remove("with-workbench");
 }
+
+/* ---------- terminal pane ---------- */
+
+let terminalCwd = "";
+let terminalBusy = false;
+const terminalLines = [];
+
+function openTerminal() {
+  api.send({ cmd: "terminalOpen" });
+  terminalInput.focus();
+}
+
+/** The pane is a fixed-width transcript, so text is appended as plain lines. */
+function appendTerminalText(text) {
+  const parts = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) terminalLines.push("");
+    const last = terminalLines.length - 1;
+    if (last < 0) terminalLines.push(parts[i]);
+    else terminalLines[last] += parts[i];
+  }
+  while (terminalLines.length > 4000) terminalLines.shift();
+  const pinned = terminalOutput.scrollTop + terminalOutput.clientHeight >= terminalOutput.scrollHeight - 24;
+  terminalOutput.textContent = terminalLines.join("\n");
+  if (pinned) terminalOutput.scrollTop = terminalOutput.scrollHeight;
+}
+
+function setTerminalState({ cwd: nextCwd, busy, exited, scrollback }) {
+  if (typeof nextCwd === "string" && nextCwd) terminalCwd = nextCwd;
+  terminalBusy = Boolean(busy);
+  terminalPrompt.textContent = terminalCwd ? `${terminalCwd}>` : ">";
+  terminalPrompt.title = terminalCwd;
+  terminalInput.disabled = Boolean(exited);
+  terminalInput.placeholder = exited ? t.terminalExited : t.terminalPlaceholder;
+  if (typeof scrollback === "string") {
+    terminalLines.length = 0;
+    if (scrollback) appendTerminalText(scrollback);
+    terminalOutput.scrollTop = terminalOutput.scrollHeight;
+  }
+}
+
+terminalInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.isComposing) {
+    event.preventDefault();
+    const command = terminalInput.value;
+    if (!command.trim()) return;
+    terminalInput.value = "";
+    api.send({ cmd: "terminalRun", command });
+  } else if (event.ctrlKey && event.key.toLowerCase() === "c") {
+    event.preventDefault();
+    api.send({ cmd: "terminalInterrupt" });
+  }
+});
+
+$("terminal-restart").addEventListener("click", () => {
+  terminalLines.length = 0;
+  terminalOutput.textContent = "";
+  api.send({ cmd: "terminalRestart" });
+});
 
 function renderDiff() {
   const files = state.changes.files;
@@ -957,7 +1087,7 @@ function autoSize() {
 
 function submit() {
   const text = input.value.trim();
-  if (!text || state.busy) return;
+  if (!text) return;
   input.value = "";
   autoSize();
   addUserTurn(text);
@@ -1027,6 +1157,9 @@ document.addEventListener("keydown", (event) => {
   } else if (key === "\\") {
     event.preventDefault();
     closeWorkbench();
+  } else if (key === "`") {
+    event.preventDefault();
+    openWorkbench("terminal");
   }
 });
 
@@ -1192,6 +1325,7 @@ function openShortcuts() {
     [t.shortcutStop, "Esc"],
     [t.shortcutChanges, `${mod}+Shift+D`],
     [t.shortcutFiles, `${mod}+Shift+E`],
+    [t.shortcutTerminal, `${mod}+\``],
     [t.shortcutClosePane, `${mod}+\\`],
     [t.shortcutModeAsk, `${mod}+1`],
     [t.shortcutModeAuto, `${mod}+2`],

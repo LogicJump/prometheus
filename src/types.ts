@@ -77,7 +77,8 @@ export interface Ui {
   toolStart(name: string, summary: string): void;
   toolEnd(name: string, ok: boolean, summary: string): void;
   /** Full, possibly long tool output for inspection. */
-  toolOutput?(name: string, content: string): void;  thinking(delta: string): void;
+  toolOutput?(name: string, content: string): void;
+  thinking(delta: string): void;
   thinkingEnd(): void;
   todos(items: TodoItem[]): void;
   confirm(question: string): Promise<"yes" | "always" | "no">;

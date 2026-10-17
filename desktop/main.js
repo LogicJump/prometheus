@@ -1,8 +1,8 @@
 /** Electron main process: one window, one agent host child process per window. */
 
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Notification, shell } from "electron";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,17 +10,31 @@ import { createInterface } from "node:readline";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const HOST = join(here, "host.js");
-const cliArgs = process.argv.slice(2).filter((arg) => !arg.startsWith("-psn") && !arg.startsWith("--user-data-dir"));
+// Packaged: argv = [exe, ...userArgs]. Dev: argv = [electron, appPath, ...userArgs].
+const userArgs = process.argv.slice(app.isPackaged ? 1 : 2);
+const cliArgs = userArgs.filter((arg, index) => {
+  if (arg.startsWith("-")) return false;
+  const previous = userArgs[index - 1];
+  // Chromium flags that take a separate value: the value is not a workspace.
+  return !(previous === "--user-data-dir" || previous === "--remote-debugging-port" || previous === "--inspect");
+});
 
 if (process.env.PROMETHEUS_DEBUG_ARGV) {
   try {
-    const { appendFileSync } = await import("node:fs");
     appendFileSync(
       process.env.PROMETHEUS_DEBUG_ARGV,
       `${new Date().toISOString()} packaged=${app.isPackaged} argv=${JSON.stringify(process.argv)}\n`,
     );
   } catch {
     /* ignore */
+  }
+}
+
+function isDirectory(path) {
+  try {
+    return existsSync(path) && statSync(path).isDirectory();
+  } catch {
+    return false;
   }
 }
 
@@ -31,20 +45,19 @@ const isBrowserProcess = !process.type || process.type === "browser";
 
 /** Launch a packaged app with a workspace: `Prometheus.exe <folder>`. */
 if (app.isPackaged && isBrowserProcess && !process.env.ELECTRON_RUN_AS_NODE) {
-  const candidate = cliArgs.find((arg) => !arg.startsWith("-"));
-  if (candidate && existsSync(candidate)) {
+  const candidate = cliArgs.find(isDirectory);
+  if (candidate) {
     try {
-      if (statSync(candidate).isDirectory()) process.chdir(candidate);
+      process.chdir(candidate);
     } catch {
       /* not a directory */
     }
   }
 }
 /** Packaged apps start from a temp extraction dir; remember the user's last workspace instead. */
-function initialWorkspace() {
-  const fromArgs = cliArgs.find((arg) => !arg.startsWith("-") && existsSync(arg));
-  if (fromArgs) return fromArgs;
-  // A remembered folder only wins while it still holds a workspace the user opened.
+function initialWorkspace(explicitWorkspace) {
+  // A folder argument always wins over the remembered workspace.
+  if (explicitWorkspace) return explicitWorkspace;
   try {
     const saved = JSON.parse(readFileSync(join(app.getPath("userData"), "workspace.json"), "utf8"));
     if (saved.cwd && existsSync(saved.cwd) && saved.explicit) return saved.cwd;
@@ -71,10 +84,11 @@ function rememberWorkspace(cwd, explicit = false) {
 }
 
 function startWindow() {
-  const startCwd = initialWorkspace();
+  // Read the candidate here, in the browser process, not at module load.
+  const explicitWorkspace = app.isPackaged ? cliArgs.find(isDirectory) : undefined;
+  const startCwd = initialWorkspace(explicitWorkspace);
   if (process.env.PROMETHEUS_DEBUG_ARGV) {
     try {
-      const { appendFileSync } = require("node:fs");
       appendFileSync(process.env.PROMETHEUS_DEBUG_ARGV, `startCwd=${startCwd} cliArgs=${JSON.stringify(cliArgs)}\n`);
     } catch {
       /* ignore */
@@ -111,7 +125,15 @@ function startWindow() {
     win.webContents.once("did-finish-load", () => {
       const prompt = process.env.PROMETHEUS_DEMO_PROMPT;
       setTimeout(async () => {
-        if (prompt) {
+        if (process.env.PROMETHEUS_DEMO_JS) {
+          try {
+            const result = await win.webContents.executeJavaScript(process.env.PROMETHEUS_DEMO_JS);
+            console.log(`[demo] js result: ${JSON.stringify(result)}`);
+          } catch (err) {
+            console.log(`[demo] js failed: ${err.message}`);
+          }
+          await new Promise((resolve) => setTimeout(resolve, Number(process.env.PROMETHEUS_DEMO_WAIT ?? 4000)));
+        } else if (prompt) {
           win.webContents.executeJavaScript(
             `document.querySelector('[data-mode="auto"]').click();` +
               `document.getElementById("input").value = ${JSON.stringify(prompt)}; document.getElementById("send-button").click();`,
@@ -157,19 +179,10 @@ function startWindow() {
   };
 
   win.webContents.on("did-finish-load", () => {
-    if (process.env.PROMETHEUS_SCREENSHOT) {
-      try {
-        require("node:fs").appendFileSync(
-          `${process.env.PROMETHEUS_SCREENSHOT}.log`,
-          `did-finish-load ${new Date().toISOString()}\n`,
-        );
-      } catch {
-        /* ignore */
-      }
-    }
     sendToHost({ cmd: "init", cwd: startCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
-    if (cliArgs.length > 0) rememberWorkspace(startCwd, true);
-  });  win.on("closed", () => {
+    if (explicitWorkspace) rememberWorkspace(explicitWorkspace, true);
+  });
+  win.on("closed", () => {
     host.kill();
   });
 
@@ -180,7 +193,7 @@ app.whenReady().then(() => {
   const debugLog = (line) => {
     if (!process.env.PROMETHEUS_DEBUG_ARGV) return;
     try {
-      require("node:fs").appendFileSync(process.env.PROMETHEUS_DEBUG_ARGV, `${line}\n`);
+      appendFileSync(process.env.PROMETHEUS_DEBUG_ARGV, `${line}\n`);
     } catch {
       /* ignore */
     }
@@ -205,6 +218,24 @@ app.whenReady().then(() => {
 
   ipcMain.handle("open-external", async (_event, url) => {
     if (/^https?:\/\//.test(url)) await shell.openExternal(url);
+  });
+
+  ipcMain.handle("notify", async (event, { title, body }) => {
+    if (!Notification.isSupported()) return false;
+    const window = BrowserWindow.fromWebContents(event.sender);
+    // Clicking the notification should bring the window forward, not open a
+    // second one.
+    const notification = new Notification({ title: String(title), body: String(body) });
+    notification.on("click", () => {
+      const target = window && !window.isDestroyed() ? window : BrowserWindow.getAllWindows()[0];
+      if (target && !target.isDestroyed()) {
+        if (target.isMinimized()) target.restore();
+        target.show();
+        target.focus();
+      }
+    });
+    notification.show();
+    return true;
   });
 
   app.on("activate", () => {

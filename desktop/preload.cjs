@@ -12,5 +12,6 @@ contextBridge.exposeInMainWorld("prometheus", {
   pickDirectory: () => ipcRenderer.invoke("pick-directory"),
   revealFile: (path) => ipcRenderer.invoke("reveal-file", path),
   openExternal: (url) => ipcRenderer.invoke("open-external", url),
+  notify: (title, body) => ipcRenderer.invoke("notify", { title, body }),
   platform: process.platform,
 });

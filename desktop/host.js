@@ -28,6 +28,7 @@ import { buildChange } from "../src/diff.ts";
 import { loadCheckpoints, restoreTo, clearCheckpoints, captureBefore } from "../src/checkpoints.ts";
 import { loadFilePreview, readWorkspaceTree } from "../src/workspace.ts";
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
+import { TerminalSession } from "./terminal.js";
 
 let config;
 let client;
@@ -39,6 +40,8 @@ let cwd = process.cwd();
 let pendingPermissions = new Map();
 let permissionSeq = 0;
 let running = false;
+/** Persistent shell behind the terminal pane; created on first use. */
+let terminal = null;
 const persistedUi = readUiSettings();
 let locale = isLocale(persistedUi.locale) ? persistedUi.locale : detectLocale();
 /** Discovered model catalog; replaced whenever /models is (re)read. */
@@ -159,6 +162,11 @@ class HostUi {
       send({ type: "assistant_end" });
     }
   }
+  echoUser(text) {
+    // A queued message was just delivered to the model.
+    send({ type: "user_queued_delivered", text });
+    send({ type: "queued", count: agent ? agent.queuedCount : 0 });
+  }
   thinking() {
     if (this.assistantActive) this.assistantEnd();
     if (!this.thinkingActive) {
@@ -274,12 +282,37 @@ function createAgent(messages = []) {
   send({ type: "checkpoints", sessionId, entries: [] });
 }
 
+function sendTerminalState(state) {
+  send({ type: "terminal_state", ...state });
+}
+
+/** Start (or restart) the pane's shell. Output streams as `terminal_output`. */
+function ensureTerminal() {
+  if (terminal && !terminal.exited) return terminal;
+  terminal?.dispose();
+  terminal = new TerminalSession({
+    cwd,
+    onOutput: (text) => send({ type: "terminal_output", text }),
+    onState: (state) => sendTerminalState(state),
+  });
+  return terminal;
+}
+
+function disposeTerminal() {
+  terminal?.dispose();
+  terminal = null;
+}
+
 async function runPrompt(text) {
   if (running) {
-    send({ type: "notice", level: "warn", text: "a turn is already running" });
+    // A message typed mid-turn is queued and delivered at the next tool
+    // boundary; the renderer already echoed it into the transcript.
+    agent.enqueue(text);
+    send({ type: "queued", count: agent.queuedCount });
     return;
   }
   running = true;
+  send({ type: "queued", count: 0 });
   send({ type: "run_start" });
   try {
     await agent.run(text);
@@ -412,6 +445,7 @@ function handle(cmd) {
       void runPrompt(cmd.text);
       return;
     case "abort":
+      agent?.clearQueue();
       agent?.abort();
       return;
     case "permission": {
@@ -467,6 +501,7 @@ function handle(cmd) {
       if (session.cwd && existsSync(session.cwd) && session.cwd !== cwd) {
         cwd = session.cwd;
         process.chdir(cwd);
+        disposeTerminal();
         try {
           config = loadConfig({});
         } catch {
@@ -487,6 +522,7 @@ function handle(cmd) {
       if (cmd.cwd && existsSync(cmd.cwd)) {
         cwd = cmd.cwd;
         process.chdir(cwd);
+        disposeTerminal();
         sessionId = newSessionId();
         try {
           config = loadConfig({ permissionMode: config.permissionMode });
@@ -564,6 +600,34 @@ function handle(cmd) {
       send({ type: "session_loaded", messages: [] });
       return;
     }
+    case "terminalOpen": {
+      const term = ensureTerminal();
+      send({ type: "terminal_state", cwd: term.cwd, busy: term.busy, exited: term.exited, scrollback: term.scrollback });
+      return;
+    }
+    case "terminalRun": {
+      const term = ensureTerminal();
+      if (running) {
+        // The terminal shares the workspace with the agent; interleaving edits
+        // could corrupt a file the agent is mid-way through changing.
+        send({ type: "notice", level: "warn", text: "the agent is still working; wait for this turn to finish" });
+        return;
+      }
+      term.run(String(cmd.command ?? ""));
+      return;
+    }
+    case "terminalInterrupt":
+      terminal?.interrupt();
+      return;
+    case "terminalRestart": {
+      disposeTerminal();
+      const term = ensureTerminal();
+      send({ type: "terminal_state", cwd: term.cwd, busy: term.busy, exited: term.exited, scrollback: "" });
+      return;
+    }
+    case "terminalClose":
+      disposeTerminal();
+      return;
     default:
       send({ type: "notice", level: "warn", text: `unknown command: ${cmd.cmd}` });
   }

@@ -127,6 +127,7 @@
               <div class="workbench-tabs" id="workbench-tabs" role="tablist">
                 <button role="tab" data-pane="diff" class="active" data-i18n="paneDiff">Changes</button>
                 <button role="tab" data-pane="file" data-i18n="paneFile">File</button>
+                <button role="tab" data-pane="terminal" data-i18n="paneTerminal">Terminal</button>
               </div>
               <div class="workbench-meta" id="workbench-meta"></div>
               <button class="icon-button small" id="close-workbench" title="Close pane">
@@ -137,6 +138,20 @@
               <aside class="diff-filelist" id="diff-filelist" hidden></aside>
               <div class="diff-root" id="diff-root"></div>
               <div class="file-root" id="file-root" hidden></div>
+              <div class="terminal-root" id="terminal-root" hidden>
+                <pre class="terminal-output" id="terminal-output" tabindex="0"></pre>
+                <div class="terminal-input-row">
+                  <span class="terminal-prompt" id="terminal-prompt">&gt;</span>
+                  <input
+                    class="terminal-input"
+                    id="terminal-input"
+                    spellcheck="false"
+                    autocomplete="off"
+                    placeholder="Run a command in the workspace…"
+                  />
+                  <button class="btn btn-quiet small" id="terminal-restart" data-i18n="terminalRestart">Restart</button>
+                </div>
+              </div>
             </div>
           </section>
         </main>
@@ -159,6 +174,7 @@
               spellcheck="false"
             ></textarea>
             <div class="composer-actions">
+              <span class="queued-badge" id="queued-badge" hidden></span>
               <button class="stop-button" id="stop-button" data-i18n="stop" hidden title="Stop (Esc)">Stop</button>
               <button class="send-button" id="send-button" title="Send (Enter)">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m0 0-6 6m6-6 6 6" /></svg>
