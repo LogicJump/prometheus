@@ -1812,6 +1812,7 @@ function openShortcuts() {
 }
 
 $("shortcuts-button").addEventListener("click", openShortcuts);
+$("new-window-button").addEventListener("click", () => api.newWindow());
 $("shortcuts-close").addEventListener("click", () => closeModal(shortcutsDialog));
 modalScrim.addEventListener("click", () => {
   closeModal(settingsDialog);

@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld("prometheus", {
     return () => ipcRenderer.removeListener("host-event", listener);
   },
   pickDirectory: () => ipcRenderer.invoke("pick-directory"),
+  newWindow: () => ipcRenderer.send("new-window"),
   revealFile: (path) => ipcRenderer.invoke("reveal-file", path),
   openExternal: (url) => ipcRenderer.invoke("open-external", url),
   notify: (title, body) => ipcRenderer.invoke("notify", { title, body }),

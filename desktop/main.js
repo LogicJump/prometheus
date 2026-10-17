@@ -177,6 +177,12 @@ function startWindow() {
     if (host.stdin.writable) host.stdin.write(`${JSON.stringify(payload)}\n`);
   };
 
+  // IPC is app-wide; route each window's commands to its own host. Without
+  // this a second window would drive the first window's agent.
+  ipcMain.on("host-send", (event, payload) => {
+    if (!win.isDestroyed() && event.sender === win.webContents) sendToHost(payload);
+  });
+
   win.webContents.on("did-finish-load", () => {
     sendToHost({ cmd: "init", cwd: startCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
     if (explicitWorkspace) rememberWorkspace(explicitWorkspace, true);
@@ -198,12 +204,20 @@ app.whenReady().then(() => {
     }
   };
   debugLog(`ready cwd=${process.cwd()} cliArgs=${JSON.stringify(cliArgs)}`);
-  const { sendToHost } = startWindow();
+  startWindow();
   debugLog("window created");
 
-  ipcMain.on("host-send", (_event, payload) => {
+  // Every window answers "setCwd" for itself; the workspace to remember is
+  // whichever window sent it.
+  ipcMain.on("host-send", (event, payload) => {
     if (payload?.cmd === "setCwd" && payload.cwd) rememberWorkspace(payload.cwd, true);
-    sendToHost(payload);
+    void event;
+  });
+
+  // A second window runs its own agent host, so two sessions can work in
+  // parallel without sharing transcript state.
+  ipcMain.on("new-window", () => {
+    startWindow();
   });
 
   ipcMain.handle("pick-directory", async () => {
