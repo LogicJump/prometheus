@@ -1,0 +1,19 @@
+{
+  "name": "prometheus",
+  "version": "0.1.0",
+  "description": "A general-purpose terminal coding agent",
+  "type": "module",
+  "bin": {
+    "prometheus": "./bin/prometheus.js"
+  },
+  "scripts": {
+    "start": "node bin/prometheus.js",
+    "test": "node --test \"tests/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "keywords": ["agent", "cli", "coding", "openai"],
+  "license": "MIT"
+}

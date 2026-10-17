@@ -1,0 +1,98 @@
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { Config, PermissionMode } from "./types.ts";
+
+const HOME_DIR = join(homedir(), ".prometheus");
+export const CONFIG_HOME = HOME_DIR;
+export const SESSIONS_DIR = join(HOME_DIR, "sessions");
+
+export const DEFAULT_MODEL = "glm-5.3-flash";
+/** Models this deployment is authorized to use. Override with PROMETHEUS_MODELS=a,b. */
+export const ALLOWED_MODELS = (process.env.PROMETHEUS_MODELS ?? "glm-5.3-flash,deepseek-v4.1-flash")
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+interface FileConfig {
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+  maxTokens?: number;
+  permissionMode?: PermissionMode;
+  contextWindow?: number;
+  maxTurns?: number;
+  allowedDirs?: string[];
+  autoApprove?: string[];
+}
+
+function readJson(path: string): FileConfig {
+  try {
+    if (!existsSync(path)) return {};
+    return JSON.parse(readFileSync(path, "utf8")) as FileConfig;
+  } catch (err) {
+    console.error(`Warning: could not parse ${path}: ${(err as Error).message}`);
+    return {};
+  }
+}
+
+function validMode(value: string | undefined): PermissionMode | undefined {
+  return value === "ask" || value === "auto" || value === "plan" ? value : undefined;
+}
+
+export function loadConfig(cli: Partial<Config> = {}): Config {
+  mkdirSync(HOME_DIR, { recursive: true });
+
+  const global = readJson(join(HOME_DIR, "config.json"));
+  const project = readJson(join(process.cwd(), ".prometheus", "config.json"));
+  const file: FileConfig = { ...global, ...project };
+
+  const apiKey =
+    cli.apiKey ||
+    process.env.PROMETHEUS_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    file.apiKey ||
+    "";
+  const baseUrl = (
+    cli.baseUrl ||
+    process.env.PROMETHEUS_BASE_URL ||
+    process.env.OPENAI_BASE_URL ||
+    file.baseUrl ||
+    "https://api.openai.com/v1"
+  ).replace(/\/+$/, "");
+  const model = cli.model || process.env.PROMETHEUS_MODEL || file.model || DEFAULT_MODEL;
+  if (!ALLOWED_MODELS.includes(model)) {
+    throw new Error(
+      `model "${model}" is not permitted on this deployment. Allowed: ${ALLOWED_MODELS.join(", ")}. ` +
+        `Set PROMETHEUS_MODELS to change the allowlist.`,
+    );
+  }
+
+  const config: Config = {
+    baseUrl,
+    apiKey,
+    model,
+    maxTokens: cli.maxTokens ?? file.maxTokens ?? 16000,
+    permissionMode:
+      cli.permissionMode ??
+      validMode(process.env.PROMETHEUS_PERMISSION_MODE) ??
+      file.permissionMode ??
+      "ask",
+    contextWindow: cli.contextWindow ?? file.contextWindow ?? 1_000_000,
+    maxTurns: cli.maxTurns ?? file.maxTurns ?? 60,
+    allowedDirs: cli.allowedDirs ?? file.allowedDirs ?? [],
+    autoApprove: cli.autoApprove ?? file.autoApprove ?? [],
+  };
+
+  if (!config.apiKey) {
+    throw new Error(
+      "No API key found. Set OPENAI_API_KEY (or PROMETHEUS_API_KEY), or add \"apiKey\" to ~/.prometheus/config.json.",
+    );
+  }
+  return config;
+}
+
+export function saveSession(id: string, data: unknown): void {
+  mkdirSync(SESSIONS_DIR, { recursive: true });
+  writeFileSync(join(SESSIONS_DIR, `${id}.json`), JSON.stringify(data, null, 2), "utf8");
+}
