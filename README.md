@@ -25,6 +25,27 @@ and tool calls appear inline with expandable output. Packaging is configured for
 electron-builder (`npm run build`) into NSIS/portable, dmg, and AppImage/deb.
 See [desktop/README.md](desktop/README.md) for the host protocol.
 
+Pass a folder to a packaged build to open it there:
+
+```bash
+Prometheus.exe D:\code\my-project
+```
+
+### The window
+
+- **Changes pane.** Every file the agent touched is listed with `+N −N`. Click
+  one to open a line diff in the right-hand workbench.
+- **History pane.** Each write/edit is checkpointed before it runs; restore one
+  step or everything back to the start of the session.
+- **Terminal pane.** A persistent shell in the workspace, kept open across
+  commands, with its working directory reflected in the prompt.
+- **Git bar.** Branch, ahead/behind, and a commit box that stages and commits.
+- **`@` references.** Type `@` in the composer to insert a workspace path.
+- **Queued messages.** Text sent while a turn is running is delivered at the
+  next tool boundary instead of being rejected.
+- **Notifications.** Long turns and permission prompts raise a desktop
+  notification when the window is not focused.
+
 ## What it does
 
 - **Streaming chat with tool use.** The model reads files, edits them, searches
