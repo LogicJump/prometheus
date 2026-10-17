@@ -123,6 +123,8 @@ function applyLocale(locale, { announce = false } = {}) {
   $("find-input").placeholder = t.findPlaceholder;
   $("theme-button").title = state.theme === "light" ? "Dark" : "Light";
   modelPicker.title = t.refreshModels;
+  // applyLocale also runs during startup, before the voice state is declared.
+  $("voice-button").title = $("voice-button").classList.contains("recording") ? t.voiceStop : t.voiceStart;
   if (state.sessions.length > 0) renderSessions(state.sessions);
   localeSwitch.querySelectorAll("button").forEach((button) => {
     button.classList.toggle("active", button.dataset.locale === locale);
@@ -1407,6 +1409,71 @@ function selectSidebarTab(tab) {
   if (tab === "artifacts") api.send({ cmd: "getArtifacts" });
 }
 
+/* ---------- voice input ---------- */
+
+/**
+ * Dictation uses the Web Speech API. It is only present when Electron was built
+ * with speech support and the OS exposes a recognizer, so the button stays
+ * hidden when unavailable instead of failing on click.
+ */
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+let voiceBase = "";
+
+function setupVoice() {
+  if (!SpeechRecognition) return;
+  $("voice-button").hidden = false;
+  $("voice-button").addEventListener("click", () => {
+    if (recognition) {
+      recognition.stop();
+      return;
+    }
+    recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = state.locale === "zh" ? "zh-CN" : "en-US";
+    voiceBase = input.value ? `${input.value} ` : "";
+
+    recognition.onresult = (event) => {
+      let final = "";
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) final += result[0].transcript;
+        else interim += result[0].transcript;
+      }
+      if (final) {
+        voiceBase += final;
+      }
+      input.value = `${voiceBase}${interim}`;
+      autoSize();
+    };
+    recognition.onerror = () => stopVoice();
+    recognition.onend = () => stopVoice();
+    $("voice-button").classList.add("recording");
+    $("voice-button").title = t.voiceStop;
+    try {
+      recognition.start();
+    } catch {
+      stopVoice();
+    }
+  });
+}
+
+function stopVoice() {
+  if (recognition) {
+    try {
+      recognition.stop();
+    } catch {
+      /* already stopped */
+    }
+    recognition = null;
+  }
+  voiceBase = "";
+  $("voice-button").classList.remove("recording");
+  $("voice-button").title = t.voiceStart;
+}
+
 /* ---------- browser pane ---------- */
 
 let browserBoundsTimer = null;
@@ -2056,6 +2123,7 @@ if (api.platform) document.documentElement.classList.add(`platform-${api.platfor
 applyLocale(state.locale);
 setTheme(state.theme);
 setDensity(state.density);
+setupVoice();
 api.send({ cmd: "listSessions" });
 api.send({ cmd: "listCommands" });
 api.send({ cmd: "getTree", path: "." });
