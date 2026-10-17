@@ -65,6 +65,14 @@ Prometheus.exe D:\code\my-project
   workspace is loaded into the system prompt automatically.
 - **Audit log.** Every permission decision is appended to
   `~/.prometheus/audit.log`.
+- **Custom commands.** Markdown files in `.prometheus/commands/` become slash
+  commands in the composer (see `.prometheus/commands/review.md`).
+- **MCP servers.** Stdio servers listed in `~/.prometheus/mcp.json` or
+  `<workspace>/.prometheus/mcp.json` contribute their tools to the agent:
+
+  ```json
+  { "servers": { "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] } } }
+  ```
 
 ## Requirements
 
