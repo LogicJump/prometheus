@@ -2,7 +2,7 @@
   "appId": "dev.prometheus.desktop",
   "productName": "Prometheus",
   "directories": {
-    "output": "release",
+    "output": "release2",
     "buildResources": "build"
   },
   "files": [

@@ -599,6 +599,9 @@ $("workspace-button").addEventListener("click", async () => {
 });
 
 $("sessions-button").addEventListener("click", openDrawer);
+$("clear-button").addEventListener("click", () => {
+  if (confirm("Start a new conversation? This session is already saved.")) api.send({ cmd: "newSession" });
+});
 $("drawer-close").addEventListener("click", closeDrawer);
 scrim.addEventListener("click", closeDrawer);
 $("new-session").addEventListener("click", () => {

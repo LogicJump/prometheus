@@ -2,7 +2,7 @@
 
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,22 +12,59 @@ const here = dirname(fileURLToPath(import.meta.url));
 const HOST = join(here, "host.js");
 const cliArgs = process.argv.slice(2).filter((arg) => !arg.startsWith("-psn"));
 
+if (process.env.PROMETHEUS_DEBUG_ARGV) {
+  try {
+    const { appendFileSync } = await import("node:fs");
+    appendFileSync(
+      process.env.PROMETHEUS_DEBUG_ARGV,
+      `${new Date().toISOString()} packaged=${app.isPackaged} argv=${JSON.stringify(process.argv)}\n`,
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+// Electron spins up extra processes (GPU, crashpad, utility) with the same
+// command line. Only the browser process may treat a folder argument as the
+// workspace; otherwise a helper would chdir and fight the main process for it.
+const isBrowserProcess = !process.type || process.type === "browser";
+
+/** Launch a packaged app with a workspace: `Prometheus.exe <folder>`. */
+if (app.isPackaged && isBrowserProcess && !process.env.ELECTRON_RUN_AS_NODE) {
+  const candidate = cliArgs.find((arg) => !arg.startsWith("-"));
+  if (candidate && existsSync(candidate)) {
+    try {
+      if (statSync(candidate).isDirectory()) process.chdir(candidate);
+    } catch {
+      /* not a directory */
+    }
+  }
+}
 /** Packaged apps start from a temp extraction dir; remember the user's last workspace instead. */
 function initialWorkspace() {
   const fromArgs = cliArgs.find((arg) => !arg.startsWith("-") && existsSync(arg));
   if (fromArgs) return fromArgs;
+  // A remembered folder only wins while it still holds a workspace the user opened.
   try {
     const saved = JSON.parse(readFileSync(join(app.getPath("userData"), "workspace.json"), "utf8"));
-    if (saved.cwd && existsSync(saved.cwd)) return saved.cwd;
+    if (saved.cwd && existsSync(saved.cwd) && saved.explicit) return saved.cwd;
   } catch {
     /* first launch */
   }
   return app.isPackaged ? homedir() : process.cwd();
 }
 
-function rememberWorkspace(cwd) {
+function rememberWorkspace(cwd, explicit = false) {
   try {
-    writeFileSync(join(app.getPath("userData"), "workspace.json"), JSON.stringify({ cwd }), "utf8");
+    const file = join(app.getPath("userData"), "workspace.json");
+    let previous = {};
+    try {
+      previous = JSON.parse(readFileSync(file, "utf8"));
+    } catch {
+      /* none yet */
+    }
+    const next = explicit || !previous.explicit ? { cwd, explicit: explicit || previous.explicit === true } : previous;
+    writeFileSync(file, JSON.stringify(next), "utf8");
   } catch {
     /* persistence is best-effort */
   }
@@ -35,6 +72,14 @@ function rememberWorkspace(cwd) {
 
 function startWindow() {
   const startCwd = initialWorkspace();
+  if (process.env.PROMETHEUS_DEBUG_ARGV) {
+    try {
+      const { appendFileSync } = require("node:fs");
+      appendFileSync(process.env.PROMETHEUS_DEBUG_ARGV, `startCwd=${startCwd} cliArgs=${JSON.stringify(cliArgs)}\n`);
+    } catch {
+      /* ignore */
+    }
+  }
   const win = new BrowserWindow({
     width: 1360,
     height: 880,
@@ -90,7 +135,6 @@ function startWindow() {
   });
 
   const sendToRenderer = (message) => {
-    if (message.type === "state" && message.cwd) rememberWorkspace(message.cwd);
     if (!win.isDestroyed()) win.webContents.send("host-event", message);
   };
 
@@ -114,6 +158,7 @@ function startWindow() {
 
   win.webContents.on("did-finish-load", () => {
     sendToHost({ cmd: "init", cwd: startCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
+    if (cliArgs.length > 0) rememberWorkspace(startCwd, true);
   });
 
   win.on("closed", () => {
@@ -124,9 +169,20 @@ function startWindow() {
 }
 
 app.whenReady().then(() => {
+  const debugLog = (line) => {
+    if (!process.env.PROMETHEUS_DEBUG_ARGV) return;
+    try {
+      require("node:fs").appendFileSync(process.env.PROMETHEUS_DEBUG_ARGV, `${line}\n`);
+    } catch {
+      /* ignore */
+    }
+  };
+  debugLog(`ready cwd=${process.cwd()} cliArgs=${JSON.stringify(cliArgs)}`);
   const { sendToHost } = startWindow();
+  debugLog("window created");
 
   ipcMain.on("host-send", (_event, payload) => {
+    if (payload?.cmd === "setCwd" && payload.cwd) rememberWorkspace(payload.cwd, true);
     sendToHost(payload);
   });
 
