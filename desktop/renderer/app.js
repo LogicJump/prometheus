@@ -149,10 +149,25 @@ function statusLabel(key) {
 
 const md = (source) => renderMarkdown(source, t.copy);
 
+/** The element that actually scrolls: the transcript, or its inner column when
+ *  the workbench splits the pane. */
+function scrollTarget() {
+  return transcript.classList.contains("with-workbench") ? transcriptScroll : transcript;
+}
+
 function scrollToBottom(force = false) {
-  const target = transcriptScroll || transcript;
+  const target = scrollTarget();
   const nearBottom = target.scrollHeight - target.scrollTop - target.clientHeight < 140;
   if (force || nearBottom) target.scrollTop = target.scrollHeight;
+  updateScrollButton();
+}
+
+function updateScrollButton() {
+  const button = $("scroll-bottom");
+  if (!button) return;
+  const target = scrollTarget();
+  const away = target.scrollHeight - target.scrollTop - target.clientHeight > 220;
+  button.hidden = !away;
 }
 
 function hideEmptyState() {
@@ -164,8 +179,12 @@ function addNode(html) {
   const wrapper = document.createElement("div");
   wrapper.innerHTML = html;
   const node = wrapper.firstElementChild;
-  (transcriptScroll || transcript).appendChild(node);
-  scrollToBottom();
+  // Streaming keeps the view pinned to the bottom; inserting a new turn
+  // mid-scroll should not yank the reader away.
+  const target = scrollTarget();
+  const pinned = target.scrollHeight - target.scrollTop - target.clientHeight < 140;
+  target.appendChild(node);
+  if (pinned) scrollToBottom(true);
   return node;
 }
 
@@ -212,10 +231,13 @@ function flushAssistant() {
     cancelAnimationFrame(current.raf);
     current.raf = 0;
   }
+  const hadText = current.text.trim().length > 0;
   current.body.innerHTML = md(current.text);
   current.body.classList.remove("streaming");
   state.currentAssistant = null;
   bindCodeCopy(current.node);
+  // A turn that produced no prose leaves an empty bubble behind.
+  if (!hadText) current.node.remove();
 }
 
 function bindCodeCopy(root) {
@@ -899,6 +921,8 @@ function handleEvent(message) {
     case "run_start":
       setBusy(true);
       endThinking();
+      // Keep typing possible while the turn runs; the message is queued.
+      input.focus();
       break;
 
     case "assistant_start":
@@ -1003,9 +1027,10 @@ function handleEvent(message) {
       }
       break;
 
-    case "session_loaded":
-      (transcriptScroll || transcript)
-        .querySelectorAll(".turn, .tool-row, .tool-output, .notice, .plan, .thinking")
+    case "session_loaded": {
+      const target = scrollTarget();
+      target
+        .querySelectorAll(".turn, .tool-row, .tool-output, .notice, .plan, .thinking, .subagent")
         .forEach((node) => node.remove());
       state.currentAssistant = null;
       state.currentThinking = null;
@@ -1024,7 +1049,7 @@ function handleEvent(message) {
         }
       }
       if ((message.messages || []).length === 0) {
-        (transcriptScroll || transcript).appendChild(emptyState);
+        target.appendChild(emptyState);
         emptyState.hidden = false;
       }
       if (message.cwd) {
@@ -1034,6 +1059,7 @@ function handleEvent(message) {
       }
       scrollToBottom(true);
       break;
+    }
 
     case "sessions":
       renderSessions(message.sessions);
@@ -1736,6 +1762,7 @@ function submit() {
   autoSize();
   addUserTurn(text);
   api.send({ cmd: "prompt", text });
+  input.focus();
 }
 
 input.addEventListener("input", autoSize);
@@ -1784,7 +1811,10 @@ input.addEventListener("keydown", (event) => {
 });
 
 sendButton.addEventListener("click", submit);
-stopButton.addEventListener("click", () => api.send({ cmd: "abort" }));
+stopButton.addEventListener("click", () => {
+  api.send({ cmd: "abort" });
+  input.focus();
+});
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
@@ -1854,6 +1884,12 @@ document.addEventListener("keydown", (event) => {
 document.addEventListener("click", (event) => {
   if (!modelMenu.hidden && !event.target.closest(".model-control")) closeModelMenu();
 });
+
+/* ---------- scroll-to-latest ---------- */
+
+transcript.addEventListener("scroll", updateScrollButton);
+transcriptScroll.addEventListener("scroll", updateScrollButton);
+$("scroll-bottom").addEventListener("click", () => scrollToBottom(true));
 
 function answerPermission(answer) {
   if (state.pendingPermissionId == null) return;

@@ -2,9 +2,10 @@
   "appId": "dev.prometheus.desktop",
   "productName": "Prometheus",
   "directories": {
-    "output": "release2",
+    "output": "release",
     "buildResources": "build"
   },
+  "electronDist": "node_modules/electron/dist",
   "files": [
     "desktop/**/*",
     "src/**/*",
