@@ -74,6 +74,7 @@ const state = {
   git: null,
   queuedCount: 0,
   sessionQuery: "",
+  commands: [],
 };
 
 let t = getDict(state.locale);
@@ -517,6 +518,68 @@ $("find-next").addEventListener("click", () => stepFind(1));
 $("find-prev").addEventListener("click", () => stepFind(-1));
 $("find-close").addEventListener("click", closeFind);
 
+/* ---------- slash commands ---------- */
+
+const commandMenu = $("command-menu");
+let commandState = null;
+
+function commandsAtCaret() {
+  const before = input.value.slice(0, input.selectionStart);
+  const match = /(^|\n)\/([a-z0-9][a-z0-9-_]*)?$/i.exec(before);
+  return match ? match[2] ?? "" : null;
+}
+
+function updateCommandMenu() {
+  const query = commandsAtCaret();
+  if (query === null || state.commands.length === 0) {
+    closeCommandMenu();
+    return;
+  }
+  const matches = state.commands.filter((command) => command.name.startsWith(query.toLowerCase()));
+  if (matches.length === 0) {
+    closeCommandMenu();
+    return;
+  }
+  commandState = { matches, index: 0 };
+  commandMenu.innerHTML = "";
+  matches.forEach((command, index) => {
+    const row = document.createElement("button");
+    row.className = `mention-row command-row${index === 0 ? " active" : ""}`;
+    row.setAttribute("role", "option");
+    row.innerHTML =
+      `<span class="command-name">/${escapeHtml(command.name)}</span>` +
+      `<span class="command-hint">${escapeHtml(command.argumentHint || command.description || "")}</span>`;
+    row.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      applyCommand(command);
+    });
+    commandMenu.appendChild(row);
+  });
+  commandMenu.hidden = false;
+}
+
+function closeCommandMenu() {
+  commandState = null;
+  commandMenu.hidden = true;
+}
+
+function applyCommand(command) {
+  input.value = `/${command.name} `;
+  input.setSelectionRange(input.value.length, input.value.length);
+  closeCommandMenu();
+  autoSize();
+  input.focus();
+}
+
+function moveCommand(delta) {
+  if (!commandState) return;
+  commandState.index = (commandState.index + delta + commandState.matches.length) % commandState.matches.length;
+  commandMenu.querySelectorAll(".command-row").forEach((row, index) => {
+    row.classList.toggle("active", index === commandState.index);
+  });
+  commandMenu.children[commandState.index]?.scrollIntoView({ block: "nearest" });
+}
+
 /* ---------- @ file references ---------- */
 
 const fileMention = $("file-mention");
@@ -531,6 +594,7 @@ function mentionAtCaret() {
 }
 
 function updateMention() {
+  updateCommandMenu();
   if (state.mentionTimer) clearTimeout(state.mentionTimer);
   const found = mentionAtCaret();
   if (!found) {
@@ -776,6 +840,14 @@ function handleEvent(message) {
 
     case "file_matches":
       if (message.query === mention?.query) renderMention(message.files ?? []);
+      break;
+
+    case "commands":
+      state.commands = message.commands ?? [];
+      break;
+
+    case "command_expanded":
+      addNotice("dim", `/${message.name}`);
       break;
 
     case "file":
@@ -1409,6 +1481,24 @@ function submit() {
 
 input.addEventListener("input", autoSize);
 input.addEventListener("keydown", (event) => {
+  if (!commandMenu.hidden && commandState) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      moveCommand(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeCommandMenu();
+      return;
+    }
+    if ((event.key === "Enter" || event.key === "Tab") && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      applyCommand(commandState.matches[commandState.index]);
+      return;
+    }
+  }
   if (!fileMention.hidden && mention) {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
@@ -1729,6 +1819,7 @@ if (api.platform) document.documentElement.classList.add(`platform-${api.platfor
 applyLocale(state.locale);
 setTheme(state.theme);
 api.send({ cmd: "listSessions" });
+api.send({ cmd: "listCommands" });
 api.send({ cmd: "getTree", path: "." });
 api.send({ cmd: "setLocale", locale: state.locale });
 input.focus();

@@ -30,6 +30,7 @@ import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus } from "./git.js";
+import { expandSlash, listCommands } from "../src/commands.ts";
 
 let config;
 let client;
@@ -450,8 +451,20 @@ async function handle(cmd) {
       }
       return;
     }
-    case "prompt":
-      void runPrompt(cmd.text);
+    case "prompt": {
+      // A known slash command expands into its prompt; anything else is sent
+      // verbatim so a message starting with "/" is never swallowed.
+      const expanded = expandSlash(cwd, String(cmd.text ?? ""));
+      if (!expanded) {
+        void runPrompt(cmd.text);
+        return;
+      }
+      send({ type: "command_expanded", name: expanded.command.name, prompt: expanded.prompt });
+      void runPrompt(expanded.prompt);
+      return;
+    }
+    case "listCommands":
+      send({ type: "commands", commands: listCommands(cwd).map(({ name, description, argumentHint }) => ({ name, description, argumentHint })) });
       return;
     case "abort":
       agent?.clearQueue();

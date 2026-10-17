@@ -1543,6 +1543,36 @@ mark.find-hit.current {
   vertical-align: 1px;
 }
 
+.command-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 4px;
+  z-index: 21;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+}
+
+.command-name {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.command-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---------- @ file references ---------- */
 
 .file-mention {
