@@ -10,7 +10,7 @@ prometheus "add input validation to src/parser.ts"
 npm run desktop          # the same agent in a window
 ```
 
-![Prometheus desktop](shot-chat.png)
+![Prometheus desktop](docs/images/desktop.png)
 
 ## Desktop app
 

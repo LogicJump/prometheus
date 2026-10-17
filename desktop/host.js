@@ -34,6 +34,7 @@ import { expandSlash, listCommands } from "../src/commands.ts";
 import { loadMcpTools } from "../src/mcp.ts";
 import { sessionToMarkdown, exportFilename, markRunActive, clearRunActive, findInterruptedRun } from "../src/export.ts";
 import { createWorktree, commitWorktree, worktreeDiff, mergeWorktree, removeWorktree } from "../src/worktree.ts";
+import { artifactCandidates, collectArtifacts, readArtifact } from "../src/artifacts.ts";
 
 let config;
 let client;
@@ -139,6 +140,18 @@ function computeChanges(baseline = changeBaseline) {
 
 function emitChanges() {
   send({ type: "changes", ...computeChanges(), lastTurn: computeChanges(turnBaseline) });
+}
+
+/**
+ * Previewable files this session touched, plus recent previewable files in the
+ * workspace when the session has not produced any.
+ */
+function emitArtifacts() {
+  const touched = [...changeBaseline.keys()];
+  const recent = touched.length > 0
+    ? collectArtifacts(cwd, touched, sessionCreatedAt)
+    : collectArtifacts(cwd, artifactCandidates(cwd), new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString());
+  send({ type: "artifacts", artifacts: recent.slice(0, 60) });
 }
 
 class HostUi {
@@ -400,6 +413,7 @@ async function runPrompt(text) {
     });
     emitChanges();
     send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
+    emitArtifacts();
     void emitGitStatus();
     void agent?.fireSessionHooks("Stop", { sessionId });
   }
@@ -644,6 +658,16 @@ async function handle(cmd) {
     }
     case "getChanges":
       emitChanges();
+      return;
+    case "getArtifacts":
+      emitArtifacts();
+      return;
+    case "getArtifact":
+      try {
+        send({ type: "artifact", artifact: readArtifact(cwd, String(cmd.path)) });
+      } catch (err) {
+        send({ type: "notice", level: "error", text: err.message });
+      }
       return;    case "getTree":
       send({ type: "tree", path: cmd.path ?? ".", nodes: readWorkspaceTree(cwd, cmd.path ?? ".") });
       return;

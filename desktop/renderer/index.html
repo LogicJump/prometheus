@@ -79,6 +79,7 @@
         <div class="sidebar-tabs" id="sidebar-tabs" role="tablist">
           <button role="tab" data-tab="files" class="active" data-i18n="tabFiles">Files</button>
           <button role="tab" data-tab="changes" data-i18n="tabChanges">Changes</button>
+          <button role="tab" data-tab="artifacts" data-i18n="tabArtifacts">Artifacts</button>
           <button role="tab" data-tab="history" data-i18n="tabHistory">History</button>
         </div>
         <div class="sidebar-panel" id="sidebar-panel">
@@ -105,6 +106,9 @@
           </div>
           <div class="panel-view" data-view="history" hidden>
             <div class="checkpoint-list" id="checkpoint-list"></div>
+          </div>
+          <div class="panel-view" data-view="artifacts" hidden>
+            <div class="artifact-list" id="artifact-list"></div>
           </div>
         </div>
 
@@ -187,6 +191,7 @@
                 <button role="tab" data-pane="diff" class="active" data-i18n="paneDiff">Changes</button>
                 <button role="tab" data-pane="file" data-i18n="paneFile">File</button>
                 <button role="tab" data-pane="terminal" data-i18n="paneTerminal">Terminal</button>
+                <button role="tab" data-pane="artifact" data-i18n="paneArtifact" hidden>Artifact</button>
               </div>
               <div class="workbench-meta" id="workbench-meta"></div>
               <div class="diff-scope" id="diff-scope" role="radiogroup" aria-label="Diff scope" hidden>
@@ -215,6 +220,7 @@
                   <button class="btn btn-quiet small" id="terminal-restart" data-i18n="terminalRestart">Restart</button>
                 </div>
               </div>
+              <div class="artifact-root" id="artifact-root" hidden></div>
             </div>
           </section>
         </main>

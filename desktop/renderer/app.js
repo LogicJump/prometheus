@@ -1,6 +1,7 @@
 /** Prometheus desktop renderer. */
 
 import { detectLocale, getDict } from "./i18n.js";
+import { escapeHtml, renderMarkdown } from "./markdown.js";
 
 /** Saved preferences are restored here; the host gets them on init. */
 const savedLocale = localStorage.getItem("prometheus.locale");
@@ -76,6 +77,8 @@ const state = {
   git: null,
   worktree: null,
   worktreeDiffText: "",
+  artifacts: [],
+  selectedArtifact: null,
   queuedCount: 0,
   sessionQuery: "",
   commands: [],
@@ -141,95 +144,7 @@ function statusLabel(key) {
 
 /* ---------- utilities ---------- */
 
-function escapeHtml(text) {
-  return text.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
-}
-
-/** Minimal, dependency-free markdown renderer (headings, lists, code, inline). */
-function renderMarkdown(source) {
-  const lines = source.replace(/\r\n/g, "\n").split("\n");
-  const out = [];
-  let i = 0;
-  let paragraph = [];
-
-  const flushParagraph = () => {
-    if (paragraph.length === 0) return;
-    out.push(`<p>${inline(paragraph.join(" "))}</p>`);
-    paragraph = [];
-  };
-
-  const inline = (text) =>
-    escapeHtml(text)
-      .replace(/`([^`]+)`/g, (_m, code) => `<code>${code}</code>`)
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(^|\s)\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
-      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_m, label, url) => `<a href="${url}">${label}</a>`);
-
-  while (i < lines.length) {
-    const line = lines[i];
-
-    if (/^\s*```/.test(line)) {
-      const lang = line.trim().replace(/^```/, "") || "text";
-      const body = [];
-      i++;
-      while (i < lines.length && !/^\s*```/.test(lines[i])) {
-        body.push(lines[i]);
-        i++;
-      }
-      i++; // closing fence
-      out.push(
-        `<pre><div class="code-head"><span>${escapeHtml(lang)}</span>` +
-          `<button class="code-copy" data-code>${escapeHtml(t.copy)}</button></div>` +
-          `<code>${escapeHtml(body.join("\n"))}</code></pre>`,
-      );
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,6})\s+(.*)$/);
-    if (heading) {
-      flushParagraph();
-      const level = Math.min(3, heading[1].length);
-      out.push(`<h${level}>${inline(heading[2])}</h${level}>`);
-      i++;
-      continue;
-    }
-
-    if (/^\s*([-*])\s+/.test(line) || /^\s*\d+\.\s+/.test(line)) {
-      flushParagraph();
-      const ordered = /^\s*\d+\.\s+/.test(line);
-      const items = [];
-      while (i < lines.length && (/^\s*([-*])\s+/.test(lines[i]) || /^\s*\d+\.\s+/.test(lines[i]))) {
-        items.push(lines[i].replace(/^\s*([-*]|\d+\.)\s+/, ""));
-        i++;
-      }
-      const tag = ordered ? "ol" : "ul";
-      out.push(`<${tag}>${items.map((item) => `<li>${inline(item)}</li>`).join("")}</${tag}>`);
-      continue;
-    }
-
-    if (/^\s*>\s?/.test(line)) {
-      flushParagraph();
-      const quote = [];
-      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
-        quote.push(lines[i].replace(/^\s*>\s?/, ""));
-        i++;
-      }
-      out.push(`<blockquote>${inline(quote.join(" "))}</blockquote>`);
-      continue;
-    }
-
-    if (line.trim() === "") {
-      flushParagraph();
-      i++;
-      continue;
-    }
-
-    paragraph.push(line.trim());
-    i++;
-  }
-  flushParagraph();
-  return out.join("");
-}
+const md = (source) => renderMarkdown(source, t.copy);
 
 function scrollToBottom(force = false) {
   const target = transcriptScroll || transcript;
@@ -294,7 +209,7 @@ function flushAssistant() {
     cancelAnimationFrame(current.raf);
     current.raf = 0;
   }
-  current.body.innerHTML = renderMarkdown(current.text);
+  current.body.innerHTML = md(current.text);
   current.body.classList.remove("streaming");
   state.currentAssistant = null;
   bindCodeCopy(current.node);
@@ -849,6 +764,15 @@ function handleEvent(message) {
       break;
     }
 
+    case "artifacts":
+      state.artifacts = message.artifacts ?? [];
+      renderArtifacts();
+      break;
+
+    case "artifact":
+      renderArtifact(message.artifact);
+      break;
+
     case "file_matches":
       if (message.query === mention?.query) renderMention(message.files ?? []);
       break;
@@ -987,7 +911,7 @@ function handleEvent(message) {
       if (!current.raf) {
         current.raf = requestAnimationFrame(() => {
           current.raf = 0;
-          current.body.innerHTML = `${renderMarkdown(current.text)}<span class="caret"></span>`;
+          current.body.innerHTML = `${md(current.text)}<span class="caret"></span>`;
           scrollToBottom();
         });
       }
@@ -1087,7 +1011,7 @@ function handleEvent(message) {
       for (const item of message.messages || []) {
         if (item.role === "user") addUserTurn(item.text);
         else if (item.role === "assistant") {
-          const node = addNode(`<div class="turn assistant"><div class="markdown">${renderMarkdown(item.text)}</div></div>`);
+          const node = addNode(`<div class="turn assistant"><div class="markdown">${md(item.text)}</div></div>`);
           bindCodeCopy(node);
         } else if (item.role === "tool") {
           addNode(
@@ -1149,11 +1073,13 @@ function openWorkbench(pane) {
   });
   const showDiff = state.pane === "diff";
   const showTerminal = state.pane === "terminal";
+  const showArtifact = state.pane === "artifact";
   diffRoot.hidden = !showDiff;
   diffFilelist.hidden = !showDiff || state.changes.files.length === 0;
   $("diff-scope").hidden = !showDiff;
   fileRoot.hidden = state.pane !== "file";
   terminalRoot.hidden = !showTerminal;
+  $("artifact-root").hidden = !showArtifact;
   if (showDiff) renderDiff();
   if (showTerminal) {
     openTerminal();
@@ -1469,6 +1395,113 @@ function selectSidebarTab(tab) {
   if (tab === "files") api.send({ cmd: "getTree", path: "." });
   if (tab === "changes") renderChangesPanel();
   if (tab === "history") api.send({ cmd: "getCheckpoints" });
+  if (tab === "artifacts") api.send({ cmd: "getArtifacts" });
+}
+
+/* ---------- artifacts ---------- */
+
+function renderArtifacts() {
+  const list = $("artifact-list");
+  list.innerHTML = "";
+  if (state.artifacts.length === 0) {
+    list.innerHTML = `<div class="sidebar-empty">${escapeHtml(t.noArtifacts)}</div>`;
+    return;
+  }
+  for (const artifact of state.artifacts) {
+    const row = document.createElement("button");
+    row.className = "artifact-row";
+    row.innerHTML =
+      `<span class="artifact-kind">${escapeHtml(artifact.kind)}</span>` +
+      `<span class="artifact-path">${escapeHtml(artifact.path)}</span>`;
+    row.title = `${artifact.path} · ${Math.round(artifact.size / 1024)} KB`;
+    row.addEventListener("click", () => {
+      state.selectedArtifact = artifact.path;
+      api.send({ cmd: "getArtifact", path: artifact.path });
+    });
+    list.appendChild(row);
+  }
+}
+
+/** Render one artifact in the right-hand workbench. */
+function renderArtifact(artifact) {
+  $("artifact-root").hidden = false;
+  const tab = workbenchTabs.querySelector('[data-pane="artifact"]');
+  if (tab) tab.hidden = false;
+  // Open the artifact's own tab without going through openWorkbench, which
+  // would render the session diff underneath it.
+  workbench.hidden = false;
+  transcript.classList.add("with-workbench");
+  state.pane = "artifact";
+  workbenchTabs.querySelectorAll("button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.pane === "artifact");
+  });
+  diffRoot.hidden = true;
+  fileRoot.hidden = true;
+  terminalRoot.hidden = true;
+  diffFilelist.hidden = true;
+  $("diff-scope").hidden = true;
+  const root = $("artifact-root");
+  root.hidden = false;
+  workbenchMeta.textContent = `${artifact.kind} · ${artifact.path}${artifact.truncated ? " · truncated" : ""}`;
+  if (artifact.kind === "html") {
+    // Scripts stay disabled: an agent-written page should not run in the app.
+    root.innerHTML = `<iframe class="artifact-frame" sandbox="" referrerpolicy="no-referrer" srcdoc="${escapeHtml(artifact.content)}"></iframe>`;
+  } else if (artifact.kind === "svg") {
+    root.innerHTML = `<div class="artifact-svg">${artifact.content}</div>`;
+  } else if (artifact.kind === "markdown") {
+    root.innerHTML = `<div class="artifact-markdown markdown">${md(artifact.content)}</div>`;
+  } else if (artifact.kind === "csv") {
+    renderCsvTable(root, artifact.content);
+  } else {
+    root.innerHTML = `<pre class="artifact-json">${escapeHtml(artifact.content)}</pre>`;
+  }
+}
+
+function renderCsvTable(root, text) {
+  const rows = parseCsvLocal(text);
+  if (rows.length === 0) {
+    root.innerHTML = `<div class="diff-empty">${escapeHtml(t.emptyFile)}</div>`;
+    return;
+  }
+  const head = rows[0].map((cell) => `<th>${escapeHtml(cell)}</th>`).join("");
+  const body = rows
+    .slice(1)
+    .map((row) => `<tr>${row.map((cell) => `<td>${escapeHtml(cell)}</td>`).join("")}</tr>`)
+    .join("");
+  root.innerHTML = `<div class="artifact-table-wrap"><table class="artifact-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+/** Local CSV parse (the host parser is not importable from the renderer). */
+function parseCsvLocal(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < text.length && rows.length < 500; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (ch === '"') quoted = false;
+      else field += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ",") {
+      row.push(field);
+      field = "";
+    } else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(field);
+      field = "";
+      if (row.some((cell) => cell !== "")) rows.push(row);
+      row = [];
+    } else field += ch;
+  }
+  if (field !== "" || row.length > 0) {
+    row.push(field);
+    if (row.some((cell) => cell !== "")) rows.push(row);
+  }
+  return rows;
 }
 
 /* ---------- sessions ---------- */
