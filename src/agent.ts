@@ -29,7 +29,8 @@ function toApiTools(tools: Tool[]): ApiTool[] {
 export class Agent {
   messages: ChatMessage[];
   readonly config: Config;
-  readonly ui: TerminalUi;
+  /** Not readonly: a sub-agent gets a proxy that folds its tool activity into the parent's view. */
+  ui: TerminalUi;
   readonly client: ChatClient;
   readonly todos: TodoList = { items: [] };
   usage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
@@ -361,6 +362,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   private async runSubagent(prompt: string, signal: AbortSignal): Promise<string> {
     if (this.isSubagent) throw new Error("sub-agents cannot spawn sub-agents");
     this.ui.info("  ↳ sub-agent started");
+    this.ui.subagentStart?.(prompt);
     const child = new Agent(
       { ...this.config, maxTurns: Math.min(25, this.config.maxTurns) },
       this.ui,
@@ -370,6 +372,16 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       [],
       true,
     );
+    // Surface the child's tool activity in the parent transcript's sub-agent group.
+    const parentUi = this.ui;
+    child.ui = new Proxy(parentUi, {
+      get(target, property, receiver) {
+        if (property === "toolStart") {
+          return (name: string, summary: string) => parentUi.subagentActivity?.("tool", `${name} ${summary}`);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as TerminalUi;
     child.abortController = new AbortController();
     // Propagate parent cancellation to the child.
     const onAbort = () => child.abort();
@@ -380,7 +392,12 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       this.usage.inputTokens += child.usage.inputTokens;
       this.usage.outputTokens += child.usage.outputTokens;
       this.ui.info("  ↳ sub-agent finished");
-      return typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
+      const report = typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
+      this.ui.subagentEnd?.(true, report.slice(0, 160));
+      return report;
+    } catch (err) {
+      this.ui.subagentEnd?.(false, (err as Error).message);
+      throw err;
     } finally {
       signal.removeEventListener("abort", onAbort);
       child.abortController = null;

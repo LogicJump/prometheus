@@ -87,6 +87,10 @@ export interface Ui {
   setModelName?(name: string): void;
   /** Echo a submitted user message into the transcript. */
   echoUser?(text: string): void;
+  /** A sub-agent's lifecycle, shown as a nested group in the transcript. */
+  subagentStart?(prompt: string): void;
+  subagentActivity?(kind: "tool" | "text", text: string): void;
+  subagentEnd?(ok: boolean, summary: string): void;
   /** True if the last streamed text ended mid-line. */
   takeLineDirty?(): boolean;
 }

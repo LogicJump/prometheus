@@ -78,6 +78,7 @@ const state = {
   sessionQuery: "",
   commands: [],
   diffScope: "session",
+  currentSubagent: null,
 };
 
 let t = getDict(state.locale);
@@ -849,6 +850,44 @@ function handleEvent(message) {
     case "file_matches":
       if (message.query === mention?.query) renderMention(message.files ?? []);
       break;
+
+    case "subagent_start": {
+      const node = addNode(
+        `<div class="subagent running">` +
+          `<div class="subagent-head"><span class="subagent-glyph">↳</span>` +
+          `<span class="subagent-title">${escapeHtml(t.subagentLabel)}</span>` +
+          `<span class="subagent-count"></span></div>` +
+          `<div class="subagent-prompt">${escapeHtml(message.prompt ?? "")}</div>` +
+          `<div class="subagent-activities"></div>` +
+          `</div>`,
+      );
+      state.currentSubagent = { node, count: 0 };
+      break;
+    }
+
+    case "subagent_activity": {
+      const sub = state.currentSubagent;
+      if (!sub) break;
+      sub.count += 1;
+      const list = sub.node.querySelector(".subagent-activities");
+      const line = document.createElement("div");
+      line.className = "subagent-line";
+      line.textContent = `${message.kind === "tool" ? "›" : "·"} ${message.text}`;
+      list.appendChild(line);
+      while (list.children.length > 40) list.removeChild(list.firstElementChild);
+      sub.node.querySelector(".subagent-count").textContent = String(sub.count);
+      break;
+    }
+
+    case "subagent_end": {
+      const sub = state.currentSubagent;
+      if (!sub) break;
+      sub.node.classList.remove("running");
+      if (!message.ok) sub.node.classList.add("failed");
+      sub.node.querySelector(".subagent-count").textContent = message.ok ? t.subagentDone : t.subagentFailed;
+      state.currentSubagent = null;
+      break;
+    }
 
     case "export_ready":
       exportSessionFile(message.markdown, message.filename);

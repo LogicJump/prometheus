@@ -177,6 +177,17 @@ class HostUi {
     send({ type: "user_queued_delivered", text });
     send({ type: "queued", count: agent ? agent.queuedCount : 0 });
   }
+  subagentStart(prompt) {
+    this.assistantEnd();
+    this.thinkingEnd();
+    send({ type: "subagent_start", prompt: String(prompt).slice(0, 300) });
+  }
+  subagentActivity(kind, text) {
+    send({ type: "subagent_activity", kind, text: String(text).slice(0, 300) });
+  }
+  subagentEnd(ok, summary) {
+    send({ type: "subagent_end", ok, summary: String(summary ?? "") });
+  }
   thinking() {
     if (this.assistantActive) this.assistantEnd();
     if (!this.thinkingActive) {
