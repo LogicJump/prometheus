@@ -73,6 +73,7 @@ const state = {
   sidebarTab: "files",
   git: null,
   queuedCount: 0,
+  sessionQuery: "",
 };
 
 let t = getDict(state.locale);
@@ -106,6 +107,9 @@ function applyLocale(locale, { announce = false } = {}) {
   $("clear-button").title = t.clearSession;
   $("sidebar-toggle").title = t.sessions;
   $("refresh-sessions").title = t.sessions;
+  const search = $("session-search");
+  search.placeholder = t.searchSessions;
+  search.title = t.searchSessions;
   $("theme-button").title = state.theme === "light" ? "Dark" : "Light";
   modelPicker.title = t.refreshModels;
   if (state.sessions.length > 0) renderSessions(state.sessions);
@@ -394,6 +398,91 @@ function setStatus(key) {
   statusText.textContent = statusLabel(key);
 }
 
+/* ---------- @ file references ---------- */
+
+const fileMention = $("file-mention");
+let mention = null;
+
+/** The `@fragment` under the caret, if the token starts a word. */
+function mentionAtCaret() {
+  const before = input.value.slice(0, input.selectionStart);
+  const match = /(^|\s)@([^\s@]*)$/.exec(before);
+  if (!match) return null;
+  return { start: input.selectionStart - match[2].length - 1, query: match[2] };
+}
+
+function updateMention() {
+  if (state.mentionTimer) clearTimeout(state.mentionTimer);
+  const found = mentionAtCaret();
+  if (!found) {
+    closeMention();
+    return;
+  }
+  mention = { ...found, files: [], index: 0 };
+  // Debounce so typing does not walk the tree on every keystroke.
+  state.mentionTimer = setTimeout(() => {
+    if (mention) api.send({ cmd: "searchFiles", query: found.query });
+  }, 120);
+}
+
+function renderMention(files) {
+  if (!mention) return;
+  mention.files = files;
+  mention.index = 0;
+  fileMention.innerHTML = "";
+  if (files.length === 0) {
+    fileMention.hidden = true;
+    return;
+  }
+  files.forEach((path, index) => {
+    const row = document.createElement("button");
+    row.className = `mention-row${index === 0 ? " active" : ""}`;
+    row.setAttribute("role", "option");
+    const cut = path.lastIndexOf("/");
+    row.innerHTML =
+      `<span class="mention-name">${escapeHtml(path.slice(cut + 1))}</span>` +
+      (cut > 0 ? `<span class="mention-dir">${escapeHtml(path.slice(0, cut))}</span>` : "");
+    row.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      applyMention(path);
+    });
+    fileMention.appendChild(row);
+  });
+  fileMention.hidden = false;
+}
+
+function closeMention() {
+  mention = null;
+  fileMention.hidden = true;
+}
+
+function applyMention(path) {
+  if (!mention) return;
+  const caret = input.selectionStart;
+  const before = input.value.slice(0, mention.start);
+  const after = input.value.slice(caret);
+  const inserted = `@${path} `;
+  input.value = `${before}${inserted}${after}`;
+  const position = before.length + inserted.length;
+  input.setSelectionRange(position, position);
+  closeMention();
+  autoSize();
+  input.focus();
+}
+
+function moveMention(delta) {
+  if (!mention || mention.files.length === 0) return;
+  mention.index = (mention.index + delta + mention.files.length) % mention.files.length;
+  fileMention.querySelectorAll(".mention-row").forEach((row, index) => {
+    row.classList.toggle("active", index === mention.index);
+  });
+  fileMention.children[mention.index]?.scrollIntoView({ block: "nearest" });
+}
+
+input.addEventListener("input", updateMention);
+input.addEventListener("click", updateMention);
+input.addEventListener("blur", () => setTimeout(closeMention, 120));
+
 /* ---------- notifications ---------- */
 
 /** Only notify when the window is not in front; otherwise the UI already told them. */
@@ -560,6 +649,10 @@ function handleEvent(message) {
       for (const node of message.nodes ?? []) target.appendChild(treeRow(node));
       break;
     }
+
+    case "file_matches":
+      if (message.query === mention?.query) renderMention(message.files ?? []);
+      break;
 
     case "file":
       renderFilePreview(message.file);
@@ -1120,21 +1213,40 @@ function relativeDate(iso) {
 function renderSessions(sessions) {
   state.sessions = sessions || [];
   sessionList.innerHTML = "";
-  if (state.sessions.length === 0) {
+  const query = state.sessionQuery.trim().toLowerCase();
+  const visible = query
+    ? state.sessions.filter(
+        (session) => session.summary.toLowerCase().includes(query) || session.cwd.toLowerCase().includes(query),
+      )
+    : state.sessions;
+  if (visible.length === 0) {
     const empty = document.createElement("div");
     empty.className = "sidebar-empty";
-    empty.textContent = t.noSessions;
+    empty.textContent = state.sessions.length === 0 ? t.noSessions : t.noSessionMatches;
     sessionList.appendChild(empty);
     return;
   }
-  for (const session of state.sessions) {
+  // Grouping by project keeps sessions from different folders distinguishable;
+  // with a single project the headers would be noise.
+  const projects = new Set(visible.map((session) => session.cwd));
+  const grouped = projects.size > 1;
+  let currentProject = "";
+  for (const session of visible) {
+    if (grouped && session.cwd !== currentProject) {
+      currentProject = session.cwd;
+      const heading = document.createElement("div");
+      heading.className = "session-group";
+      heading.textContent = currentProject.split(/[\\/]/).filter(Boolean).pop() || currentProject;
+      heading.title = currentProject;
+      sessionList.appendChild(heading);
+    }
     const button = document.createElement("button");
     button.className = `session-item${session.id === state.sessionId ? " active" : ""}`;
     const title = session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages;
     button.innerHTML =
       `<div class="session-title">${escapeHtml(title)}</div>` +
       `<div class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</div>`;
-    button.title = `${title}\n${session.id}`;
+    button.title = `${title}\n${session.id}\n${session.cwd}`;
     button.addEventListener("click", () => {
       api.send({ cmd: "loadSession", id: session.id });
     });
@@ -1167,6 +1279,25 @@ function submit() {
 
 input.addEventListener("input", autoSize);
 input.addEventListener("keydown", (event) => {
+  if (!fileMention.hidden && mention) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      moveMention(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMention();
+      return;
+    }
+    if ((event.key === "Enter" || event.key === "Tab") && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      const path = mention.files[mention.index];
+      if (path) applyMention(path);
+      return;
+    }
+  }
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
     submit();
@@ -1285,6 +1416,11 @@ $("clear-button").addEventListener("click", () => {
 });
 $("new-session").addEventListener("click", () => api.send({ cmd: "newSession" }));
 $("refresh-sessions").addEventListener("click", () => api.send({ cmd: "listSessions" }));
+
+$("session-search").addEventListener("input", (event) => {
+  state.sessionQuery = event.target.value;
+  renderSessions(state.sessions);
+});
 
 function toggleSidebar() {
   document.querySelector(".shell").classList.toggle("collapsed");

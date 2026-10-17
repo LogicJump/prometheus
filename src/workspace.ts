@@ -20,8 +20,16 @@ const SKIP = new Set([
   ".cache",
   "coverage",
   ".prometheus",
+  ".research",
   "release",
 ]);
+
+/** Build output from repeated packaging runs: release, release2, release15, … */
+function skipEntry(name: string): boolean {
+  if (SKIP.has(name)) return true;
+  if (/^release\d+$/i.test(name)) return true;
+  return name.startsWith(".DS_Store");
+}
 
 export interface TreeNode {
   name: string;
@@ -42,7 +50,7 @@ export function readWorkspaceTree(cwd: string, relPath = "."): TreeNode[] {
   }
   const nodes: TreeNode[] = [];
   for (const entry of entries) {
-    if (SKIP.has(entry.name) || entry.name.startsWith(".DS_Store")) continue;
+    if (skipEntry(entry.name)) continue;
     const full = join(abs, entry.name);
     const rel = relative(cwd, full).split("\\").join("/");
     if (entry.isDirectory()) nodes.push({ name: entry.name, path: rel, type: "dir" });
@@ -53,6 +61,48 @@ export function readWorkspaceTree(cwd: string, relPath = "."): TreeNode[] {
 }
 
 const TEXT_LIMIT = 400 * 1024;
+
+/**
+ * Rank workspace files against a typed fragment for the composer's `@`
+ * completion. Matching is on the file name first (so `@diff` finds `diff.ts`
+ * from anywhere) and on the path second; shallower paths win ties.
+ */
+export function searchWorkspaceFiles(cwd: string, query: string, limit = 12): string[] {
+  const needle = query.trim().toLowerCase();
+  const results: { path: string; score: number }[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 8 || results.length > 4000) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (skipEntry(entry.name)) continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const rel = relative(cwd, full).split("\\").join("/");
+      const name = entry.name.toLowerCase();
+      const path = rel.toLowerCase();
+      let score = -1;
+      if (!needle) score = 100;
+      else if (name === needle) score = 0;
+      else if (name.startsWith(needle)) score = 1;
+      else if (name.includes(needle)) score = 2;
+      else if (path.includes(needle)) score = 3;
+      if (score < 0) continue;
+      results.push({ path: rel, score: score * 100 + rel.split("/").length });
+    }
+  };
+  walk(cwd, 0);
+  results.sort((a, b) => a.score - b.score || a.path.localeCompare(b.path));
+  return results.slice(0, limit).map((result) => result.path);
+}
 
 export interface FilePreview {
   path: string;

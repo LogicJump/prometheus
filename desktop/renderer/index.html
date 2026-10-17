@@ -50,6 +50,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6M20 20v-6h-6" /><path d="M4.5 15a8 8 0 0 0 14-3M19.5 9a8 8 0 0 0-14 3" /></svg>
           </button>
         </div>
+        <div class="session-search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>
+          <input id="session-search" type="search" spellcheck="false" autocomplete="off" />
+        </div>
         <nav class="session-list" id="session-list" aria-label="Sessions"></nav>
 
         <div class="sidebar-tabs" id="sidebar-tabs" role="tablist">
@@ -181,6 +185,7 @@
           </div>
 
           <div class="composer">
+            <div class="file-mention" id="file-mention" hidden role="listbox"></div>
             <textarea
               id="input"
               rows="1"

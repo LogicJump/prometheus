@@ -702,6 +702,56 @@ svg {
   text-align: left;
 }
 
+.session-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 8px 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.session-search svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 13px;
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-width: 1.7;
+}
+
+.session-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+}
+
+.session-search input::placeholder {
+  color: var(--text-faint);
+}
+
+.session-search input::-webkit-search-cancel-button {
+  filter: grayscale(1);
+  opacity: 0.5;
+}
+
+.session-group {
+  padding: 10px 9px 3px;
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .session-item:hover {
   background: var(--surface);
 }
@@ -1333,6 +1383,7 @@ svg {
 }
 
 .composer {
+  position: relative;
   max-width: 780px;
   margin: 0 auto;
   display: flex;
@@ -1428,6 +1479,55 @@ svg {
   border-radius: 5px;
   padding: 0 4px;
   vertical-align: 1px;
+}
+
+/* ---------- @ file references ---------- */
+
+.file-mention {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: 0;  max-height: 240px;
+  overflow-y: auto;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 4px;
+  z-index: 20;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+}
+
+.mention-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 0;
+}
+
+.mention-row.active,
+.mention-row:hover {
+  background: var(--surface-hover);
+}
+
+.mention-name {
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.mention-dir {
+  color: var(--text-faint);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
 }
 
 /* ---------- git ---------- */

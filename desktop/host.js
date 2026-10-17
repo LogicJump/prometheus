@@ -26,7 +26,7 @@ import { discoverModels, FALLBACK_MODELS } from "../src/models.ts";
 import { detectLocale, isLocale } from "../src/i18n.ts";
 import { buildChange } from "../src/diff.ts";
 import { loadCheckpoints, restoreTo, clearCheckpoints, captureBefore } from "../src/checkpoints.ts";
-import { loadFilePreview, readWorkspaceTree } from "../src/workspace.ts";
+import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src/workspace.ts";
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus } from "./git.js";
@@ -566,6 +566,9 @@ async function handle(cmd) {
       return;
     case "getTree":
       send({ type: "tree", path: cmd.path ?? ".", nodes: readWorkspaceTree(cwd, cmd.path ?? ".") });
+      return;
+    case "searchFiles":
+      send({ type: "file_matches", query: cmd.query ?? "", files: searchWorkspaceFiles(cwd, String(cmd.query ?? "")) });
       return;
     case "getFile":
       try {
