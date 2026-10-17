@@ -1,0 +1,30 @@
+{
+  "appId": "dev.prometheus.desktop",
+  "productName": "Prometheus",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "desktop/**/*",
+    "src/**/*",
+    "bin/**/*",
+    "package.json",
+    "README.md"
+  ],
+  "win": {
+    "target": ["nsis", "portable"],
+    "artifactName": "Prometheus-${version}-${arch}.${ext}"
+  },
+  "mac": {
+    "target": ["dmg"],
+    "category": "public.app-category.developer-tools"
+  },
+  "linux": {
+    "target": ["AppImage", "deb"],
+    "category": "Development"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true
+  }
+}

@@ -1,12 +1,28 @@
 # Prometheus
 
-A general-purpose terminal coding agent. It talks to any OpenAI-compatible
-`/chat/completions` endpoint, streams responses, and works on your repository
-through a small, explicit tool set.
+A general-purpose terminal coding agent, with a desktop app. It talks to any
+OpenAI-compatible `/chat/completions` endpoint, streams responses, and works on
+your repository through a small, explicit tool set.
 
 ```
 prometheus "add input validation to src/parser.ts"
+npm run desktop          # the same agent in a window
 ```
+
+![Prometheus desktop](shot-chat.png)
+
+## Desktop app
+
+```bash
+npm install              # installs Electron
+npm run desktop
+```
+
+The window opens on the current directory; click the workspace chip to switch
+folders. Modes and models sit under the composer, sessions live in the drawer,
+and tool calls appear inline with expandable output. Packaging is configured for
+electron-builder (`npm run build`) into NSIS/portable, dmg, and AppImage/deb.
+See [desktop/README.md](desktop/README.md) for the host protocol.
 
 ## What it does
 

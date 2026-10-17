@@ -74,12 +74,18 @@ export interface Ui {
   assistantEnd(): void;
   toolStart(name: string, summary: string): void;
   toolEnd(name: string, ok: boolean, summary: string): void;
-  thinking(delta: string): void;
+  /** Full, possibly long tool output for inspection. */
+  toolOutput?(name: string, content: string): void;  thinking(delta: string): void;
   thinkingEnd(): void;
   todos(items: TodoItem[]): void;
   confirm(question: string): Promise<"yes" | "always" | "no">;
   spinnerStart(text: string): void;
   spinnerStop(): void;
+  setModelName?(name: string): void;
+  /** Echo a submitted user message into the transcript. */
+  echoUser?(text: string): void;
+  /** True if the last streamed text ended mid-line. */
+  takeLineDirty?(): boolean;
 }
 
 export interface PermissionManager {

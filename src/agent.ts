@@ -253,10 +253,12 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     try {
       const result = await tool.execute(input, ctx);
       this.ui.toolEnd(name, !result.isError, result.display ?? "");
+      this.ui.toolOutput?.(name, result.content);
       return { content: result.isError ? `Error: ${result.content}` : result.content };
     } catch (err) {
       const message = (err as Error).message ?? String(err);
       this.ui.toolEnd(name, false, message.slice(0, 160));
+      this.ui.toolOutput?.(name, message);
       return { content: `Error: ${message}` };
     }
   }

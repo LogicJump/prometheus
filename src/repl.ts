@@ -207,7 +207,7 @@ export class Repl {
       this.ui.error(formatError(err));
     } finally {
       saveSession(this.sessionFile());
-      if (this.ui.takeLineDirty()) stdout.write("\r\n");
+      if (this.ui.takeLineDirty?.()) stdout.write("\r\n");
     }
   }
 
