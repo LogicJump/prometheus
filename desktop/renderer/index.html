@@ -62,8 +62,22 @@
             <div class="file-tree" id="file-tree"></div>
           </div>
           <div class="panel-view" data-view="changes" hidden>
+            <div class="git-bar" id="git-bar" hidden>
+              <button class="git-branch" id="git-branch" title="Copy branch name">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="6" r="2.2" /><circle cx="7" cy="18" r="2.2" /><circle cx="17" cy="8" r="2.2" /><path d="M7 8.2v7.6M17 10.2c0 3-2.4 4-5 4.4-2.2.3-4 1-4 3.4" /></svg>
+                <span id="git-branch-name">—</span>
+              </button>
+              <span class="git-sync" id="git-sync"></span>
+            </div>
             <div class="changes-summary" id="changes-summary"></div>
             <div class="changes-list" id="changes-list"></div>
+            <div class="git-commit" id="git-commit" hidden>
+              <textarea id="git-message" rows="2" spellcheck="false" placeholder="Commit message"></textarea>
+              <div class="git-commit-actions">
+                <span class="git-commit-note" id="git-commit-note"></span>
+                <button class="btn btn-primary small" id="git-commit-button" data-i18n="commitAll">Commit all</button>
+              </div>
+            </div>
           </div>
           <div class="panel-view" data-view="history" hidden>
             <div class="checkpoint-list" id="checkpoint-list"></div>

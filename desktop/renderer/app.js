@@ -71,6 +71,8 @@ const state = {
   tree: [],
   pane: "diff",
   sidebarTab: "files",
+  git: null,
+  queuedCount: 0,
 };
 
 let t = getDict(state.locale);
@@ -113,6 +115,11 @@ function applyLocale(locale, { announce = false } = {}) {
   setStatus(state.statusKey);
   if (state.models.length > 0) renderModelMenu();
   if (announce) api.send({ cmd: "setLocale", locale });
+  const message = $("git-message");
+  if (message) message.placeholder = t.commitPlaceholder;
+  const commitButton = $("git-commit-button");
+  if (commitButton) commitButton.textContent = t.commitAll;
+  if (state.git) renderGitBar();
   void announce;
 }
 
@@ -566,6 +573,24 @@ function handleEvent(message) {
       setTerminalState(message);
       break;
 
+    case "git_status":
+      state.git = message;
+      renderGitBar();
+      break;
+
+    case "git_commit": {
+      const note = $("git-commit-note");
+      if (message.ok) {
+        note.textContent = t.commitDone;
+        $("git-message").value = "";
+        addNode(`<div class="notice dim">${escapeHtml(t.commitDone)} ${escapeHtml(message.summary ?? "")}</div>`);
+        scrollToBottom();
+      } else {
+        note.textContent = `${t.commitFailed} ${message.error ?? ""}`;
+      }
+      break;
+    }
+
     case "queued":
       setQueuedBadge(message.count ?? 0);
       break;
@@ -898,6 +923,7 @@ function renderDiffFileList() {
 }
 
 function renderChangesPanel() {
+  renderGitBar();
   changesList.innerHTML = "";
   const { files, additions, deletions } = state.changes;
   changesSummary.innerHTML = files.length
@@ -918,6 +944,51 @@ function renderChangesPanel() {
     changesList.appendChild(row);
   }
 }
+
+/* ---------- git ---------- */
+
+function renderGitBar() {
+  const bar = $("git-bar");
+  const git = state.git;
+  if (!git || !git.available) {
+    bar.hidden = false;
+    $("git-branch-name").textContent = t.gitNotRepo;
+    $("git-sync").textContent = "";
+    $("git-commit").hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  $("git-branch-name").textContent = git.branch || "HEAD";
+  const sync = [];
+  if (git.ahead > 0) sync.push(t.gitAhead(git.ahead));
+  if (git.behind > 0) sync.push(t.gitBehind(git.behind));
+  if (sync.length === 0 && git.clean) sync.push(t.gitClean);
+  $("git-sync").textContent = sync.join(" ");
+  $("git-commit").hidden = git.clean;
+}
+
+function sendCommit() {
+  const message = $("git-message").value.trim();
+  const note = $("git-commit-note");
+  if (!message) {
+    note.textContent = t.commitEmpty;
+    return;
+  }
+  note.textContent = "";
+  api.send({ cmd: "gitCommit", message });
+}
+
+$("git-commit-button").addEventListener("click", sendCommit);
+$("git-message").addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    sendCommit();
+  }
+});
+$("git-branch").addEventListener("click", () => {
+  const name = state.git?.branch;
+  if (name) void navigator.clipboard.writeText(name);
+});
 
 function renderCheckpoints() {
   checkpointList.innerHTML = "";

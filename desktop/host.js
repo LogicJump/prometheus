@@ -29,6 +29,7 @@ import { loadCheckpoints, restoreTo, clearCheckpoints, captureBefore } from "../
 import { loadFilePreview, readWorkspaceTree } from "../src/workspace.ts";
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
 import { TerminalSession } from "./terminal.js";
+import { gitCommit, gitStatus } from "./git.js";
 
 let config;
 let client;
@@ -303,6 +304,12 @@ function disposeTerminal() {
   terminal = null;
 }
 
+async function emitGitStatus() {
+  const status = await gitStatus(cwd);
+  send({ type: "git_status", ...status });
+  return status;
+}
+
 async function runPrompt(text) {
   if (running) {
     // A message typed mid-turn is queued and delivered at the next tool
@@ -333,10 +340,11 @@ async function runPrompt(text) {
     });
     emitChanges();
     send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
+    void emitGitStatus();
   }
 }
 
-function handle(cmd) {
+async function handle(cmd) {
   switch (cmd.cmd) {
     case "init": {
       if (cmd.cwd && existsSync(cmd.cwd)) {
@@ -360,6 +368,7 @@ function handle(cmd) {
       });
       createAgent([]);
       send({ type: "ready" });
+      void emitGitStatus();
       void refreshCatalog(false);
       return;
     }
@@ -541,6 +550,7 @@ function handle(cmd) {
         createAgent([]);
         send({ type: "session_loaded", messages: [], cwd });
         void refreshCatalog(false);
+        void emitGitStatus();
       }
       return;
     }
@@ -628,6 +638,17 @@ function handle(cmd) {
     case "terminalClose":
       disposeTerminal();
       return;
+    case "gitStatus":
+      void emitGitStatus();
+      return;
+    case "gitCommit": {
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      const paths = Array.isArray(cmd.paths) ? cmd.paths.map(String) : [];
+      const result = await gitCommit(cwd, cmd.message, paths);
+      send({ type: "git_commit", ...result });
+      void emitGitStatus();
+      return;
+    }
     default:
       send({ type: "notice", level: "warn", text: `unknown command: ${cmd.cmd}` });
   }
@@ -671,7 +692,9 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(newline + 1);
     if (!line) continue;
     try {
-      handle(JSON.parse(line));
+      void handle(JSON.parse(line)).catch((err) => {
+        send({ type: "notice", level: "error", text: `host error: ${err.message}` });
+      });
     } catch (err) {
       send({ type: "notice", level: "error", text: `host error: ${err.message}` });
     }
