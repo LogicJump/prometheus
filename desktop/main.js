@@ -84,6 +84,17 @@ function rememberWorkspace(cwd, explicit = false) {
   }
 }
 
+/** Numeric compare of dotted versions: 1.10.0 > 1.9.2. */
+function compareVersions(left, right) {
+  const a = String(left).split(/[.+-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const b = String(right).split(/[.+-]/).map((part) => Number.parseInt(part, 10) || 0);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
 function startWindow() {
   // Read the candidate here, in the browser process, not at module load.
   const explicitWorkspace = app.isPackaged ? cliArgs.find(isDirectory) : undefined;
@@ -268,6 +279,35 @@ app.whenReady().then(() => {
   ipcMain.handle("browser-close", async (event) => {
     closeBrowser(BrowserWindow.fromWebContents(event.sender));
     return true;
+  });
+
+  ipcMain.handle("app-version", async () => app.getVersion());
+
+  /**
+   * Update check against a JSON feed at PROMETHEUS_UPDATE_URL, shaped like a
+   * GitHub latest-release response: { tag_name, html_url, body }. Updates are
+   * installed by the user; nothing downloads or runs unattended.
+   */
+  ipcMain.handle("check-update", async () => {
+    const feed = process.env.PROMETHEUS_UPDATE_URL;
+    if (!feed) return { status: "unconfigured" };
+    try {
+      const response = await fetch(feed, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!response.ok) return { status: "error", message: `HTTP ${response.status}` };
+      const latest = await response.json();
+      const tag = String(latest.tag_name ?? latest.version ?? "").replace(/^v/, "");
+      return {
+        status: compareVersions(tag, app.getVersion()) > 0 ? "available" : "current",
+        latest: tag,
+        current: app.getVersion(),
+        url: typeof latest.html_url === "string" ? latest.html_url : null,
+      };
+    } catch (err) {
+      return { status: "error", message: err.message };
+    }
   });
 
   ipcMain.handle("notify", async (event, { title, body }) => {

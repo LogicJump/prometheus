@@ -121,6 +121,7 @@ function applyLocale(locale, { announce = false } = {}) {
   search.placeholder = t.searchSessions;
   search.title = t.searchSessions;
   $("find-input").placeholder = t.findPlaceholder;
+  $("check-update").textContent = t.checkUpdate;
   $("theme-button").title = state.theme === "light" ? "Dark" : "Light";
   modelPicker.title = t.refreshModels;
   // applyLocale also runs during startup, before the voice state is declared.
@@ -2053,6 +2054,34 @@ $("settings-close").addEventListener("click", () => closeModal(settingsDialog));
 $("settings-cancel").addEventListener("click", () => closeModal(settingsDialog));
 $("settings-save").addEventListener("click", saveSettings);
 
+/* ---------- about / update check ---------- */
+
+async function refreshVersion() {
+  if (!api.appVersion) return;
+  const version = await api.appVersion();
+  const node = $("about-version");
+  if (node && version) node.textContent = version;
+}
+
+$("check-update").addEventListener("click", async () => {
+  const note = $("update-note");
+  note.textContent = t.updateChecking;
+  const result = await api.checkUpdate();
+  if (!result || result.status === "unconfigured") {
+    note.textContent = t.updateUnconfigured;
+  } else if (result.status === "error") {
+    note.textContent = `${t.updateError} ${result.message ?? ""}`;
+  } else if (result.status === "available") {
+    note.innerHTML =
+      `${escapeHtml(t.updateAvailable)} ${escapeHtml(result.latest)} ` +
+      (result.url ? `<button class="link-button" id="update-open">${escapeHtml(t.updateOpen)}</button>` : "");
+    const open = $("update-open");
+    if (open) open.addEventListener("click", () => api.openExternal(result.url));
+  } else {
+    note.textContent = t.updateCurrent;
+  }
+});
+
 /* ---------- shortcuts sheet ---------- */
 
 function openShortcuts() {
@@ -2124,6 +2153,7 @@ applyLocale(state.locale);
 setTheme(state.theme);
 setDensity(state.density);
 setupVoice();
+void refreshVersion();
 api.send({ cmd: "listSessions" });
 api.send({ cmd: "listCommands" });
 api.send({ cmd: "getTree", path: "." });

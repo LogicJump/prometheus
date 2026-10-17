@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld("prometheus", {
   browserNavigate: (action, arg) => ipcRenderer.invoke("browser-navigate", action, arg),
   browserSnapshot: () => ipcRenderer.invoke("browser-snapshot"),
   browserClose: () => ipcRenderer.invoke("browser-close"),
+  checkUpdate: () => ipcRenderer.invoke("check-update"),
+  appVersion: () => ipcRenderer.invoke("app-version"),
   onBrowserState: (handler) => {
     const listener = (_event, message) => handler(message);
     ipcRenderer.on("browser-state", listener);
