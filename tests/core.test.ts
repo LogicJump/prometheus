@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { estimateTokens, compact, compactForce } from "../src/context.ts";
 import { globToRegExp } from "../src/tools/fsUtil.ts";
 import { ChatClient } from "../src/llm.ts";
+import { diffFile } from "../src/diff.ts";
 import { startFakeServer } from "./fakeServer.ts";
 import type { ChatMessage } from "../src/llm.ts";
 
@@ -39,6 +40,28 @@ test("glob conversion handles ** and braces", () => {
   assert.ok(globToRegExp("src/**/*.{js,ts}").test("src/x/y.ts"));
   assert.ok(globToRegExp("src/*.js").test("src/a.js"));
   assert.ok(!globToRegExp("src/*.js").test("src/sub/a.js"));
+});
+
+test("diff reports additions, deletions, and context with line numbers", () => {
+  const diff = diffFile("a.txt", "one\ntwo\nthree\n", "one\nTWO\nthree\nfour\n");
+  assert.equal(diff.status, "modified");
+  assert.equal(diff.additions, 2);
+  assert.equal(diff.deletions, 1);
+  assert.equal(diff.hunks.length, 1);
+  const kinds = diff.hunks[0].lines.map((line) => line.kind);
+  assert.deepEqual(kinds, ["context", "del", "add", "context", "add"]);
+  assert.equal(diff.hunks[0].lines[1].oldNo, 2);
+  assert.equal(diff.hunks[0].lines[2].newNo, 2);
+});
+
+test("diff distinguishes new and deleted files and ignores a trailing newline", () => {
+  assert.equal(diffFile("new.txt", null, "a\nb\n").status, "added");
+  assert.equal(diffFile("new.txt", null, "a\nb\n").additions, 2);
+  assert.equal(diffFile("gone.txt", "a\nb\n", null).deletions, 2);
+  const same = diffFile("same.txt", "a\nb\n", "a\nb");
+  assert.equal(same.additions, 0);
+  assert.equal(same.deletions, 0);
+  assert.equal(same.hunks.length, 0);
 });
 
 test("streaming accumulates split tool-call deltas and usage", async () => {
