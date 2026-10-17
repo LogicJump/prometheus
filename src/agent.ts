@@ -36,7 +36,8 @@ export class Agent {
   sessionId = "";
   /** Called before a mutating tool runs; used to snapshot file state for diffs. */
   onBeforeMutate: ((toolName: string, input: Record<string, unknown>) => void) | null = null;
-  private readonly tools: Tool[];
+  /** Mutable so MCP tools can be added after startup. */
+  private tools: Tool[];
   private readonly permissions: Permissions;
   private readonly isSubagent: boolean;
   private abortController: AbortController | null = null;
@@ -118,6 +119,12 @@ Prefer dedicated file tools over bash for reading and editing. Use bash for buil
 Use the remember tool for durable facts about the user or project. Do not save transient task state.
 ${memory ? `\n# Existing memory\n${memory}` : ""}
 ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""}`;
+  }
+
+  /** Add tools at runtime (MCP servers connect after the first turn may start). */
+  addTools(extra: Tool[]): void {
+    const known = new Set(this.tools.map((tool) => tool.name));
+    for (const tool of extra) if (!known.has(tool.name)) this.tools.push(tool);
   }
 
   /** Add a user message without running the loop (used when restoring sessions). */

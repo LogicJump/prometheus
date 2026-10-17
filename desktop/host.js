@@ -31,6 +31,7 @@ import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../sr
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
+import { loadMcpTools } from "../src/mcp.ts";
 
 let config;
 let client;
@@ -44,6 +45,8 @@ let permissionSeq = 0;
 let running = false;
 /** Persistent shell behind the terminal pane; created on first use. */
 let terminal = null;
+/** MCP servers started for the current workspace. */
+let mcpClients = [];
 const persistedUi = readUiSettings();
 let locale = isLocale(persistedUi.locale) ? persistedUi.locale : detectLocale();
 /** Discovered model catalog; replaced whenever /models is (re)read. */
@@ -305,6 +308,33 @@ function disposeTerminal() {
   terminal = null;
 }
 
+/**
+ * Start the configured MCP servers and give their tools to the agent. Failures
+ * are reported as notices: one broken server must not block the session.
+ */
+async function startMcp() {
+  for (const client of mcpClients) client.dispose();
+  mcpClients = [];
+  let loaded;
+  try {
+    loaded = await loadMcpTools(cwd);
+  } catch (err) {
+    send({ type: "notice", level: "warn", text: `MCP: ${err.message}` });
+    return;
+  }
+  mcpClients = loaded.clients;
+  if (loaded.tools.length > 0) {
+    agent?.addTools(loaded.tools);
+    send({ type: "notice", level: "dim", text: `MCP: ${loaded.tools.length} tool(s) loaded` });
+  }
+  for (const error of loaded.errors) send({ type: "notice", level: "warn", text: `MCP: ${error}` });
+}
+
+function stopMcp() {
+  for (const client of mcpClients) client.dispose();
+  mcpClients = [];
+}
+
 async function emitGitStatus() {
   const status = await gitStatus(cwd);
   send({ type: "git_status", ...status });
@@ -370,6 +400,7 @@ async function handle(cmd) {
       createAgent([]);
       send({ type: "ready" });
       void emitGitStatus();
+      void startMcp();
       void refreshCatalog(false);
       return;
     }
@@ -564,6 +595,8 @@ async function handle(cmd) {
         send({ type: "session_loaded", messages: [], cwd });
         void refreshCatalog(false);
         void emitGitStatus();
+        stopMcp();
+        void startMcp();
       }
       return;
     }
@@ -717,7 +750,11 @@ process.stdin.on("data", (chunk) => {
   }
 });
 
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => {
+  stopMcp();
+  disposeTerminal();
+  process.exit(0);
+});
 
 process.on("uncaughtException", (err) => {
   send({ type: "error", message: `host crashed: ${err.message}` });
