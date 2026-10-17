@@ -247,7 +247,7 @@ function handle(cmd) {
         cwd = cmd.cwd;
         process.chdir(cwd);
       }
-      if (isLocale(cmd.locale)) locale = cmd.locale;
+  if (isLocale(cmd.locale)) locale = cmd.locale;
       try {
         config = loadConfig({ permissionMode: cmd.mode });
       } catch (err) {

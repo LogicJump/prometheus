@@ -2,6 +2,10 @@
 
 import { detectLocale, getDict } from "./i18n.js";
 
+/** Saved preferences are restored here; the host gets them on init. */
+const savedLocale = localStorage.getItem("prometheus.locale");
+const savedTheme = localStorage.getItem("prometheus.theme");
+
 const api = window.prometheus;
 
 const $ = (id) => document.getElementById(id);
@@ -35,8 +39,8 @@ const state = {
   modelsSource: "",
   sessionId: "",
   sessions: [],
-  locale: detectLocale(),
-  theme: localStorage.getItem("prometheus.theme") || "dark",
+  locale: savedLocale === "zh" || savedLocale === "en" ? savedLocale : detectLocale(),
+  theme: savedTheme || "dark",
   statusKey: "statusStarting",
   currentAssistant: null,
   currentThinking: null,

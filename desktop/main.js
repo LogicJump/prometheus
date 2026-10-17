@@ -169,8 +169,7 @@ function startWindow() {
     }
     sendToHost({ cmd: "init", cwd: startCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
     if (cliArgs.length > 0) rememberWorkspace(startCwd, true);
-  });
-  win.on("closed", () => {
+  });  win.on("closed", () => {
     host.kill();
   });
 
