@@ -120,21 +120,43 @@ function applyModelContext(id) {
   if (agent) agent.config.contextWindow = entry.contextLength;
 }
 
+/**
+ * Refresh the model list without ever leaving the picker on "loading models…".
+ * Callers use `void refreshCatalog()`, so an exception here would be an
+ * unhandled rejection that the renderer never hears about. Reporting the
+ * failure explicitly is what lets the picker leave the loading state.
+ */
 async function refreshCatalog(force = false) {
-  if (!config?.baseUrl) return;
-  const next = await discoverModels(config.baseUrl, config.apiKey, { force });
-  catalog = next;
-  // Keep the active model if the endpoint still lists it; otherwise fall back to
-  // the first advertised model so the next turn can actually run.
-  if (config.model && !pickerModels().some((m) => m.id === config.model) && next.models.length > 0) {
-    const replacement = pickerModels()[0].id;
-    config.model = replacement;
-    if (client) client.options.model = replacement;
-    if (agent) agent.refreshSystemPrompt();
+  if (!config?.baseUrl) {
+    send({ type: "models", models: [], model: config?.model ?? "", source: "unconfigured", fetchedAt: null });
+    return;
   }
-  applyModelContext(config.model);
-  emitState();
-  send({ type: "models", models: pickerModels(), model: config.model, source: next.source, fetchedAt: next.fetchedAt });
+  try {
+    const next = await discoverModels(config.baseUrl, config.apiKey, { force });
+    catalog = next;
+    // Keep the active model if the endpoint still lists it; otherwise fall back to
+    // the first advertised model so the next turn can actually run.
+    if (config.model && !pickerModels().some((m) => m.id === config.model) && next.models.length > 0) {
+      const replacement = pickerModels()[0].id;
+      config.model = replacement;
+      if (client) client.options.model = replacement;
+      if (agent) agent.refreshSystemPrompt();
+    }
+    applyModelContext(config.model);
+    emitState();
+    send({ type: "models", models: pickerModels(), model: config.model, source: next.source, fetchedAt: next.fetchedAt });
+  } catch (err) {
+    // Still send the catalogue we have — fallback models are usually enough to
+    // run — but say why it is stale so the picker stops spinning.
+    send({
+      type: "models",
+      models: pickerModels(),
+      model: config.model,
+      source: "error",
+      error: err instanceof Error ? err.message : String(err),
+      fetchedAt: null,
+    });
+  }
 }
 
 /**

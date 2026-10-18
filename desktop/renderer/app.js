@@ -58,6 +58,7 @@ const state = {
   model: "",
   models: [],
   modelsSource: "",
+  modelsError: "",
   providers: [],
   sessionId: "",
   sessions: [],
@@ -841,17 +842,28 @@ function setEffort(effort) {
 
 /* ---------- model picker ---------- */
 
-function renderModels(models, current, source) {
+function renderModels(models, current, source, error) {
   state.models = models || [];
   state.model = current;
   state.modelsSource = source || "";
+  state.modelsError = error || "";
   if (current) {
     modelLabel.textContent = current;
+    // applyLocale rewrites every [data-i18n] node from the dictionary, so
+    // leaving the attribute on would put "loading models…" back the next time
+    // the user switches language — after the real model name had been shown.
+    modelLabel.removeAttribute("data-i18n");
     modelPicker.classList.remove("unavailable");
     // The meter is a share of the model's real context, not a placeholder.
     const active = state.models.find((model) => model.id === current);
     if (active && Number.isFinite(active.contextLength)) state.contextWindow = active.contextLength;
+  } else {
+    // Nothing to show: the label must still leave the loading state, or the
+    // chip spins forever on a misconfigured endpoint.
+    modelLabel.textContent = t.modelsUnavailable;
+    modelPicker.classList.add("unavailable");
   }
+  modelPicker.title = state.modelsError || t.refreshModels;
   if (!modelMenu.hidden) renderModelMenu();
 }
 function renderModelMenu() {
@@ -937,8 +949,11 @@ function handleEvent(message) {
       setMode(message.mode);
       setEffort(message.effort || "auto");
       if (message.sandbox) state.sandbox = message.sandbox;
-  if (Array.isArray(message.models) && message.models.length > 0) {
-        renderModels(message.models, message.model, message.modelsSource);
+      // A state event may arrive before the catalogue has been fetched; keep
+      // whatever we already have rather than blanking the picker back to
+      // "loading models…".
+      if (Array.isArray(message.models) && message.models.length > 0) {
+        renderModels(message.models, message.model, state.modelsSource);
       } else if (message.model) {
         renderModels(state.models, message.model, state.modelsSource);
       }
@@ -948,7 +963,7 @@ function handleEvent(message) {
       break;
 
     case "models":
-      renderModels(message.models, message.model, message.source);
+      renderModels(message.models, message.model, message.source, message.error);
       break;
 
     case "changes":
