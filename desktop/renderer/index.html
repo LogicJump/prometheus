@@ -431,6 +431,19 @@
       <div class="shortcut-grid" id="shortcut-grid"></div>
     </dialog>
 
+    <!-- Electron 里 window.prompt() 是被禁用的（调用直接返回 null），
+         所以任何需要用户输入一行文字的地方都得有自己的对话框。 -->
+    <dialog class="input-dialog" id="input-dialog" hidden>
+      <form method="dialog">
+        <label class="input-dialog-label" id="input-dialog-label" for="input-dialog-field"></label>
+        <input class="input-dialog-field" id="input-dialog-field" type="text" autocomplete="off" />
+        <footer class="input-dialog-actions">
+          <button type="button" class="btn" id="input-dialog-cancel" data-i18n="cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="input-dialog-ok" data-i18n="ok">OK</button>
+        </footer>
+      </form>
+    </dialog>
+
     <script type="module" src="app.js"></script>
   </body>
 </html>

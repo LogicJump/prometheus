@@ -68,6 +68,7 @@
   --sidebar-width: 264px;
   --reading-width: 780px;
   --font-scale: 1;
+  --mark-size: 22px;
 }
 
 :root[data-theme="light"] {
@@ -182,7 +183,7 @@ svg {
   border-right: 1px solid var(--border);
   padding: 0 10px 10px;
   -webkit-app-region: drag;
-  transition: margin-left 180ms ease;
+  transition: width 180ms ease, flex-basis 180ms ease, padding 180ms ease;
 }
 
 .sidebar button,
@@ -191,15 +192,31 @@ svg {
 }
 
 .shell.collapsed .sidebar {
-  margin-left: calc(-1 * var(--sidebar-width) - 1px);
+  /* 折叠只需要把宽度收成 0 —— 同时用负 margin 会把元素挤成负宽度，
+     后面的内容跟着左移过头，反而露出空白。padding 和边框也要一起归零，
+     否则 width: 0 的元素仍有 11px 的可视宽度。
+     transition 覆盖的仍是 margin-left，所以这里顺手改成宽度动画。 */
+  width: 0;
+  flex-basis: 0;
+  min-width: 0;
+  padding: 0;
+  border-right: 0;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 .sidebar-head {
-  height: 48px;
+  /* 图标到上边、到左边的距离必须是同一个数。它不是"某个值写错了"，
+     而是水平内边距和垂直居中本来就是两套算法：左边是 padding 给的，
+     上边是 (高度 − 图标高) / 2 算出来的。只要两者分开写，改高度或改
+     图标尺寸就会再次失配。所以这里让垂直间距由同一个变量推导。 */
+  --head-gap: 14px;
+  height: calc(var(--mark-size) + var(--head-gap) * 2);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 4px 0 6px;
+  /* 侧栏本身有 10px 左内边距，所以这里补到 --head-gap。 */
+  padding: 0 4px 0 calc(var(--head-gap) - 10px);
 }
 
 .sidebar-head-actions {
@@ -215,8 +232,8 @@ svg {
 }
 
 .mark {
-  width: 22px;
-  height: 22px;
+  width: var(--mark-size);
+  height: var(--mark-size);
   color: var(--accent);
   flex: 0 0 auto;
 }
@@ -3521,6 +3538,55 @@ mark.find-hit.current {
   width: min(520px, 92vw);
 }
 
+.input-dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  z-index: 42;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 18px 18px 14px;
+  width: min(420px, 92vw);
+  box-shadow: var(--shadow-popover);
+}
+
+.input-dialog::backdrop {
+  background: var(--scrim);
+}
+
+.input-dialog-label {
+  display: block;
+  margin-bottom: 10px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.input-dialog-field {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-base);
+}
+
+.input-dialog-field:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.input-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
 /* The settings page is a window-sized surface, not a dialog card. */
 .settings-dialog {
   width: min(1080px, 96vw);
@@ -3606,7 +3672,19 @@ mark.find-hit.current {
     box-shadow: var(--shadow-popover);
   }
   .shell.collapsed .sidebar {
-    margin-left: calc(-1 * var(--sidebar-width) - 1px);
+    /* 窄窗口里侧栏是 position: fixed 的抽屉，负 margin 不起作用。
+       它要么完全在屏幕外，要么完全在屏幕内。 */
+    margin-left: 0;
+    transform: translateX(-100%);
+    width: var(--sidebar-width);
+    flex-basis: auto;
+    padding: 0 10px 10px;
+    border-right: 1px solid var(--border);
+    pointer-events: none;
+  }
+  .shell:not(.collapsed) .sidebar {
+    transform: none;
+    pointer-events: auto;
   }
   .turn,
   .tool-group,

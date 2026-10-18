@@ -2207,9 +2207,9 @@ function renderSessions(sessions) {
 
   const labels = projectLabels([...groups.keys()], displayPath);
   for (const [cwd, items] of groups) {
-    // The open project folds to a single row that carries the conversation
-    // count; collapsed projects show their most recent few conversations, so
-    // every project stays reachable without a second click.
+    // The open project expands to its conversations; a folded one is a single
+    // row carrying the count, because a folder that still shows children is
+    // not folded.
     const explicitOpen = state.expandedProjects.has(cwd) && !state.collapsedProjects.has(cwd);
     const explicitClosed = state.collapsedProjects.has(cwd);
     const open = expandAll || explicitOpen || (!explicitClosed && cwd === activeProject);
@@ -2251,8 +2251,10 @@ function renderSessions(sessions) {
       renderSessions(state.sessions);
     });
     sessionList.appendChild(head);
-    // A folded project keeps its three latest conversations in view.
-    const shown = open ? items : items.slice(0, 3);
+    // A folded project shows only its name. Leaving a few conversations visible
+    // defeats the point of folding: the list is still crowded, and the count on
+    // the group row already says how many are inside.
+    const shown = open ? items : [];
 
     for (const session of shown) {
       const button = document.createElement("button");
@@ -2329,9 +2331,10 @@ function sendSessionFlags(session, flags) {
 
 function renameSession(session) {
   const current = session.title || session.summary || "";
-  const next = prompt(t.sessionRenamePrompt, current);
-  if (next === null) return;
-  sendSessionFlags(session, { title: next.trim() || null });
+  askText(t.sessionRenamePrompt, current).then((next) => {
+    if (next === null) return;
+    sendSessionFlags(session, { title: next.trim() || null });
+  });
 }
 
 document.addEventListener("mousedown", (event) => {
@@ -2637,10 +2640,47 @@ $("pr-create").addEventListener("click", async () => {
   // A PR needs a pushed branch; ask the agent to run the push so the user sees
   // the command in the transcript instead of it happening silently.
   const current = state.sessions.find((session) => session.id === state.sessionId);
-  const title = prompt(t.prTitlePrompt, current?.title || current?.summary || "");
+  const title = await askText(t.prTitlePrompt, current?.title || current?.summary || "");
   if (title === null) return;
   api.send({ cmd: "createPr", title: title.trim(), body: t.prBodyDefault });
 });
+
+/**
+ * Ask for one line of text.
+ *
+ * `window.prompt()` does not work in Electron: it is not implemented and
+ * returns null without showing anything, so every call site that used it
+ * looked like a dead button. This wraps a real `<dialog>` in the same shape —
+ * resolves to the string, or null when cancelled.
+ */
+function askText(label, value = "") {
+  return new Promise((resolve) => {
+    const dialog = $("input-dialog");
+    const field = $("input-dialog-field");
+    $("input-dialog-label").textContent = label;
+    field.value = value;
+
+    const done = (result) => {
+      dialog.removeEventListener("close", onClose);
+      $("input-dialog-cancel").removeEventListener("click", onCancel);
+      resolve(result);
+    };
+    const onCancel = () => dialog.close();
+    const onClose = () => {
+      // `returnValue` is "ok" only when the form was submitted; closing by Esc
+      // or the cancel button leaves it empty.
+      done(dialog.returnValue === "ok" ? field.value : null);
+    };
+
+    dialog.returnValue = "";
+    dialog.addEventListener("close", onClose, { once: true });
+    $("input-dialog-cancel").addEventListener("click", onCancel);
+
+    dialog.showModal();
+    field.focus();
+    field.select();
+  });
+}
 
 /* ---------- command palette ---------- */
 
@@ -2670,6 +2710,9 @@ function paletteEntries() {
     { label: t.modeAsk, run: () => api.send({ cmd: "setMode", mode: "ask" }) },
     { label: t.modeAuto, run: () => api.send({ cmd: "setMode", mode: "auto" }) },
     { label: t.modePlan, run: () => api.send({ cmd: "setMode", mode: "plan" }) },
+    // 压缩一直是自动的，但那意味着用户没法在自己想腾出上下文的时候
+    // 腾出上下文 —— 比如刚读完一大堆文件，马上要换一个话题。
+    { label: t.compactNow, run: () => api.send({ cmd: "compact" }) },
     { label: t.shortcutStop, run: () => api.send({ cmd: "abort" }) },
   ];
   for (const command of state.commands) {
