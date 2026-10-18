@@ -254,6 +254,14 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
   });
   if (!command) return empty(`Detected a ${project.kind} project but have no build command for it.`);
 
+  // A compiler with no C library compiles and then fails to link, and the error
+  // names the user's code. Say what is actually wrong before running anything.
+  const toolchains = await detectToolchains();
+  const arm = toolchains.tools.find((entry) => entry.kind === "gcc-arm");
+  if (arm && arm.complete === false) {
+    return empty(`The Arm toolchain is installed but unusable: ${arm.problem}`);
+  }
+
   const timeout = options.timeoutMs ?? 10 * 60_000;
   const result = await run(command.program, command.args, command.cwd, timeout);
   const parsed = parseDiagnostics(result.out);

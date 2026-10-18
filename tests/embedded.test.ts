@@ -17,6 +17,7 @@ import { findArtifacts } from "../src/embedded/build.ts";
 import { miFields, miList, parseMiLine, parseStackFrames, parseStopReason, parseVariables, SERVER_PORTS, serverCommand } from "../src/embedded/debug.ts";
 import { findRegister, parseSvd, peripheralIndex, registerAddress } from "../src/embedded/svd.ts";
 import { parseClangTidyYaml, parseCppcheckXml, parseMemoryUsage, parseStackUsage } from "../src/embedded/analyze.ts";
+import type { FoundTool } from "../src/embedded/toolchain.ts";
 import { existsSync } from "node:fs";
 
 function scratch(prefix: string): string {
@@ -793,4 +794,30 @@ test("stack usage marks a dynamic frame as a lower bound", () => {
   assert.equal(frames[0].function, "main");
   assert.equal(frames[0].bytes, 128);
   assert.equal(frames.find((frame) => frame.function === "recurse")?.kind, "dynamic");
+});
+
+// ---- toolchain health ------------------------------------------------------
+
+test("a toolchain source is recorded so the UI can show where it came from", () => {
+  // The report distinguishes PATH finds from install-root finds; the shape is
+  // what the settings screen and the build guard both read.
+  const found: FoundTool = {
+    kind: "gcc-arm",
+    path: "C:/tools/arm/bin/arm-none-eabi-gcc.exe",
+    version: "15.3.1",
+    source: "install-root",
+    complete: true,
+  };
+  assert.equal(found.source, "install-root");
+  assert.equal(found.complete, true);
+
+  const broken: FoundTool = {
+    kind: "gcc-arm",
+    path: "/opt/homebrew/bin/arm-none-eabi-gcc",
+    version: "16.2.0",
+    source: "path",
+    complete: false,
+    problem: "this compiler has no C library",
+  };
+  assert.equal(broken.complete, false);
 });

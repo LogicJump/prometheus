@@ -46,6 +46,17 @@ export interface FoundTool {
   /** Absolute path to the executable. */
   path: string;
   version: string;
+  /**
+   * A tool that answers `--version` but cannot link is worse than a missing
+   * one, because detection accepts it and the failure moves to link time.
+   * Homebrew's arm-none-eabi-gcc is exactly that: a compiler-only bottle with
+   * no libc. `complete` is false when the toolchain itself says so.
+   */
+  complete?: boolean;
+  /** Why it is incomplete, when it is. */
+  problem?: string;
+  /** Where it came from, for the settings UI. */
+  source?: "path" | "install-root";
 }
 
 export interface ToolchainReport {
@@ -158,16 +169,17 @@ const SPECS: Spec[] = [
 ];
 
 /** PATH first, then the extra directories; the first hit wins. */
-function locate(spec: Spec): string | null {
-  const dirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
-  const all = [...dirs, ...extraSearchPaths()];
-  for (const dir of all) {
-    for (const name of spec.names) {
-      const candidate = join(dir, name);
-      try {
-        if (statSync(candidate).isFile()) return candidate;
-      } catch {
-        /* not here */
+function locate(spec: Spec): { path: string; source: "path" | "install-root" } | null {
+  const pathDirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  for (const [dirs, source] of [[pathDirs, "path"], [extraSearchPaths(), "install-root"]] as const) {
+    for (const dir of dirs) {
+      for (const name of spec.names) {
+        const candidate = join(dir, name);
+        try {
+          if (statSync(candidate).isFile()) return { path: candidate, source };
+        } catch {
+          /* not here */
+        }
       }
     }
   }
@@ -195,6 +207,34 @@ function runVersion(path: string, args: string[]): Promise<string> {
 let cached: ToolchainReport | null = null;
 
 /**
+ * Does this Arm GCC have a C library behind it?
+ *
+ * `-print-file-name=libc.a` resolves to an absolute path in a complete Arm
+ * install and echoes the string back when there is no libc — which is what
+ * Homebrew's compiler-only bottle does. Without this check the toolchain looks
+ * installed, `embed_build` runs, and the failure lands at link time as
+ * `cannot find -lc`, pointing at the user's code instead of their toolchain.
+ */
+async function checkArmCompleteness(gccPath: string): Promise<{ complete?: boolean; problem?: string }> {
+  const result = await new Promise<string>((resolve) => {
+    execFile(gccPath, ["-print-file-name=libc.a"], { timeout: 8000, windowsHide: true }, (error, stdout) => {
+      resolve(error ? "" : String(stdout ?? "").trim());
+    });
+  });
+  if (!result) return {};
+  // A resolved path contains a separator; a bare `libc.a` means none was found.
+  if (!/[\\/]/.test(result)) {
+    return {
+      complete: false,
+      problem:
+        "this compiler has no C library (Homebrew's arm-none-eabi-gcc is built --without-headers and cannot link). " +
+        "Install the Arm GNU Toolchain from developer.arm.com instead.",
+    };
+  }
+  return { complete: true };
+}
+
+/**
  * Probe every tool once per process. `refresh` re-runs the search, which the
  * settings page uses after the user installs something.
  */
@@ -206,13 +246,14 @@ export async function detectToolchains(refresh = false): Promise<ToolchainReport
 
   await Promise.all(
     SPECS.map(async (spec) => {
-      const path = locate(spec);
-      if (!path) {
+      const located = locate(spec);
+      if (!located) {
         missing.push(spec.kind);
         return;
       }
-      const version = await runVersion(path, spec.versionArgs);
-      found.push({ kind: spec.kind, path, version });
+      const version = await runVersion(located.path, spec.versionArgs);
+      const health = spec.kind === "gcc-arm" ? await checkArmCompleteness(located.path) : {};
+      found.push({ kind: spec.kind, path: located.path, version, source: located.source, ...health });
     }),
   );
 
