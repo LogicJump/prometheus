@@ -1082,6 +1082,17 @@
   white-space: pre-wrap;
 }
 
+/* 校验通过是"没什么事发生"，但它仍然需要一句回话 —— 否则用户点了
+   按钮之后不知道到底跑没跑。用一条安静的成功提示，不用卡片。 */
+.pack-ok {
+  padding: 8px 14px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
 /* 离线安装是外网受限时的唯一出路，但它不是主路径：放在列表末尾，
    用一条分隔线而不是一张卡片，避免和"可安装"那组抢注意力。 */
 .pack-offline {

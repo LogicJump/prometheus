@@ -31,6 +31,8 @@ state.memory = { global: [], project: [] };
 state.systemState = null;
 state.packState = null;
 state.packProgress = null;
+/** A transient "that worked" line, cleared on the next action. */
+state.packNotice = null;
 /** The pack id whose Remove button is awaiting its second click. */
 state.packRemoveArmed = null;
 state.settingsQuery = "";
@@ -1202,6 +1204,11 @@ function buildToolsPage() {
       const box = el("div", "pack-error");
       box.textContent = state.packError;
       list.appendChild(box);
+    } else if (state.packNotice) {
+      // 校验通过是"什么也没发生"，但用户点了按钮，总得有一句回话。
+      const box = el("div", "pack-ok");
+      box.textContent = state.packNotice;
+      list.appendChild(box);
     }
 
     // 根目录与占用：这是"别把文件系统搞乱"这个问题最直接的回答。
@@ -1716,6 +1723,11 @@ function basename(path) {
         state.renderPackPage?.();
         break;
       case "pack_progress":
+        // 新的一次操作开始了，上一次的"校验通过"就不该再挂在页面上。
+        if (message.phase === "preflight" || message.phase === "download") {
+          state.packNotice = null;
+          state.packError = "";
+        }
         state.renderPackProgress?.(message);
         break;
       case "pack_installed":
@@ -1730,6 +1742,7 @@ function basename(path) {
         break;
       case "pack_verified":
         state.packError = message.ok ? "" : (message.problems ?? []).join("; ");
+        state.packNotice = message.ok ? S().packVerifiedOk : null;
         state.renderPackPage?.();
         break;
       case "pack_pruned":
