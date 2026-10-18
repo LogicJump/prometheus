@@ -2278,7 +2278,8 @@ $("worktree-discard").addEventListener("click", () => {
 });
 
 $("clear-button").addEventListener("click", () => {
-  if (confirm(t.clearConfirm)) api.send({ cmd: "newSession" });
+  // Clearing keeps the session and its saved history; only the transcript goes.
+  if (confirm(t.clearConfirm)) api.send({ cmd: "clearHistory" });
 });
 $("new-session").addEventListener("click", () => api.send({ cmd: "newSession" }));
 $("refresh-sessions").addEventListener("click", () => {
