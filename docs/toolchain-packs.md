@@ -140,3 +140,19 @@ contains no entries for them — an installable list is a promise that the
 artefacts were downloaded and hashed, and we have only made that promise for
 Windows. `catalogFor` filters by platform and arch, so adding a platform later
 means adding tested entries, not changing code.
+
+## What the installer actually weighs
+
+Measured on 2026-10-18, `electron-builder --win --publish never`:
+
+| | |
+|---|---|
+| `Prometheus-0.1.0-x64.exe` (NSIS) | 106.5 MB |
+| `release\win-unpacked\` | 370 MB |
+| `app.asar` — our code | **1.1 MB** |
+
+The other 369 MB is Electron. Nothing in this feature adds a single byte to
+those numbers, because packs are user data under `%LOCALAPPDATA%` and there is
+no `extraResources` entry to bundle them. That is the whole point of the design:
+the installer stays the size of a framework, and compilers arrive only if
+someone builds firmware.
