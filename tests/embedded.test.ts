@@ -12,6 +12,9 @@ import { parseDiagnostics, sortDiagnostics, summarizeDiagnostics, collapseCascad
 import { detectProject, buildCommand } from "../src/embedded/project.ts";
 import { matchTarget, parsePyocdTargets, pyocdProbes } from "../src/embedded/probe.ts";
 import { capture, parseLine } from "../src/embedded/serial.ts";
+import { classifyOutput, commandFor, flash, parseSize, validate } from "../src/embedded/flash.ts";
+import { findArtifacts } from "../src/embedded/build.ts";
+import { existsSync } from "node:fs";
 
 function scratch(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -336,4 +339,154 @@ test("a port that cannot be opened reports the reason, not a hang", async () => 
   }, "COM7", { timeoutMs: 100 });
   assert.equal(result.lines.length, 0);
   assert.match(result.errors.join(" "), /Access denied/);
+});
+
+// ---- flashing --------------------------------------------------------------
+
+const ELF_FIXTURE = "C:/Users/Admin/AppData/Local/Temp/fltest/t.elf";
+const hasFixture = existsSync(ELF_FIXTURE);
+
+test("a flash is refused before running when it would be ambiguous", () => {
+  const tmp = scratch("prometheus-flash-");
+  const bin = join(tmp, "fw.bin");
+  writeFileSync(bin, Buffer.alloc(64, 0xff));
+
+  // A raw .bin with no address: every tool defaults differently.
+  assert.match(String(validate({ kind: "pyocd", program: "pyocd", firmware: bin, target: "stm32f412xe" })), /load address/);
+  assert.equal(validate({ kind: "pyocd", program: "pyocd", firmware: bin, target: "stm32f412xe", address: 0x08000000 }), null);
+
+  // No target means the tool picks one, which is how the wrong board gets flashed.
+  const elf = join(tmp, "fw.elf");
+  writeFileSync(elf, "not really an elf");
+  assert.match(String(validate({ kind: "pyocd", program: "pyocd", firmware: elf })), /needs a target/);
+  assert.match(String(validate({ kind: "openocd", program: "openocd", firmware: elf })), /target config/);
+
+  // A missing file and an empty one are both refused.
+  assert.match(String(validate({ kind: "pyocd", program: "pyocd", firmware: join(tmp, "nope.elf"), target: "x" })), /not found/);
+  const empty = join(tmp, "empty.elf");
+  writeFileSync(empty, "");
+  assert.match(String(validate({ kind: "pyocd", program: "pyocd", firmware: empty, target: "x" })), /empty/);
+});
+
+test("the command vector matches what each tool actually expects", () => {
+  const pyocd = commandFor({ kind: "pyocd", program: "pyocd", firmware: "fw.elf", target: "stm32f412xe" });
+  assert.deepEqual(pyocd, ["flash", "-f", "fw.elf", "--target", "stm32f412xe"]);
+
+  const openocd = commandFor({
+    kind: "openocd",
+    program: "openocd",
+    firmware: "fw.elf",
+    interfaceConfig: "interface/stlink.cfg",
+    targetConfig: "target/stm32f4x.cfg",
+  });
+  assert.deepEqual(openocd.slice(0, 4), ["-f", "interface/stlink.cfg", "-f", "target/stm32f4x.cfg"]);
+  // The whole program/verify/reset/exit sequence is one -c string.
+  assert.match(openocd[5], /^program fw\.elf verify reset exit$/);
+
+  const esptool = commandFor({ kind: "esptool", program: "esptool", firmware: "app.bin", address: 0x10000 });
+  assert.deepEqual(esptool, ["--chip", "auto", "--baud", "460800", "write_flash", "0x10000", "app.bin"]);
+});
+
+test("a tool that says it failed is not rescued by a zero exit code", () => {
+  // pyOCD prints "loaded" and then "verify failed"; the second must win.
+  const pyocd = classifyOutput("pyocd", "[flasher] loaded 1024 bytes\nERROR: Verify failed", 0);
+  assert.equal(pyocd.ok, false);
+  assert.match(String(pyocd.reason), /Verify failed/i);
+
+  const openocd = classifyOutput("openocd", "** Programming Started **\n** Programming Failed **", 0);
+  assert.equal(openocd.ok, false);
+
+  const esptool = classifyOutput("esptool", "Writing at 0x1000... (100%)\nA fatal error occurred: Failed to connect", 0);
+  assert.equal(esptool.ok, false);
+});
+
+test("a success with a verify step reports verified", () => {
+  const verified = classifyOutput("openocd", "** Programming Started **\n** Programming Finished **\n** Verified OK **\nshutdown command invoked", 0);
+  assert.equal(verified.ok, true);
+  assert.equal(verified.verified, true);
+
+  const esptool = classifyOutput("esptool", "Hash of data verified.\nLeaving...", 0);
+  assert.equal(esptool.ok, true);
+  assert.equal(esptool.verified, true);
+});
+
+test("no status phrase falls back to the exit code and says so", () => {
+  const quiet = classifyOutput("probe-rs", "some unfamiliar output", 0);
+  assert.equal(quiet.ok, true);
+  assert.match(String(quiet.reason), /exit code 0/);
+
+  const crashed = classifyOutput("probe-rs", "some unfamiliar output", 2);
+  assert.equal(crashed.ok, false);
+});
+
+test("a flash with a missing firmware never spawns a process", async () => {
+  const result = await flash({ kind: "pyocd", program: "definitely-not-a-program", firmware: "does-not-exist.elf", target: "x" });
+  assert.equal(result.ok, false);
+  assert.equal(result.command, "");
+  assert.match(String(result.reason), /not found/);
+});
+
+test("size parsing separates what reaches flash from what stays on disk", { skip: !hasFixture }, () => {
+  // Real `arm-none-eabi-size -A` output for a tiny Cortex-M image.
+  const output = [
+    "t.elf  :",
+    "section           size        addr",
+    ".text               14   134217728",
+    ".persistent          0   134221840",
+    ".noinit              0   134221840",
+    ".comment            69           0",
+    ".ARM.attributes     46           0",
+    "Total              129",
+  ].join("\n");
+
+  const usage = parseSize(output);
+  // .comment and .ARM.attributes never reach the chip.
+  assert.equal(usage.flash, 14);
+  assert.equal(usage.sections.length, 3);
+  assert.equal(usage.sections[0].address, 0x08000000);
+});
+
+test("a .data section counts against both flash and RAM", () => {
+  const output = [
+    "section           size        addr",
+    ".text             1024   134217728",
+    ".data               64   536870912",
+    ".bss               512   536871000",
+  ].join("\n");
+  const usage = parseSize(output);
+  // .data's initialiser lives in flash, its storage in RAM.
+  assert.equal(usage.flash, 1024 + 64);
+  assert.equal(usage.ram, 64 + 512);
+});
+
+// ---- artifacts -------------------------------------------------------------
+
+test("an artifact finder trusts ELF magic over the file extension", () => {
+  const root = scratch("prometheus-artifacts-");
+  mkdirSync(join(root, "build"), { recursive: true });
+
+  // CMake's OUTPUT_NAME strips the suffix; this is a real ELF with no extension.
+  const magic = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]);
+  writeFileSync(join(root, "build", "firmware"), magic);
+  // A text file with no extension must not be mistaken for one.
+  writeFileSync(join(root, "build", "CMakeCache.txt"), "not an elf");
+  writeFileSync(join(root, "build", "notes"), "plain text");
+  writeFileSync(join(root, "build", "app.hex"), ":00000001FF\n");
+
+  const artifacts = findArtifacts(root, ["build/*.elf", "build/*.hex"]);
+  const kinds = artifacts.map((artifact) => `${artifact.relative}:${artifact.kind}`).sort();
+  assert.deepEqual(kinds, ["build/app.hex:hex", "build/firmware:elf"]);
+});
+
+test("the newest artifact wins, and an ELF beats its own hex", () => {
+  const root = scratch("prometheus-artifacts2-");
+  mkdirSync(join(root, "build"), { recursive: true });
+  const magic = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
+  writeFileSync(join(root, "build", "old.elf"), magic);
+  // Same-size, same-mtime ELF and hex: the ELF carries the debug symbols.
+  writeFileSync(join(root, "build", "fw.elf"), magic);
+  writeFileSync(join(root, "build", "fw.hex"), ":00000001FF\n");
+
+  const artifacts = findArtifacts(root, ["build/*.elf", "build/*.hex"]);
+  assert.equal(artifacts[0].kind, "elf");
 });
