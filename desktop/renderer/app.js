@@ -7,6 +7,8 @@ import { escapeHtml, renderMarkdown } from "./markdown.js";
 const savedLocale = localStorage.getItem("prometheus.locale");
 const savedTheme = localStorage.getItem("prometheus.theme");
 const savedDensity = localStorage.getItem("prometheus.density");
+const savedTab = localStorage.getItem("prometheus.sidebarTab");
+const savedWorkbench = localStorage.getItem("prometheus.workbench");
 
 const api = window.prometheus;
 
@@ -73,7 +75,8 @@ const state = {
   selectedFile: null,
   tree: [],
   pane: "diff",
-  sidebarTab: "files",
+  sidebarTab: savedTab || "files",
+  workbenchOpen: savedWorkbench === "1",
   git: null,
   worktree: null,
   worktreeDiffText: "",
@@ -1139,6 +1142,8 @@ function handleEvent(message) {
 function openWorkbench(pane) {
   state.pane = pane ?? state.pane;
   workbench.hidden = false;
+  state.workbenchOpen = true;
+  localStorage.setItem("prometheus.workbench", "1");
   transcript.classList.add("with-workbench");
   workbenchTabs.querySelectorAll("button").forEach((button) => {
     button.classList.toggle("active", button.dataset.pane === state.pane);
@@ -1167,6 +1172,8 @@ function openWorkbench(pane) {
 
 function closeWorkbench() {
   workbench.hidden = true;
+  state.workbenchOpen = false;
+  localStorage.setItem("prometheus.workbench", "0");
   transcript.classList.remove("with-workbench");
   // The page view floats above the window, so it must be removed explicitly.
   void api.browserClose?.();
@@ -1581,6 +1588,7 @@ function renderFilePreview(file) {
 
 function selectSidebarTab(tab) {
   state.sidebarTab = tab;
+  localStorage.setItem("prometheus.sidebarTab", tab);
   sidebarTabs.querySelectorAll("button").forEach((button) => {
     button.classList.toggle("active", button.dataset.tab === tab);
   });
@@ -2234,7 +2242,8 @@ $("pr-open").addEventListener("click", () => {
 $("pr-create").addEventListener("click", async () => {
   // A PR needs a pushed branch; ask the agent to run the push so the user sees
   // the command in the transcript instead of it happening silently.
-  const title = prompt(t.prTitlePrompt, state.sessionTitle || "");
+  const current = state.sessions.find((session) => session.id === state.sessionId);
+  const title = prompt(t.prTitlePrompt, current?.title || current?.summary || "");
   if (title === null) return;
   api.send({ cmd: "createPr", title: title.trim(), body: t.prBodyDefault });
 });
@@ -2687,6 +2696,7 @@ setupVoice();
 void refreshVersion();
 api.send({ cmd: "listSessions" });
 api.send({ cmd: "listCommands" });
+if (state.sidebarTab !== "files") selectSidebarTab(state.sidebarTab);
 api.send({ cmd: "getTree", path: "." });
 api.send({ cmd: "setLocale", locale: state.locale });
 input.focus();
