@@ -2013,6 +2013,10 @@ stopButton.addEventListener("click", () => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    if (paletteState) {
+      closePalette();
+      return;
+    }
     if (!findBar.hidden) {
       closeFind();
       return;
@@ -2036,7 +2040,10 @@ document.addEventListener("keydown", (event) => {
   const mod = event.ctrlKey || event.metaKey;
   if (!mod) return;
   const key = event.key.toLowerCase();
-  if (key === "f") {
+  if (key === "k") {
+    event.preventDefault();
+    openPalette();
+  } else if (key === "f") {
     event.preventDefault();
     openFind();
   } else if (key === "n") {
@@ -2079,6 +2086,124 @@ document.addEventListener("keydown", (event) => {
 document.addEventListener("click", (event) => {
   if (!modelMenu.hidden && !event.target.closest(".model-control")) closeModelMenu();
 });
+
+
+/* ---------- command palette ---------- */
+
+/**
+ * One searchable list of actions and open commands. It is the discoverable
+ * counterpart to the keyboard shortcuts, not a second implementation: every
+ * entry calls the same function the button or shortcut calls.
+ */
+function paletteEntries() {
+  const entries = [
+    { label: t.newSession, run: () => api.send({ cmd: "newSession" }) },
+    { label: t.shortcutSettings, run: openSettings },
+    { label: t.shortcutShortcuts, run: openShortcuts },
+    { label: t.toggleSidebar, run: toggleSidebar },
+    { label: t.newWindow, run: () => api.newWindow() },
+    { label: t.exportSession, run: () => api.send({ cmd: "exportSession" }) },
+    { label: t.paneDiff, run: () => openWorkbench("diff") },
+    { label: t.tabFiles, run: () => selectSidebarTab("files") },
+    { label: t.tabChanges, run: () => selectSidebarTab("changes") },
+    { label: t.tabArtifacts, run: () => selectSidebarTab("artifacts") },
+    { label: t.tabHistory, run: () => selectSidebarTab("history") },
+    { label: t.paneTerminal, run: () => openWorkbench("terminal") },
+    { label: t.paneBrowser, run: () => openWorkbench("browser") },
+    { label: t.shortcutFind, run: openFind },
+    { label: t.worktreeLabel, run: () => { $("worktree-panel").hidden = false; $("worktree-panel").scrollIntoView({ block: "nearest" }); } },
+    { label: t.modeAsk, run: () => api.send({ cmd: "setMode", mode: "ask" }) },
+    { label: t.modeAuto, run: () => api.send({ cmd: "setMode", mode: "auto" }) },
+    { label: t.modePlan, run: () => api.send({ cmd: "setMode", mode: "plan" }) },
+    { label: t.shortcutStop, run: () => api.send({ cmd: "abort" }) },
+  ];
+  for (const command of state.commands) {
+    entries.push({
+      label: `/${command.name}`,
+      hint: command.description || command.argumentHint || "",
+      run: () => {
+        input.value = `/${command.name} `;
+        autoSize();
+        input.focus();
+      },
+    });
+  }
+  return entries;
+}
+
+let paletteState = null;
+
+function openPalette() {
+  paletteState = { index: 0, entries: [] };
+  $("palette-scrim").hidden = false;
+  $("command-palette").hidden = false;
+  const field = $("palette-input");
+  field.value = "";
+  field.placeholder = t.palettePlaceholder;
+  renderPalette();
+  field.focus();
+}
+
+function closePalette() {
+  paletteState = null;
+  $("palette-scrim").hidden = true;
+  $("command-palette").hidden = true;
+  input.focus();
+}
+
+function renderPalette() {
+  if (!paletteState) return;
+  const query = $("palette-input").value.trim().toLowerCase();
+  const all = paletteEntries();
+  const matches = query
+    ? all.filter((entry) => entry.label.toLowerCase().includes(query) || (entry.hint ?? "").toLowerCase().includes(query))
+    : all;
+  paletteState.entries = matches;
+  paletteState.index = Math.min(paletteState.index, Math.max(0, matches.length - 1));
+  const list = $("palette-list");
+  list.innerHTML = "";
+  if (matches.length === 0) {
+    list.innerHTML = `<div class="palette-empty">${escapeHtml(t.paletteEmpty)}</div>`;
+    return;
+  }
+  matches.forEach((entry, index) => {
+    const row = document.createElement("button");
+    row.className = `palette-row${index === paletteState.index ? " active" : ""}`;
+    row.innerHTML =
+      `<span class="palette-label">${escapeHtml(entry.label)}</span>` +
+      (entry.hint ? `<span class="palette-hint">${escapeHtml(entry.hint)}</span>` : "");
+    row.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      runPaletteEntry(entry);
+    });
+    list.appendChild(row);
+  });
+}
+
+function runPaletteEntry(entry) {
+  closePalette();
+  entry?.run();
+}
+
+$("palette-input").addEventListener("input", renderPalette);
+$("palette-input").addEventListener("keydown", (event) => {
+  if (!paletteState) return;
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const count = paletteState.entries.length;
+    if (count === 0) return;
+    paletteState.index = (paletteState.index + (event.key === "ArrowDown" ? 1 : -1) + count) % count;
+    renderPalette();
+    $("palette-list").children[paletteState.index]?.scrollIntoView({ block: "nearest" });
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    runPaletteEntry(paletteState.entries[paletteState.index]);
+  } else if (event.key === "Escape") {
+    event.preventDefault();
+    closePalette();
+  }
+});
+$("palette-scrim").addEventListener("mousedown", closePalette);
 
 /* ---------- scroll-to-latest ---------- */
 
@@ -2340,6 +2465,7 @@ function openShortcuts() {
   const mod = api.platform === "darwin" ? "⌘" : "Ctrl";
   const rows = [
     [t.shortcutNewChat, `${mod}+N`],
+    [t.shortcutPalette, `${mod}+K`],
     [t.shortcutFind, `${mod}+F`],
     [t.shortcutSettings, `${mod}+,`],
     [t.shortcutShortcuts, `${mod}+/`],
