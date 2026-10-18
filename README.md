@@ -8,7 +8,7 @@
 <!-- PROJECT LOGO -->
 <br />
 <div align="center">
-  <a href="https://github.com/HUC-jie/prometheus">
+  <a href="https://github.com/LogicJump/prometheus">
     <img src="build/icon.svg" alt="Logo" width="120" height="120">
   </a>
 
@@ -115,7 +115,7 @@ Extensibility:
 ## Quick Start
 
 ```bash
-git clone https://github.com/HUC-jie/prometheus.git
+git clone https://github.com/LogicJump/prometheus.git
 cd prometheus
 npm install
 npm link          # optional: puts `prometheus` on PATH
@@ -226,13 +226,13 @@ npm run typecheck
 MIT — see [LICENSE](LICENSE).
 
 <!-- MARKDOWN LINKS & IMAGES -->
-[contributors-shield]: https://img.shields.io/github/contributors/HUC-jie/prometheus.svg?style=for-the-badge
-[contributors-url]: https://github.com/HUC-jie/prometheus/graphs/contributors
-[forks-shield]: https://img.shields.io/github/forks/HUC-jie/prometheus.svg?style=for-the-badge
-[forks-url]: https://github.com/HUC-jie/prometheus/network/members
-[stars-shield]: https://img.shields.io/github/stars/HUC-jie/prometheus.svg?style=for-the-badge
-[stars-url]: https://github.com/HUC-jie/prometheus/stargazers
-[issues-shield]: https://img.shields.io/github/issues/HUC-jie/prometheus.svg?style=for-the-badge
-[issues-url]: https://github.com/HUC-jie/prometheus/issues
-[license-shield]: https://img.shields.io/github/license/HUC-jie/prometheus.svg?style=for-the-badge
-[license-url]: https://github.com/HUC-jie/prometheus/blob/main/LICENSE
+[contributors-shield]: https://img.shields.io/github/contributors/LogicJump/prometheus.svg?style=for-the-badge
+[contributors-url]: https://github.com/LogicJump/prometheus/graphs/contributors
+[forks-shield]: https://img.shields.io/github/forks/LogicJump/prometheus.svg?style=for-the-badge
+[forks-url]: https://github.com/LogicJump/prometheus/network/members
+[stars-shield]: https://img.shields.io/github/stars/LogicJump/prometheus.svg?style=for-the-badge
+[stars-url]: https://github.com/LogicJump/prometheus/stargazers
+[issues-shield]: https://img.shields.io/github/issues/LogicJump/prometheus.svg?style=for-the-badge
+[issues-url]: https://github.com/LogicJump/prometheus/issues
+[license-shield]: https://img.shields.io/github/license/LogicJump/prometheus.svg?style=for-the-badge
+[license-url]: https://github.com/LogicJump/prometheus/blob/master/LICENSE
