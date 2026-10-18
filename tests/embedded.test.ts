@@ -14,6 +14,7 @@ import { matchTarget, parsePyocdTargets, pyocdProbes } from "../src/embedded/pro
 import { capture, parseLine } from "../src/embedded/serial.ts";
 import { classifyOutput, commandFor, flash, parseSize, validate } from "../src/embedded/flash.ts";
 import { findArtifacts } from "../src/embedded/build.ts";
+import { miFields, miList, parseMiLine, parseStackFrames, parseStopReason, parseVariables, SERVER_PORTS, serverCommand } from "../src/embedded/debug.ts";
 import { existsSync } from "node:fs";
 
 function scratch(prefix: string): string {
@@ -489,4 +490,92 @@ test("the newest artifact wins, and an ELF beats its own hex", () => {
 
   const artifacts = findArtifacts(root, ["build/*.elf", "build/*.hex"]);
   assert.equal(artifacts[0].kind, "elf");
+});
+
+// ---- GDB/MI ----------------------------------------------------------------
+
+test("MI records parse with their token, class and body", () => {
+  assert.equal(parseMiLine("(gdb)"), null);
+  // A stream record has no class: `~"text"`.
+  const stream = parseMiLine('~"Reading symbols\\n"');
+  assert.equal(stream?.kind, "stream");
+  assert.equal(stream?.body, '"Reading symbols\\n"');
+
+  const done = parseMiLine("1^done");
+  assert.equal(done?.kind, "result");
+  assert.equal(done?.token, 1);
+  assert.equal(done?.class, "done");
+
+  const error = parseMiLine('2^error,msg="No symbol table is loaded"');
+  assert.equal(error?.class, "error");
+  assert.match(error.body, /No symbol table/);
+
+  const running = parseMiLine('*running,thread-id="all"');
+  assert.equal(running?.kind, "exec");
+  assert.equal(running?.class, "running");
+});
+
+test("MI field extraction handles escapes, nesting and bare words", () => {
+  const fields = miFields('msg="a \\"quoted\\" word",frame={level="0"},count=3');
+  assert.equal(fields.msg, 'a "quoted" word');
+  assert.equal(fields.frame, '{level="0"}');
+  // A nested tuple is returned as raw text so its children can be parsed later.
+  assert.equal(miFields(fields.frame).level, "0");
+  assert.equal(fields.count, "3");
+});
+
+test("a MI list keeps commas that live inside strings", () => {
+  const items = miList('[{a="1",b="x,y"},{a="2"}]');
+  assert.equal(items.length, 2);
+  assert.match(items[0], /x,y/);
+});
+
+test("stack frames parse from both `frame=` and bare tuple forms", () => {
+  // Real `-stack-list-frames` output.
+  const frames = parseStackFrames(
+    'stack=[frame={level="0",addr="0x08000010",func="main",file="src/main.c",line="7"},' +
+      'frame={level="1",addr="0x08000020",func="Reset_Handler",file="startup.c",line="3"}]',
+  );
+  assert.equal(frames.length, 2);
+  assert.deepEqual(frames[0], { level: 0, func: "main", file: "src/main.c", line: 7, address: "0x08000010" });
+  assert.equal(frames[1].func, "Reset_Handler");
+
+  // `-stack-list-variables` uses bare tuples; the same unwrap must work.
+  const variables = parseVariables('variables=[{name="counter",type="uint32_t",value="1"},{name="i",type="int",value="0"}]');
+  assert.deepEqual(variables, [
+    { name: "counter", value: "1" },
+    { name: "i", value: "0" },
+  ]);
+
+  // An empty list is empty, not a crash.
+  assert.deepEqual(parseStackFrames("stack=[]"), []);
+  assert.deepEqual(parseStackFrames("nothing here"), []);
+});
+
+test("a stop reason carries its frame even without a level", () => {
+  const stop = parseStopReason(
+    'reason="breakpoint-hit",disp="keep",bkptno="1",frame={addr="0x08000010",func="main",file="src/main.c",line="7"},thread-id="1"',
+  );
+  assert.equal(stop.reason, "breakpoint-hit");
+  // Real stop records omit `level`; the top frame is level 0.
+  assert.equal(stop.frame?.level, 0);
+  assert.equal(stop.frame?.func, "main");
+});
+
+test("each probe family gets the GDB server command it actually accepts", () => {
+  const openocd = serverCommand("openocd", "openocd", { targetConfig: "target/stm32f4x.cfg", interfaceConfig: "interface/stlink.cfg" });
+  assert.ok(openocd);
+  assert.equal(openocd.port, 3333);
+  assert.deepEqual(openocd.args.slice(0, 4), ["-f", "interface/stlink.cfg", "-f", "target/stm32f4x.cfg"]);
+
+  const pyocd = serverCommand("pyocd", "pyocd", { target: "stm32f412xe" });
+  assert.ok(pyocd);
+  assert.deepEqual(pyocd.args.slice(0, 2), ["gdbserver", "--target"]);
+
+  // Without the config a server cannot start, and saying so beats a hang.
+  assert.equal(serverCommand("openocd", "openocd", {}), null);
+  assert.equal(serverCommand("pyocd", "pyocd", {}), null);
+  // Ports differ per tool; getting this wrong is a silent timeout.
+  assert.equal(SERVER_PORTS["probe-rs"], 1337);
+  assert.equal(SERVER_PORTS.jlink, 2331);
 });

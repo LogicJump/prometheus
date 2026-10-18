@@ -17,12 +17,23 @@
  */
 
 import type { Tool, ToolContext, ToolResult } from "../types.ts";
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import { build } from "../embedded/build.ts";
 import { flash, type FlasherKind } from "../embedded/flash.ts";
 import { capture, listSerialPorts, openPort } from "../embedded/serial.ts";
 import { listProbes, listTargets, matchTarget } from "../embedded/probe.ts";
 import { detectToolchains } from "../embedded/toolchain.ts";
 import { detectProject, buildCommand } from "../embedded/project.ts";
+import {
+  MiSession,
+  type MiRecord,
+  parseStackFrames,
+  parseStopReason,
+  parseVariables,
+  serverCommand,
+} from "../embedded/debug.ts";
 
 /** The flasher paths the machine actually has, keyed by kind. */
 async function flasherPaths(): Promise<{ paths: Partial<Record<FlasherKind, string>>; report: Awaited<ReturnType<typeof detectToolchains>> }> {
@@ -365,4 +376,235 @@ const projectTool: Tool = {
   },
 };
 
-export const embeddedTools: Tool[] = [buildTool, flashTool, serialTool, portsTool, targetsTool, projectTool];
+// ---- embed_debug -----------------------------------------------------------
+
+const debugTool: Tool = {
+  name: "embed_debug",
+  description:
+    "Start a debug session on the attached board: halt at a breakpoint, read the call stack, inspect variables, step, and continue. Starts the probe's GDB server itself (OpenOCD, pyOCD, probe-rs or J-Link) and drives GDB over its machine interface. Returns structured frames and variables, not GDB's formatted text. Use it when the firmware runs but misbehaves — a wrong value, a hang, a hard fault — instead of adding print statements.",
+  readonly: false,
+  parameters: {
+    type: "object",
+    properties: {
+      elf: { type: "string", description: "The .elf with debug symbols, relative to the workspace root" },
+      target: { type: "string", description: "Target chip name the GDB server should use, e.g. `stm32f412xe`" },
+      server: { type: "string", enum: ["openocd", "pyocd", "probe-rs", "jlink"], description: "Which GDB server to start; defaults to the first installed" },
+      target_config: { type: "string", description: "OpenOCD target config, e.g. `target/stm32f4x.cfg`" },
+      interface_config: { type: "string", description: "OpenOCD interface config, e.g. `interface/stlink.cfg`" },
+      breakpoints: { type: "array", items: { type: "string" }, description: "Functions or file:line locations to break at before running" },
+      action: {
+        type: "string",
+        enum: ["run", "backtrace", "variables", "continue", "step"],
+        description: "What to do once attached: run to the first breakpoint, read a backtrace, read variables, continue, or step one line. Default `run`.",
+      },
+      remote: { type: "string", description: "An already-running GDB server endpoint, e.g. `localhost:3333`. Skips starting a server." },
+    },
+    required: ["elf"],
+    additionalProperties: false,
+  },
+  summarize: (input) => String(input.action ?? "debug"),
+  async execute(input, ctx): Promise<ToolResult> {
+    const elf = String(input.elf);
+    const { paths } = await flasherPaths();
+    const gdb = await gdbPath();
+    if (!gdb) {
+      return { isError: true, content: "No GDB found. Install the Arm GNU Toolchain, which ships arm-none-eabi-gdb.", display: "no gdb" };
+    }
+
+    const serverKind = (input.server as "openocd" | "pyocd" | "probe-rs" | "jlink" | undefined) ?? firstServer(paths);
+    let server: ChildProcess | undefined;
+    let remote = input.remote ? String(input.remote) : "";
+
+    if (!remote) {
+      if (!serverKind) {
+        return {
+          isError: true,
+          content: `No GDB server installed, and no remote endpoint given. ${flasherHint(paths)}`,
+          display: "no server",
+        };
+      }
+      const program = paths[serverKind];
+      if (!program) {
+        return { isError: true, content: `${serverKind} is not installed.`, display: "no server" };
+      }
+      const command = serverCommand(serverKind, program, {
+        ...(input.target ? { target: String(input.target) } : {}),
+        ...(elf ? { elf } : {}),
+        ...(input.interface_config ? { interfaceConfig: String(input.interface_config) } : {}),
+        ...(input.target_config ? { targetConfig: String(input.target_config) } : {}),
+      });
+      if (!command) {
+        return {
+          isError: true,
+          content:
+            serverKind === "openocd"
+              ? "OpenOCD needs `target_config` (e.g. target/stm32f4x.cfg) and usually `interface_config`."
+              : `${serverKind} needs a \`target\` chip name.`,
+          display: "incomplete",
+        };
+      }
+
+      const started = await startServer(command);
+      if (!started.ok) {
+        return { isError: true, content: started.reason, display: "server failed" };
+      }
+      server = started.child;
+      remote = `localhost:${command.port}`;
+    }
+
+    const events: MiRecord[] = [];
+    const session = new MiSession({ gdb, elf, remote, onEvent: (record) => events.push(record) });
+    try {
+      const attach = await session.connect();
+      if (!attach.ok) {
+        return { isError: true, content: `could not attach: ${attach.body}`, display: "attach failed" };
+      }
+
+      const breakpoints = Array.isArray(input.breakpoints) ? input.breakpoints.map(String) : [];
+      const inserted: string[] = [];
+      for (const location of breakpoints) {
+        const result = await session.send(`-break-insert ${JSON.stringify(location).slice(1, -1)}`);
+        if (result.ok) inserted.push(location);
+        else inserted.push(`${location} (failed: ${result.body})`);
+      }
+
+      const action = (input.action as string | undefined) ?? "run";
+      const sections: string[] = [`attached to ${remote}${serverKind ? ` via ${serverKind}` : ""}`];
+      if (inserted.length) sections.push(`breakpoints: ${inserted.join(", ")}`);
+
+      if (action === "run") {
+        // A remote target is already running when we attach; `run` only works
+        // for a local process. GDB reports the remote case as an error, not a
+        // failure of the session, so it becomes a continue.
+        const result = await session.send("-exec-run", 20_000);
+        if (!result.ok) await session.send("-exec-continue", 20_000);
+        const stop = await waitForStop(events, 15_000);
+        sections.push(...describeStop(stop));
+      } else if (action === "continue") {
+        await session.send("-exec-continue", 20_000);
+        const stop = await waitForStop(events, 15_000);
+        sections.push(...describeStop(stop));
+      } else if (action === "step") {
+        await session.send("-exec-step", 20_000);
+        const stop = await waitForStop(events, 10_000);
+        sections.push(...describeStop(stop));
+      }
+
+      if (action === "backtrace" || action === "run" || action === "continue" || action === "step") {
+        const frames = await session.send("-stack-list-frames");
+        const parsed = parseStackFrames(frames.body);
+        if (parsed.length) {
+          sections.push("", "backtrace:");
+          for (const frame of parsed) {
+            const where = frame.file ? ` at ${frame.file}:${frame.line ?? "?"}` : "";
+            sections.push(`  #${frame.level} ${frame.func ?? "?"}${where}${frame.address ? ` (${frame.address})` : ""}`);
+          }
+        }
+      }
+
+      if (action === "variables" || action === "run" || action === "step") {
+        const variables = await session.send("-stack-list-variables --simple-values");
+        const parsed = parseVariables(variables.body);
+        if (parsed.length) {
+          sections.push("", "locals:");
+          for (const variable of parsed) sections.push(`  ${variable.name} = ${variable.value}`);
+        }
+      }
+
+      return { content: sections.join("\n"), display: `debug: ${action}` };
+    } finally {
+      await session.close();
+      // The GDB server holds the probe; leaving it running blocks the next flash.
+      server?.kill();
+    }
+  },
+};
+
+/** The Arm GDB, falling back to a plain gdb for host-side emulator runs. */
+async function gdbPath(): Promise<string | null> {
+  const report = await detectToolchains();
+  const arm = report.tools.find((entry) => entry.kind === "gcc-arm");
+  if (arm) {
+    const candidate = arm.path.replace(/gcc(-ar)?(\.exe)?$/i, arm.path.endsWith(".exe") ? "gdb.exe" : "gdb");
+    if (existsSync(candidate)) return candidate;
+  }
+  for (const name of ["arm-none-eabi-gdb", "arm-none-eabi-gdb.exe", "gdb", "gdb.exe"]) {
+    for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function firstServer(paths: Partial<Record<FlasherKind, string>>): "openocd" | "pyocd" | "probe-rs" | "jlink" | undefined {
+  for (const kind of ["pyocd", "openocd", "probe-rs", "jlink"] as const) if (paths[kind]) return kind;
+  return undefined;
+}
+
+/** Start the GDB server and wait for its ready line. */
+async function startServer(command: { program: string; args: string[]; readyPattern: RegExp; port: number }): Promise<
+  { ok: true; child: ChildProcess } | { ok: false; reason: string }
+> {
+  return new Promise((resolve) => {
+    const child = spawn(command.program, command.args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let seen = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve({
+        ok: false,
+        reason: `the GDB server did not become ready within 15s. Its output:\n${seen.split("\n").slice(-15).join("\n")}`,
+      });
+    }, 15_000);
+
+    const check = (chunk: Buffer) => {
+      seen += chunk.toString("utf8");
+      if (command.readyPattern.test(seen)) {
+        clearTimeout(timer);
+        resolve({ ok: true, child });
+      }
+    };
+    child.stdout?.on("data", check);
+    child.stderr?.on("data", check);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ ok: false, reason: `the GDB server exited (code ${code}) before listening:\n${seen.split("\n").slice(-15).join("\n")}` });
+    });
+  });
+}
+
+/**
+ * Wait for a stop the agent can act on.
+ *
+ * A remote target emits stop events while attaching — the loader, a signal, a
+ * thread start — none of which is the breakpoint the caller asked for. Waiting
+ * for the first `*stopped` reports one of those and looks like the breakpoint
+ * never hit. So the interesting reasons are ranked, and an uninteresting stop
+ * is returned only if the timeout expires with nothing better.
+ */
+const INTERESTING_STOPS = /breakpoint-hit|watchpoint-trigger|watchpoint-scope|signal-received|exited|exited-normally|exited-signalled|end-stepping-range|function-finished/;
+
+async function waitForStop(events: MiRecord[], timeoutMs: number): Promise<MiRecord | null> {
+  const deadline = Date.now() + timeoutMs;
+  let fallback: MiRecord | null = null;
+  while (Date.now() < deadline) {
+    const stops = events.filter((record) => record.class === "stopped");
+    for (const stop of stops) {
+      if (INTERESTING_STOPS.test(stop.body)) return stop;
+      fallback ??= stop;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return fallback;
+}
+
+function describeStop(stop: MiRecord | null): string[] {
+  if (!stop) return ["", "the target did not stop within the timeout (it may be running, or waiting on a breakpoint that was never reached)"];
+  const parsed = parseStopReason(stop.body);
+  const where = parsed.frame
+    ? `${parsed.frame.func ?? "?"}${parsed.frame.file ? ` at ${parsed.frame.file}:${parsed.frame.line ?? "?"}` : ""}`
+    : "(no frame reported)";
+  return ["", `stopped: ${parsed.reason} in ${where}`];
+}
+
+export const embeddedTools: Tool[] = [buildTool, flashTool, serialTool, portsTool, targetsTool, projectTool, debugTool];
