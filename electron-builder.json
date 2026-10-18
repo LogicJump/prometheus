@@ -12,7 +12,8 @@
     "bin/**/*",
     "build/icon.png",
     "package.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "win": {
     "icon": "build/icon.png",

@@ -1,23 +1,25 @@
+# Local development
+
+# Dependencies and build output
 node_modules/
 dist/
+
+# Prometheus itself writes here: sessions, memory, audit log, model cache
 .prometheus/
+
+# Packaged builds (electron-builder). The glob covers the ad-hoc
+# release-<name> directories that accumulate during testing.
+release/
+release*/
+
+# Research dumps and scratch artefacts
+.research/
 *.log
 .env
 models.json
-release/
-shot-*.png
-release2/
-release-old/
-release4/
-release5/
-release6/
-release7/
-release8/
-release9/
-release10/
 argv.log
-release3/
-.research/
+shot-*.png
+
+# Per-machine agent/editor configuration
+.claude/settings.local.json
 .claude/launch.json
-release11/
-release*/

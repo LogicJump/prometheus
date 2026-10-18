@@ -29,8 +29,9 @@ npm install -D electron-builder
 npm run build
 ```
 
-Artifacts land in `release/`: an NSIS installer plus a portable `.exe` on
-Windows, a `.dmg` on macOS, and AppImage/deb on Linux.
+Artifacts land in `release/`: an NSIS installer plus a portable `.exe`. Windows
+is the only build target; the app draws its own window controls so the caption
+matches the top bar.
 
 ## Protocol
 

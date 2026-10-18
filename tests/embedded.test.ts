@@ -347,9 +347,14 @@ test("a port that cannot be opened reports the reason, not a hang", async () => 
 
 // ---- flashing --------------------------------------------------------------
 
-const ELF_FIXTURE = "C:/Users/Admin/AppData/Local/Temp/fltest/t.elf";
-const hasFixture = existsSync(ELF_FIXTURE);
-const hasStm32Svd = existsSync("G:/software/cubeprogrammer/SVD/STM32F411.svd");
+// These two tests read real files that only exist on a machine where a
+// toolchain and a vendor SVD pack have been installed by hand. They are opt-in
+// through the environment so a fresh clone never silently skips a test it was
+// meant to run, and so no contributor's home directory ends up in the repo.
+const ELF_FIXTURE = process.env.PROMETHEUS_TEST_ELF ?? "";
+const SVD_FIXTURE = process.env.PROMETHEUS_TEST_SVD ?? "";
+const hasFixture = ELF_FIXTURE !== "" && existsSync(ELF_FIXTURE);
+const hasStm32Svd = SVD_FIXTURE !== "" && existsSync(SVD_FIXTURE);
 
 test("a flash is refused before running when it would be ambiguous", () => {
   const tmp = scratch("prometheus-flash-");
@@ -702,7 +707,7 @@ test("the index fits a context window and carries base addresses", () => {
 });
 
 test("reading a real vendor SVD gives the right register addresses", { skip: !hasStm32Svd }, () => {
-  const device = parseSvd("G:/software/cubeprogrammer/SVD/STM32F411.svd");
+  const device = parseSvd(SVD_FIXTURE);
   assert.ok(device.peripherals.length > 30, `expected many peripherals, got ${device.peripherals.length}`);
 
   // USART2 is a derived peripheral on STM32: without resolution it is empty.
