@@ -20,7 +20,6 @@ const sendButton = $("send-button");
 const stopButton = $("stop-button");
 const statusDot = $("status-dot");
 const statusText = $("status-text");
-const workspacePath = $("workspace-path");
 const modeControl = $("mode-control");
 const effortControl = $("effort-control");
 const modelPicker = $("model-picker");
@@ -127,7 +126,7 @@ function applyLocale(locale, { announce = false } = {}) {
   if (terminalTab) terminalTab.textContent = t.paneTerminal;
   sendButton.title = `${t.send} (Enter)`;
   stopButton.title = `${t.stop} (Esc)`;
-  $("workspace-button").title = t.changeWorkspace;
+  $("topbar-cwd").title = t.changeWorkspace;
   $("refresh-sessions").title = t.sessions;
   const search = $("session-search");
   search.placeholder = t.searchSessions;
@@ -249,7 +248,7 @@ function setQueuedBadge(count) {
 function addAssistantTurn() {
   const last = transcript.lastElementChild;
   const node = addNode(`<div class="turn assistant"><div class="markdown"></div></div>`);
-  if (last && last.classList.contains("tool-row")) node.classList.add("after-tools");
+  if (last && (last.classList.contains("tool-row") || last.classList.contains("tool-group"))) node.classList.add("after-tools");
   state.currentAssistant = { node, body: node.querySelector(".markdown"), text: "", raf: 0 };
   return state.currentAssistant;
 }
@@ -283,29 +282,57 @@ function bindCodeCopy(root) {
   });
 }
 
+/** Human labels for tool ids: the transcript should read as actions. */
+const TOOL_LABELS = {
+  read_file: "Read",
+  write_file: "Write",
+  edit_file: "Edit",
+  list_files: "List",
+  glob: "Find files",
+  grep: "Search",
+  search_codebase: "Search code",
+  bash: "Run",
+  todo_write: "Plan",
+  remember: "Remember",
+  delegate: "Delegate",
+  web_fetch: "Fetch",
+};
+
+function toolLabel(name) {
+  return TOOL_LABELS[name] ?? name;
+}
+
+/** Consecutive calls belong to one activity block, not a stream of lines. */
+function toolGroup() {
+  const last = transcript.lastElementChild;
+  if (last && last.classList.contains("tool-group")) return last;
+  return addNode(`<div class="tool-group"></div>`);
+}
+
 function addToolRow(name, summary) {
-  const glyph = name === "bash" ? "›" : ["read_file", "list_files", "grep", "glob"].includes(name) ? "◦" : "✦";
-  const node = addNode(
-    `<div class="tool-row running">` +
-      `<span class="tool-glyph">${glyph}</span>` +
-      `<span class="tool-name">${escapeHtml(name)}</span>` +
-      `<span class="tool-summary">${escapeHtml(summary || "")}</span>` +
-      `<button class="tool-expand" hidden>${escapeHtml(t.details)}</button>` +
-      `</div>`,
-  );
+  const glyph = name === "bash" ? "›" : ["read_file", "list_files", "grep", "glob", "search_codebase"].includes(name) ? "◦" : "✦";
+  const row = document.createElement("div");
+  row.className = "tool-row running";
+  row.innerHTML =
+    `<span class="tool-glyph">${glyph}</span>` +
+    `<span class="tool-name">${escapeHtml(toolLabel(name))}</span>` +
+    `<span class="tool-summary">${escapeHtml(summary || "")}</span>` +
+    `<button class="tool-expand" hidden>${escapeHtml(t.details)}</button>`;
+  row.dataset.path = summary || "";
+  toolGroup().appendChild(row);
   // The summary of a file tool is its path; clicking opens it in the
   // workbench, like clicking a path in an editor's output pane.
   if (FILE_TOOLS.has(name) && summary) {
-    node.classList.add("openable");
-    node.title = `${t.openFile}: ${summary}`;
-    node.addEventListener("click", (event) => {
+    row.classList.add("openable");
+    row.title = `${t.openFile}: ${summary}`;
+    row.addEventListener("click", (event) => {
       if (event.target.closest(".tool-expand")) return;
       openFile(summary);
     });
   }
-  state.currentTool = { node, name, summary };
-  state.lastToolNode = node;
-  return node;
+  state.currentTool = { node: row, name, summary };
+  state.lastToolNode = row;
+  return row;
 }
 
 const FILE_TOOLS = new Set(["read_file", "write_file", "edit_file"]);
@@ -326,7 +353,12 @@ function attachToolOutput(node, name, output) {
   outputNode.className = "tool-output";
   outputNode.hidden = true;
   outputNode.textContent = output;
-  row.after(outputNode);
+  // A detail block belongs to its call, so it is wrapped with it rather than
+  // being a sibling inside the activity group.
+  const block = document.createElement("div");
+  block.className = "tool-item";
+  row.before(block);
+  block.append(row, outputNode);
   const button = row.querySelector(".tool-expand");
   button.hidden = false;
   button.addEventListener("click", () => {
@@ -391,6 +423,8 @@ function setStatus(key) {
   const dotKind = key === "statusWorking" || key === "statusConnecting" ? "working" : key.startsWith("statusError") || key === "statusHostStopped" || key === "statusConfigError" ? "error" : "ready";
   statusDot.className = `status-dot ${dotKind}`;
   statusText.textContent = statusLabel(key);
+  // "Ready" is the resting state and needs no label; anything else is news.
+  statusText.hidden = dotKind === "ready";
 }
 
 /* ---------- in-conversation search ---------- */
@@ -756,9 +790,13 @@ function setMode(mode) {
 
 function setEffort(effort) {
   state.effort = effort;
-  effortControl.querySelectorAll("button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.effort === effort);
+  effortControl.querySelectorAll("[data-effort]").forEach((button) => {
+    const active = button.dataset.effort === effort;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-checked", String(active));
   });
+  const label = effortControl.querySelector(`[data-effort="${effort}"]`);
+  $("effort-label").textContent = label ? label.textContent : t.effortAuto;
 }
 
 /* ---------- model picker ---------- */
@@ -864,8 +902,6 @@ function handleEvent(message) {
       } else if (message.model) {
         renderModels(state.models, message.model, state.modelsSource);
       }
-      workspacePath.textContent = message.cwd;
-      workspacePath.title = message.cwd;
       state.cwd = message.cwd;
       renderTopbarLocation();
       updateMeter(message.context, message.usage);
@@ -1110,11 +1146,21 @@ function handleEvent(message) {
       const row = state.currentTool?.node;
       if (row) {
         row.classList.remove("running");
+        row.classList.add("done");
         if (!message.ok) row.classList.add("failed");
         const summaryEl = row.querySelector(".tool-summary");
         if (message.summary) summaryEl.textContent = message.summary;
         if (!message.ok) summaryEl.style.color = "var(--danger)";
         row.querySelector(".tool-glyph").textContent = message.ok ? "✓" : "✕";
+        // An edit's result is a diff size: make it read like one.
+        if (message.ok && message.name === "edit_file") {
+          const parts = String(message.summary).match(/\+(\d+)\s+-(\d+)/);
+          if (parts) {
+            summaryEl.innerHTML =
+              `<span class="add">+${parts[1]}</span> <span class="del">−${parts[2]}</span>` +
+              `<span class="tool-path">${escapeHtml(row.dataset.path ?? "")}</span>`;
+          }
+        }
         state.currentTool = null;
       }
       break;
@@ -1208,7 +1254,7 @@ function handleEvent(message) {
     case "session_loaded": {
       const target = scrollTarget();
       target
-        .querySelectorAll(".turn, .tool-row, .tool-output, .notice, .plan, .thinking, .subagent, .compact-marker")
+        .querySelectorAll(".turn, .tool-row, .tool-group, .tool-output, .notice, .plan, .thinking, .subagent, .compact-marker")
         .forEach((node) => node.remove());
       state.currentAssistant = null;
       state.currentThinking = null;
@@ -1223,10 +1269,13 @@ function handleEvent(message) {
           const node = addNode(`<div class="turn assistant"><div class="markdown">${md(item.text)}</div></div>`);
           bindCodeCopy(node);
         } else if (item.role === "tool") {
-          addNode(
-            `<div class="tool-row"><span class="tool-glyph">✦</span><span class="tool-name">${escapeHtml(item.name)}</span>` +
-              `<span class="tool-summary">${escapeHtml(item.summary || "")}</span></div>`,
-          );
+          const row = document.createElement("div");
+          row.className = "tool-row done";
+          row.innerHTML =
+            `<span class="tool-glyph">✓</span>` +
+            `<span class="tool-name">${escapeHtml(toolLabel(item.name))}</span>` +
+            `<span class="tool-summary">${escapeHtml(item.summary || "")}</span>`;
+          toolGroup().appendChild(row);
         }
       }
       if ((message.messages || []).length === 0) {
@@ -1234,10 +1283,8 @@ function handleEvent(message) {
         emptyState.hidden = false;
       }
       if (message.cwd) {
-        workspacePath.textContent = message.cwd;
         state.cwd = message.cwd;
         renderTopbarLocation();
-        workspacePath.title = message.cwd;
         api.send({ cmd: "getTree", path: "." });
         api.send({ cmd: "listSessions", includeArchived: state.showArchived });
       }
@@ -2065,11 +2112,13 @@ function renderSessions(sessions) {
   // folder with different separators (G:\x vs G:/x), so keys are normalized.
   const groups = new Map();
   const displayPath = new Map();
+  const lastUsed = new Map();
   for (const session of visible) {
     const key = normalizeCwd(session.cwd);
     if (!groups.has(key)) {
       groups.set(key, []);
       displayPath.set(key, session.cwd || "");
+      lastUsed.set(key, session.updatedAt);
     }
     groups.get(key).push(session);
   }
@@ -2079,14 +2128,15 @@ function renderSessions(sessions) {
 
   const labels = projectLabels([...groups.keys()], displayPath);
   for (const [cwd, items] of groups) {
-    // Active project opens by default; others stay folded until the user opens
-    // them, so a busy project cannot push the rest of the list out of view.
-    const collapsed =
-      !expandAll &&
-      (state.collapsedProjects.has(cwd) || (cwd !== activeProject && !state.expandedProjects.has(cwd)));
+    // The open project folds to a single row that carries the conversation
+    // count; collapsed projects show their most recent few conversations, so
+    // every project stays reachable without a second click.
+    const explicitOpen = state.expandedProjects.has(cwd) && !state.collapsedProjects.has(cwd);
+    const explicitClosed = state.collapsedProjects.has(cwd);
+    const open = expandAll || explicitOpen || (!explicitClosed && cwd === activeProject);
     const head = document.createElement("button");
     head.className = `session-group${cwd === activeProject ? " active" : ""}`;
-    head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    head.setAttribute("aria-expanded", open ? "true" : "false");
     const count = document.createElement("span");
     count.className = "session-group-count";
     count.textContent = String(items.length);
@@ -2096,7 +2146,7 @@ function renderSessions(sessions) {
     name.title = displayPath.get(cwd) || cwd || t.noProject;
     const twisty = document.createElement("span");
     twisty.className = "session-group-twisty";
-    twisty.textContent = collapsed ? "▸" : "▾";
+    twisty.textContent = open ? "▾" : "▸";
     // New chat inside this project, without leaving the current conversation.
     const add = document.createElement("span");
     add.className = "session-group-add";
@@ -2110,29 +2160,32 @@ function renderSessions(sessions) {
     });
     head.append(twisty, name, count, add);
     head.addEventListener("click", () => {
-      if (collapsed) {
-        state.expandedProjects.add(cwd);
-        state.collapsedProjects.delete(cwd);
-      } else {
+      if (open) {
         state.expandedProjects.delete(cwd);
         state.collapsedProjects.add(cwd);
+      } else {
+        state.expandedProjects.add(cwd);
+        state.collapsedProjects.delete(cwd);
       }
       localStorage.setItem("prometheus.expandedProjects", JSON.stringify([...state.expandedProjects]));
       localStorage.setItem("prometheus.collapsedProjects", JSON.stringify([...state.collapsedProjects]));
       renderSessions(state.sessions);
     });
     sessionList.appendChild(head);
-    if (collapsed) continue;
+    // A folded project keeps its three latest conversations in view.
+    const shown = open ? items : items.slice(0, 3);
 
-    for (const session of items) {
+    for (const session of shown) {
       const button = document.createElement("button");
       button.className = `session-item${session.id === state.sessionId ? " active" : ""}${session.pinned ? " pinned" : ""}`;
       const title = session.title || (session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages);
+      // The timestamp is reference, not navigation: it appears on hover and
+      // gives the row back its second line of height.
       button.innerHTML =
         (session.pinned ? `<span class="session-pin" title="${escapeHtml(t.sessionPinned)}">◆</span>` : "") +
         `<div class="session-title">${escapeHtml(title)}</div>` +
-        `<div class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</div>`;
-      button.title = `${title}\n${session.id}\n${session.cwd}`;
+        `<span class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</span>`;
+      button.title = `${title}\n${relativeDate(session.updatedAt)}\n${session.cwd}`;
       button.addEventListener("click", () => {
         api.send({ cmd: "loadSession", id: session.id });
         // On a narrow window the drawer covers the conversation once opened.
@@ -2512,7 +2565,7 @@ function paletteEntries() {
     { label: t.paneTerminal, run: () => openWorkbench("terminal") },
     { label: t.paneBrowser, run: () => openWorkbench("browser") },
     { label: t.shortcutFind, run: openFind },
-    { label: t.worktreeLabel, run: () => { $("worktree-panel").hidden = false; $("worktree-panel").scrollIntoView({ block: "nearest" }); } },
+    { label: t.worktreeLabel, run: () => { $("worktree-panel").hidden = false; } },
     { label: t.modeAsk, run: () => api.send({ cmd: "setMode", mode: "ask" }) },
     { label: t.modeAuto, run: () => api.send({ cmd: "setMode", mode: "auto" }) },
     { label: t.modePlan, run: () => api.send({ cmd: "setMode", mode: "plan" }) },
@@ -2631,10 +2684,28 @@ modeControl.querySelectorAll("button").forEach((button) => {
   });
 });
 
-effortControl.querySelectorAll("button").forEach((button) => {
+effortControl.querySelectorAll("[data-effort]").forEach((button) => {
   button.addEventListener("click", () => {
+    setEffortMenu(false);
     if (button.dataset.effort !== state.effort) api.send({ cmd: "setEffort", effort: button.dataset.effort });
   });
+});
+
+const effortPicker = $("effort-picker");
+const effortMenu = $("effort-menu");
+
+function setEffortMenu(open) {
+  effortMenu.hidden = !open;
+  effortPicker.setAttribute("aria-expanded", String(open));
+}
+
+effortPicker.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setEffortMenu(effortMenu.hidden);
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#effort-control")) setEffortMenu(false);
 });
 
 modelPicker.addEventListener("click", (event) => {
@@ -2643,7 +2714,7 @@ modelPicker.addEventListener("click", (event) => {
   else closeModelMenu();
 });
 
-$("workspace-button").addEventListener("click", async () => {
+$("topbar-cwd").addEventListener("click", async () => {
   const dir = await api.pickDirectory();
   if (dir) api.send({ cmd: "setCwd", cwd: dir });
 });
@@ -2652,15 +2723,30 @@ $("workspace-button").addEventListener("click", async () => {
 
 function renderWorktree() {
   const active = state.worktree;
-  $("worktree-state").textContent = active ? active.branch : t.worktreeOff;
+  // The worktree control lives on the active project's header, so its state
+  // reads where the project is named instead of in a second card.
   $("worktree-button").classList.toggle("active", Boolean(active));
+  $("worktree-button").title = active ? `${t.worktreeLabel}: ${active.branch}` : t.worktreeLabel;
   $("worktree-actions-off").hidden = Boolean(active);
   $("worktree-actions-on").hidden = !active;
   $("worktree-copy").textContent = active ? `${t.worktreeActive} ${active.path}` : t.worktreeExplain;
 }
 
-$("worktree-button").addEventListener("click", () => {
-  $("worktree-panel").hidden = !$("worktree-panel").hidden;
+$("worktree-button").addEventListener("click", (event) => {
+  event.stopPropagation();
+  const panel = $("worktree-panel");
+  panel.hidden = !panel.hidden;
+  $("worktree-button").setAttribute("aria-expanded", String(!panel.hidden));
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#worktree-panel") && !event.target.closest("#worktree-button")) {
+    const panel = $("worktree-panel");
+    if (!panel.hidden) {
+      panel.hidden = true;
+      $("worktree-button").setAttribute("aria-expanded", "false");
+    }
+  }
 });
 
 $("worktree-enable").addEventListener("click", () => api.send({ cmd: "worktreeStart" }));
@@ -2725,7 +2811,6 @@ function renderChangesBadge() {
   $("changes-button").title = count > 0 ? `${t.paneDiff} (${count})` : t.paneDiff;
 }
 
-$("topbar-cwd").addEventListener("click", () => $("workspace-button").click());
 $("changes-button").addEventListener("click", () => {
   if (!workbench.hidden && state.pane === "diff") closeWorkbench();
   else openWorkbench("diff");
@@ -3125,7 +3210,12 @@ setupVoice();
 void refreshVersion();
 api.send({ cmd: "listSessions" });
 api.send({ cmd: "listCommands" });
-if (state.workbenchOpen) openWorkbench(state.pane);
+// The inspector is opened by the action that needs it, not on launch: a
+// remembered pane used to eat half the window before the first message.
+if (state.workbenchOpen) {
+  state.workbenchOpen = false;
+  localStorage.setItem("prometheus.workbench", "0");
+}
 api.send({ cmd: "getTree", path: "." });
 api.send({ cmd: "setLocale", locale: state.locale });
 input.focus();

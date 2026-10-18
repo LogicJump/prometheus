@@ -162,7 +162,7 @@ svg {
 }
 
 .sidebar-actions {
-  padding: 2px 2px 10px;
+  padding: 2px 2px 6px;
 }
 
 .new-chat {
@@ -187,54 +187,6 @@ svg {
   width: 14px;
   height: 14px;
   color: var(--text-secondary);
-}
-
-.workspace-card {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  width: 100%;
-  padding: 8px 10px;
-  margin-bottom: 12px;
-  border-radius: var(--radius);
-  border: 1px solid transparent;
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-.workspace-card:hover {
-  background: var(--surface);
-  border-color: var(--border);
-}
-
-.workspace-card svg {
-  color: var(--text-faint);
-  width: 15px;
-  height: 15px;
-}
-
-.workspace-copy {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.workspace-label {
-  font-size: 10.5px;
-  color: var(--text-faint);
-  text-transform: none;
-  letter-spacing: 0.01em;
-}
-
-.workspace-path {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  direction: rtl;
-  text-align: left;
 }
 
 .sidebar-section-head {
@@ -775,9 +727,10 @@ svg {
   flex-direction: column;
   gap: 1px;
   width: 100%;
-  padding: 7px 9px;
+  padding: 6px 9px;
   border-radius: var(--radius-sm);
   text-align: left;
+  position: relative;
 }
 
 .session-search {
@@ -875,6 +828,12 @@ svg {
   font-family: var(--mono);
   font-size: 10px;
   color: var(--text-faint);
+  opacity: 0.75;
+}
+
+.session-group:hover .session-group-count,
+.session-group-add:hover ~ .session-group-count {
+  opacity: 1;
 }
 
 .session-group-add {
@@ -925,9 +884,27 @@ svg {
 }
 
 .session-meta {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding-left: 12px;
   font-size: 10.5px;
   color: var(--text-faint);
   font-family: var(--mono);
+  background: linear-gradient(to right, transparent, var(--sidebar) 12px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.session-item:hover .session-meta,
+.session-item:focus-visible .session-meta {
+  opacity: 1;
+}
+
+.session-item.active .session-meta {
+  background: linear-gradient(to right, transparent, var(--surface-hover) 12px);
 }
 
 .sidebar-empty {
@@ -1001,6 +978,7 @@ svg {
   padding: 0 14px;
   border-bottom: 1px solid var(--border);
   -webkit-app-region: drag;
+  position: relative;
 }
 
 .window-controls {
@@ -1346,18 +1324,18 @@ mark.find-hit.current {
 
 .turn {
   max-width: 780px;
-  margin: 0 auto 26px;
+  margin: 0 auto 22px;
   padding: 0 28px;
 }
 
 .user-bubble {
   display: inline-block;
-  max-width: 100%;
-  padding: 10px 15px;
-  border-radius: var(--radius-lg);
-  border-top-right-radius: var(--radius-sm);
-  background: var(--surface-raised);
-  border: 1px solid var(--border);
+  max-width: 78%;
+  padding: 8px 13px;
+  border-radius: 14px;
+  border-top-right-radius: 4px;
+  background: var(--surface);
+  border: 1px solid transparent;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   float: right;
@@ -1550,16 +1528,37 @@ mark.find-hit.current {
 
 /* ---------- tool activity ---------- */
 
-.tool-row {
+/* Consecutive calls form one quiet block with a left rail, the way an editor
+   groups a build's steps. The block is a list of actions, not a second
+   transcript, so it sits at a lower contrast than the prose. */
+.tool-group {
   max-width: 780px;
-  margin: 0 auto 4px;
+  margin: 2px auto 18px;
   padding: 0 28px;
   display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tool-group:empty {
+  display: none;
+}
+
+.tool-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.tool-row {
+  display: flex;
   align-items: baseline;
-  gap: 9px;
+  gap: 8px;
+  padding: 3px 8px;
+  margin-left: -8px;
+  border-radius: 6px;
   font-size: 12.5px;
   color: var(--text-secondary);
-  min-height: 20px;
+  min-height: 22px;
   animation: tool-in 160ms ease-out;
 }
 
@@ -1573,7 +1572,7 @@ mark.find-hit.current {
 .tool-glyph {
   flex: 0 0 auto;
   color: var(--text-faint);
-  width: 14px;
+  width: 12px;
   text-align: center;
   font-family: var(--mono);
   font-size: 11px;
@@ -1583,13 +1582,18 @@ mark.find-hit.current {
   color: var(--accent);
 }
 
+.tool-row.done .tool-glyph {
+  color: var(--text-faint);
+  opacity: 0.7;
+}
+
 .tool-row.openable {
   cursor: pointer;
 }
 
-.tool-row.openable:hover {
+.tool-row.openable:hover,
+.tool-row:hover {
   background: var(--surface);
-  border-radius: 6px;
 }
 
 .tool-row.failed .tool-glyph,
@@ -1598,19 +1602,22 @@ mark.find-hit.current {
 }
 
 .tool-name {
-  font-family: var(--mono);
   font-size: 12px;
-  color: var(--text-faint);
+  color: var(--text-secondary);
   flex: 0 0 auto;
 }
 
+.tool-row.done .tool-name {
+  color: var(--text-faint);
+}
+
 .tool-row.running .tool-name {
-  color: var(--text-secondary);
+  color: var(--text);
 }
 
 .tool-summary {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1618,8 +1625,21 @@ mark.find-hit.current {
   min-width: 0;
 }
 
+.tool-summary .add {
+  color: var(--success);
+}
+
+.tool-summary .del {
+  color: var(--danger);
+}
+
+.tool-path {
+  margin-left: 8px;
+}
+
 .tool-expand {
   flex: 0 0 auto;
+  margin-left: auto;
   font-size: 11px;
   color: var(--text-faint);
   padding: 1px 6px;
@@ -1639,9 +1659,8 @@ mark.find-hit.current {
 }
 
 .tool-output {
-  max-width: 780px;
-  margin: 2px auto 10px;
-  padding: 0 28px 0 51px;
+  margin: 2px 0 8px;
+  padding: 0 0 0 22px;
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.55;
@@ -1759,46 +1778,52 @@ mark.find-hit.current {
 
 .empty-state {
   max-width: 620px;
-  margin: 10vh auto 0;
+  margin: 8vh auto 0;
   padding: 0 28px;
   text-align: center;
 }
 
 .empty-mark {
-  width: 40px;
-  height: 40px;
+  width: 34px;
+  height: 34px;
   fill: var(--accent);
   stroke: none;
-  margin-bottom: 18px;
+  margin-bottom: 16px;
 }
 
 .empty-state h1 {
-  font-size: 27px;
+  font-size: 25px;
   font-weight: 500;
   letter-spacing: -0.025em;
-  margin: 0 0 10px;
+  margin: 0 0 8px;
 }
 
 .empty-state p {
   color: var(--text-secondary);
-  margin: 0 auto 28px;
+  font-size: 13.5px;
+  margin: 0 auto 26px;
   max-width: 46ch;
 }
 
+/* Prompts read as inline suggestions, not as a stack of full-width cards:
+   three equal-weight rows were heavier than the thing they suggested. */
 .suggestions {
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 8px;
-  max-width: 420px;
+  max-width: 520px;
   margin: 0 auto;
 }
 
 .suggestion {
   text-align: left;
-  padding: 11px 14px;
+  padding: 7px 12px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: 999px;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 12.5px;
+  white-space: nowrap;
   transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
 }
 
@@ -1860,9 +1885,9 @@ mark.find-hit.current {
   max-width: 780px;
   margin: 0 auto;
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 10px 10px 10px 16px;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 10px 8px 14px;
   background: var(--surface-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -1872,6 +1897,28 @@ mark.find-hit.current {
 
 .composer:focus-within {
   border-color: var(--border-strong);
+}
+
+.composer-input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* The controls sit inside the box: they describe the message being written,
+   so they belong next to it rather than in a second band below. */
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-top: 7px;
+  border-top: 1px solid var(--border);
+}
+
+.composer-bar .controls {
+  gap: 5px;
 }
 
 #input {
@@ -2446,8 +2493,9 @@ mark.find-hit.current {
 /* ---------- tool density ---------- */
 
 :root[data-density="compact"] .tool-row {
-  margin-bottom: 1px;
-  min-height: 17px;
+  padding-top: 1px;
+  padding-bottom: 1px;
+  min-height: 18px;
   font-size: 12px;
 }
 
@@ -2456,9 +2504,8 @@ mark.find-hit.current {
 }
 
 :root[data-density="detailed"] .tool-row {
-  margin-bottom: 6px;
-  padding-top: 2px;
-  padding-bottom: 2px;
+  padding-top: 5px;
+  padding-bottom: 5px;
 }
 
 /* ---------- browser pane ---------- */
@@ -2620,42 +2667,40 @@ mark.find-hit.current {
   top: 0;
 }
 
-.worktree-card {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  width: 100%;
-  padding: 7px 10px;
-  margin-top: 4px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  text-align: left;
-  transition: background 120ms ease;
+/* Worktree is a top-bar toggle next to the project name: its panel drops
+   under the button instead of sitting permanently in the sidebar. */
+.worktree-toggle {
+  -webkit-app-region: no-drag;
+  position: relative;
 }
 
-.worktree-card:hover {
-  background: var(--surface);
-}
-
-.worktree-card.active {
+.worktree-toggle.active {
   color: var(--accent);
 }
 
-.worktree-card svg {
-  width: 15px;
-  height: 15px;
-  flex: 0 0 15px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.6;
+.worktree-toggle.active::after {
+  content: "";
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
 .worktree-panel {
-  margin: 2px 8px 8px;
-  padding: 9px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
+  position: absolute;
+  top: 44px;
+  left: 52px;
+  z-index: 40;
+  width: 300px;
+  padding: 11px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.4);
+  -webkit-app-region: no-drag;
 }
 
 .worktree-copy {
@@ -2761,18 +2806,7 @@ mark.find-hit.current {
   text-overflow: ellipsis;
 }
 
-.composer-footer {
-  max-width: 780px;
-  margin: 10px auto 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  flex-wrap: wrap;
-  position: relative;
-}
-
-.composer-footer .meter {
+.composer-bar .meter {
   margin-left: auto;
 }
 
@@ -2835,17 +2869,13 @@ mark.find-hit.current {
   user-select: none;
 }
 
-/* ---------- model picker ---------- */
-
-.model-control {
-  position: relative;
-}
-
-.model-picker {
+/* Secondary composer controls are chips, not segmented rails: the mode stays
+   a rail because it changes what the agent may do, everything else is one
+   button that opens a small menu. */
+.chip-button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  max-width: 210px;
   padding: 4px 8px 4px 10px;
   border-radius: 8px;
   background: var(--surface);
@@ -2856,10 +2886,76 @@ mark.find-hit.current {
   transition: border-color 120ms ease, color 120ms ease;
 }
 
-.model-picker:hover,
-.model-picker[aria-expanded="true"] {
+.chip-button:hover,
+.chip-button[aria-expanded="true"] {
   border-color: var(--border-strong);
   color: var(--text);
+}
+
+.chip-button svg {
+  width: 12px;
+  height: 12px;
+  opacity: 0.7;
+}
+
+.chip-key {
+  font-family: var(--sans);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.effort-control {
+  position: relative;
+}
+
+.effort-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 150px;
+  padding: 4px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  z-index: 20;
+}
+
+.effort-menu[hidden] {
+  display: none;
+}
+
+.effort-menu {
+  display: flex;
+  flex-direction: column;
+  animation: slide-up 120ms ease-out;
+}
+
+.effort-menu button {
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.effort-menu button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.effort-menu button.active {
+  color: var(--accent-text);
+}
+
+/* ---------- model picker ---------- */
+
+.model-control {
+  position: relative;
+}
+
+.model-picker {
+  max-width: 210px;
 }
 
 .model-picker.unavailable {
@@ -2870,12 +2966,6 @@ mark.find-hit.current {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.model-picker svg {
-  width: 12px;
-  height: 12px;
-  opacity: 0.7;
 }
 
 .model-menu {
@@ -3409,8 +3499,7 @@ mark.find-hit.current {
     margin-left: calc(-1 * var(--sidebar-width) - 1px);
   }
   .turn,
-  .tool-row,
-  .tool-output,
+  .tool-group,
   .thinking,
   .plan,
   .notice {
@@ -3421,10 +3510,8 @@ mark.find-hit.current {
     padding-left: 12px;
     padding-right: 12px;
   }
-  .composer-footer {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
+  .composer-bar {
+    gap: 6px;
   }
   .topbar {
     gap: 6px;

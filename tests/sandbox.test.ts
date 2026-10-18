@@ -32,9 +32,16 @@ test("destructive commands are denied", () => {
 });
 
 test("recoverable-but-risky commands need confirmation", () => {
-  for (const command of ["rm -rf node_modules", "git reset --hard HEAD~1", "npm install lodash", "pip install requests"]) {
+  for (const command of ["rm -rf node_modules", "rm -r build", "rm --recursive dist", "git reset --hard HEAD~1", "npm install lodash", "pip install requests"]) {
     assert.equal(classifyCommand(command, workspace, policy).class, "confirm", command);
   }
+});
+
+test("a non-recursive delete is not called recursive", () => {
+  // `-f` only suppresses the prompt; it is not a recursion flag, and
+  // labelling it "recursive delete" made an ordinary cleanup look dangerous.
+  const verdict = classifyCommand("rm -f notes.txt", workspace, policy);
+  assert.equal(verdict.class, "allow");
 });
 
 test("deny wins over confirm when both match", () => {

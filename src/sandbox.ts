@@ -51,7 +51,10 @@ const RULES: Rule[] = [
   { class: "deny", pattern: /\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(sh|bash|zsh|python|node)\b/i, reason: "piping a download into an interpreter" },
   { class: "deny", pattern: />\s*\/dev\/(sd|nvme|disk)/i, reason: "redirecting output to a raw disk" },
 
-  { class: "confirm", pattern: /\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+/i, reason: "recursive delete" },
+  // Recursive deletes are the destructive shape; `-f` alone only suppresses
+  // the prompt, so it must not be labelled "recursive" (it was, because a
+  // single `[rf]` matched the `f` in `rm -f file`).
+  { class: "confirm", pattern: /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+|--recursive\s+)/i, reason: "recursive delete" },
   { class: "confirm", pattern: /\bgit\s+reset\s+--hard\b/i, reason: "discarding uncommitted work" },
   { class: "confirm", pattern: /\bgit\s+clean\s+-[a-z]*f/i, reason: "deleting untracked files" },
   { class: "confirm", pattern: /\bgit\s+push\b[^|;&]*--force/i, reason: "force-pushing" },
