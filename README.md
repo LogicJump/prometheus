@@ -239,3 +239,14 @@ The right-hand workbench hosts five panes:
 Sessions can run in an **isolated worktree** (sidebar control) on a
 `prometheus/<session>` branch, then be viewed as a diff, merged back, or
 discarded without touching your working copy.
+
+## Review loop
+
+Changes in the workbench can be reviewed before they are accepted: click any
+changed line to attach a comment, then **Send to agent** turns the collected
+comments into one message naming each file and line. `Ctrl+K` opens the command
+palette, which lists every action and custom command.
+
+Sessions can be pinned, renamed, forked, archived, and deleted from their
+right-click menu; archived sessions stay out of the list until the archive
+toggle is on. **Export conversation** writes the transcript as markdown.

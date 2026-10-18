@@ -81,3 +81,19 @@ Host -> renderer (`type`): `hello`, `ready`, `state`, `models`, `changes`,
 - Tool rows are quiet one-liners; full output is one click away on demand.
 - Markdown is rendered by a small local renderer; nothing is loaded from the
   network, and the renderer runs under a strict CSP.
+
+## Layout
+
+The renderer is plain ES modules with no build step:
+
+```
+renderer/app.js       state, host events, panes, palette, comments
+renderer/markdown.js  the markdown renderer shared by transcript and previews
+renderer/i18n.js      en / zh dictionaries
+renderer/styles.css   theme, layout, panes
+```
+
+The browser pane is a native `WebContentsView` owned by the main process
+(`desktop/browser.js`); the renderer only reports its rectangle and drives
+navigation. Screenshots taken with `win.webContents.capturePage()` do not
+include that view — use an OS-level screenshot when verifying it.
