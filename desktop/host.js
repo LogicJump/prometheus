@@ -29,7 +29,7 @@ import { loadCheckpoints, restoreTo, clearCheckpoints, captureBefore } from "../
 import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src/workspace.ts";
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
 import { TerminalSession } from "./terminal.js";
-import { gitCommit, gitStatus } from "./git.js";
+import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
 import { loadMcpTools } from "../src/mcp.ts";
 import { sessionToMarkdown, exportFilename, markRunActive, clearRunActive, findInterruptedRun } from "../src/export.ts";
@@ -401,7 +401,19 @@ async function emitGitStatus() {
   const status = await gitStatus(cwd);
   if (generation !== gitStatusGeneration) return status;
   send({ type: "git_status", ...status, worktree: worktree ? { branch: worktree.branch, path: worktree.path, base: baseCwd } : null });
+  void emitPrStatus(generation);
   return status;
+}
+
+/** PR and check status; skipped quietly when gh is absent or unauthenticated. */
+async function emitPrStatus(generation = gitStatusGeneration) {
+  if (!(await ghAvailable(cwd))) {
+    send({ type: "pr_status", available: false });
+    return;
+  }
+  const result = await prStatus(cwd);
+  if (generation !== gitStatusGeneration) return;
+  send({ type: "pr_status", ...result });
 }
 
 async function runPrompt(text, images) {
@@ -904,6 +916,21 @@ async function handle(cmd) {
     case "gitStatus":
       void emitGitStatus();
       return;
+    case "prStatus":
+      void emitPrStatus();
+      return;
+    case "createPr": {
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      const result = await createPullRequest(cwd, {
+        title: String(cmd.title ?? ""),
+        body: String(cmd.body ?? ""),
+        base: cmd.base,
+        draft: Boolean(cmd.draft),
+      });
+      send({ type: "pr_created", ...result });
+      if (result.ok) void emitPrStatus();
+      return;
+    }
     case "gitCommit": {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
       const paths = Array.isArray(cmd.paths) ? cmd.paths.map(String) : [];

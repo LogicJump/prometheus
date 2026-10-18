@@ -1778,6 +1778,64 @@ mark.find-hit.current {
   padding: 0 4px;
 }
 
+
+/* ---------- PR and checks ---------- */
+
+.pr-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px 6px;
+  font-size: 11.5px;
+  min-width: 0;
+}
+
+.pr-state {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.pr-state.open {
+  color: var(--success);
+}
+
+.pr-state.merged {
+  color: var(--accent);
+}
+
+.pr-title {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pr-open {
+  font-size: 11px;
+}
+
+.pr-checks {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.pr-checks.passed {
+  color: var(--success);
+}
+
+.pr-checks.pending {
+  color: var(--warn);
+}
+
+.pr-checks.failed {
+  color: var(--danger);
+}
+
 /* ---------- command palette ---------- */
 
 .palette-scrim {

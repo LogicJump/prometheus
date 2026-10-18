@@ -84,6 +84,7 @@ const state = {
   showArchived: false,
   comments: [],
   attachments: [],
+  pr: null,
   commands: [],
   diffScope: "session",
   currentSubagent: null,
@@ -881,6 +882,20 @@ function handleEvent(message) {
       state.worktree = message.worktree ?? null;
       renderGitBar();
       renderWorktree();
+      break;
+
+    case "pr_status":
+      state.pr = message;
+      renderPrBar();
+      break;
+
+    case "pr_created":
+      if (message.ok) {
+        addNotice("dim", `${t.prCreated} ${message.url ?? ""}`);
+        api.send({ cmd: "prStatus" });
+      } else {
+        addNotice("warn", `${t.prFailed} ${message.error ?? ""}`);
+      }
       break;
 
     case "worktree_diff":
@@ -2168,6 +2183,60 @@ document.addEventListener("drop", (event) => {
 });
 document.addEventListener("dragover", (event) => {
   if ([...(event.dataTransfer?.types ?? [])].includes("Files")) event.preventDefault();
+});
+
+
+/* ---------- pull request and checks ---------- */
+
+function renderPrBar() {
+  const bar = $("pr-bar");
+  const info = state.pr;
+  if (!info || !info.available) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const pr = info.pr;
+  $("pr-create").hidden = Boolean(pr);
+  $("pr-open").hidden = !pr;
+  if (!pr) {
+    $("pr-state").textContent = t.prNone;
+    $("pr-state").className = "pr-state";
+    $("pr-title").textContent = "";
+    $("pr-checks").textContent = "";
+    return;
+  }
+  const stateLabel = pr.isDraft ? t.prDraft : pr.state === "OPEN" ? t.prOpenState : pr.state === "MERGED" ? t.prMerged : t.prClosed;
+  $("pr-state").textContent = `#${pr.number} ${stateLabel}`;
+  $("pr-state").className = `pr-state ${pr.state === "MERGED" ? "merged" : pr.state === "OPEN" ? "open" : "closed"}`;
+  $("pr-title").textContent = pr.title ?? "";
+  $("pr-title").title = pr.title ?? "";
+  const checks = pr.checks ?? { total: 0 };
+  if (checks.total === 0) {
+    $("pr-checks").textContent = "";
+  } else if (checks.failed > 0) {
+    $("pr-checks").textContent = t.checksFailed(checks.failed, checks.total);
+    $("pr-checks").className = "pr-checks failed";
+    $("pr-checks").title = checks.failing.join("\n");
+  } else if (checks.pending > 0) {
+    $("pr-checks").textContent = t.checksPending(checks.pending, checks.total);
+    $("pr-checks").className = "pr-checks pending";
+  } else {
+    $("pr-checks").textContent = t.checksPassed(checks.total);
+    $("pr-checks").className = "pr-checks passed";
+  }
+}
+
+$("pr-open").addEventListener("click", () => {
+  if (state.pr?.pr?.url) api.openExternal(state.pr.pr.url);
+});
+
+$("pr-create").addEventListener("click", async () => {
+  // A PR needs a pushed branch; ask the agent to run the push so the user sees
+  // the command in the transcript instead of it happening silently.
+  const title = prompt(t.prTitlePrompt, state.sessionTitle || "");
+  if (title === null) return;
+  api.send({ cmd: "createPr", title: title.trim(), body: t.prBodyDefault });
 });
 
 /* ---------- command palette ---------- */
