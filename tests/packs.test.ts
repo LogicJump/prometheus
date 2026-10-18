@@ -394,3 +394,41 @@ test("toolEnv 不会修改 process.env", () => {
   toolEnv();
   assert.equal(process.env.PATH, before, "process.env 必须一个字都不变");
 });
+
+// ---- 目录 ------------------------------------------------------------------
+
+import { catalogFor, isInstallable, CATALOG } from "../src/packs/catalog.ts";
+
+test("没有校验和的条目不会出现在可安装列表里", () => {
+  // 安装器拒绝无校验的包，所以目录也不该把这种条目摆给用户看。
+  const unverified = CATALOG.filter((entry) => !isInstallable(entry));
+  const offered = catalogFor("win32", "x64");
+  for (const entry of unverified) {
+    assert.equal(offered.includes(entry), false, `${entry.id} 没有哈希却出现了`);
+  }
+});
+
+test("目录按平台和架构过滤", () => {
+  // 换一个平台就不该看到别的平台的包。
+  const win = catalogFor("win32", "x64", { includeUnverified: true });
+  const linux = catalogFor("linux", "x64", { includeUnverified: true });
+  for (const entry of win) assert.equal(entry.platform, "win32");
+  for (const entry of linux) assert.equal(entry.platform, "linux");
+  // arm64 的 macOS 包不该出现在 x64 上。
+  const darwinX64 = catalogFor("darwin", "x64", { includeUnverified: true });
+  assert.equal(darwinX64.length, 0);
+});
+
+test("目录里每个条目本身是自洽的", () => {
+  for (const entry of CATALOG) {
+    assert.match(entry.id, /^[a-z0-9][a-z0-9._-]*$/, `${entry.id} 不是合法的 pack id`);
+    assert.ok(entry.sources.length > 0, `${entry.id} 没有来源`);
+    for (const source of entry.sources) {
+      assert.match(source.url, /^https:\/\//, `${entry.id} 的来源不是 https`);
+      assert.ok(source.hosts.length > 0, `${entry.id} 没有声明允许的主机`);
+    }
+    assert.ok(entry.provides.length > 0, `${entry.id} 没有声明提供什么`);
+    // 每个条目都必须能在装完后证明自己是可用的。
+    assert.ok(entry.validation.command, `${entry.id} 没有验证命令`);
+  }
+});

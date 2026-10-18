@@ -247,6 +247,9 @@ export async function installPack(entry: CatalogEntry, options: InstallOptions =
   // a pack directory whose layout only becomes correct after a move is a pack
   // that can be observed in the wrong state.
   const payloadStage = join(txn, manifest.payload.root);
+  // tar 的 `-C` 要求目标目录已经存在；不建的话它会 chdir 失败，而错误信息
+  // 出现在下载和校验都成功之后 —— 那是最让人困惑的失败位置。
+  mkdirSync(payloadStage, { recursive: true });
 
   try {
     // Download every source; a composite pack (Zephyr) has more than one.
@@ -318,15 +321,15 @@ export async function installPack(entry: CatalogEntry, options: InstallOptions =
       // Move the old pack aside first: the rename below needs the name free,
       // and a failure deleting the old one must not destroy the new one.
       const trash = join(root, "packs", `.trash-${id}-${Date.now()}`);
-      renameWithRetry(destination, trash);
-      renameWithRetry(txn, destination);
+      await renameWithRetry(destination, trash);
+      await renameWithRetry(txn, destination);
       try {
         rmSync(trash, { recursive: true, force: true });
       } catch {
         /* pruned later */
       }
     } else {
-      renameWithRetry(txn, destination);
+      await renameWithRetry(txn, destination);
     }
 
     return finalManifest;
@@ -344,13 +347,13 @@ export async function installPack(entry: CatalogEntry, options: InstallOptions =
 }
 
 /**
- * Windows can refuse a rename while an indexer or antivirus holds a handle.
- * Retrying briefly is the difference between a spurious failure and a real one.
+ * Windows 上刚解压出 1GB 的文件时，杀毒软件或索引器会立刻开始扫描，此时
+ * 对目录改名会得到 EPERM。这不是真正的失败，等它扫完就好。
  *
- * The wait is a blocking sleep on a worker thread rather than a spin, so a
- * retry does not burn a core while the host's event loop stays free.
+ * 所以重试必须是异步的：同步的重试会把宿主的命令循环卡住最多一秒多，而这
+ * 期间用户点什么都没有反应。
  */
-function renameWithRetry(from: string, to: string, attempts = 5): void {
+async function renameWithRetry(from: string, to: string, attempts = 8): Promise<void> {
   let last: unknown;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
@@ -358,18 +361,18 @@ function renameWithRetry(from: string, to: string, attempts = 5): void {
       return;
     } catch (error) {
       last = error;
-      if (attempt < attempts - 1) sleepMs(150 * (attempt + 1));
+      const code = (error as NodeJS.ErrnoException).code;
+      // Only transient Windows contention is worth waiting out. A permission
+      // error caused by the target being a different volume will not improve.
+      if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES") break;
+      if (attempt < attempts - 1) await sleep(120 * (attempt + 1));
     }
   }
   throw new InstallError(`could not move ${from} into place: ${last instanceof Error ? last.message : String(last)}`);
 }
 
-function sleepMs(ms: number): void {
-  // Atomics.wait on a shared buffer is the only sleep that does not need a
-  // timer; it blocks this thread only, and install work is already off the
-  // command loop.
-  const shared = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(shared, 0, 0, ms);
+function sleep(ms: number): Promise<void> {
+  return new Promise((done) => setTimeout(done, ms));
 }
 
 /** The licence and source offer, written next to the payload. */
