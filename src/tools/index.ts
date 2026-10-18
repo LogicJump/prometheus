@@ -9,6 +9,7 @@ import {
   searchCodeTool,
 } from "./fileTools.ts";
 import { bashTool, todoTool } from "./shellTools.ts";
+import { embeddedTools } from "./embeddedTools.ts";
 import { saveMemory } from "../memory.ts";
 
 const memoryTool: Tool = {
@@ -124,6 +125,7 @@ export const ALL_TOOLS: Tool[] = [
   todoTool,
   memoryTool,
   subagentTool,
+  ...embeddedTools,
 ];
 
 export function toolByName(name: string): Tool | undefined {

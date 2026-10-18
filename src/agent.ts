@@ -160,6 +160,9 @@ ${styleNote}
 # Tools
 Prefer dedicated file tools over bash for reading and editing. Use bash for builds, tests, git, and package managers. Never run interactive commands. Paths are relative to the workspace root unless absolute.
 
+# Embedded work
+When the workspace is firmware, prefer the embed_* tools over bash. They return structured results — parsed diagnostics with file and line, artifact paths, flash/RAM usage, verified flash status, parsed log lines — which a shell command's output does not. The loop is: embed_build, read the diagnostics, fix, embed_build again, then embed_flash, then embed_serial to see whether the board came up. Do not claim a flash worked unless the tool reported it did; several flashers exit zero after a failed verify. When a target name is unknown, call embed_targets before guessing — flashing the wrong part bricks boards.
+
 # Memory
 Use the remember tool for durable facts about the user or project. Do not save transient task state.
 ${memory ? `\n# Existing memory\n${memory}` : ""}

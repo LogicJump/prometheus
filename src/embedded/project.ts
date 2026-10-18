@@ -139,17 +139,32 @@ export function detectProject(start = process.cwd()): DetectedProject {
     if (parent === dir) break;
     dir = parent;
   }
-  // Generic build systems only count at the starting directory.
-  if (has(join(start, "CMakeLists.txt")) || has(join(start, "CMakePresets.json"))) {
-    return finish("cmake", start, ["CMakeLists.txt"]);
+  // Generic build systems only count at the starting directory, so a build run
+  // from `src/` sees nothing. A project's own subtree is the common case for an
+  // agent that was told to "build", so walk up for these too — a CMakeLists.txt
+  // anywhere above the working directory is the build for this code.
+  const ancestors: string[] = [];
+  {
+    let dir = start;
+    for (let depth = 0; depth < 5; depth++) {
+      ancestors.push(dir);
+      const parent = join(dir, "..");
+      if (parent === dir) break;
+      dir = parent;
+    }
   }
-  if (has(join(start, "Makefile")) || has(join(start, "makefile"))) {
-    return finish("make", start, ["Makefile"]);
+  for (const dir of ancestors) {
+    if (has(join(dir, "CMakeLists.txt")) || has(join(dir, "CMakePresets.json"))) {
+      return finish("cmake", dir, [dir === start ? "CMakeLists.txt" : `CMakeLists.txt (${dir})`]);
+    }
+    if (has(join(dir, "Makefile")) || has(join(dir, "makefile"))) {
+      return finish("make", dir, [dir === start ? "Makefile" : `Makefile (${dir})`]);
+    }
+    const keil = readdirSyncSafe(dir).filter((name) => name.endsWith(".uvprojx") || name.endsWith(".uvproj"));
+    if (keil.length > 0) return finish("keil", dir, keil);
+    const iar = readdirSyncSafe(dir).filter((name) => name.endsWith(".ewp") || name.endsWith(".eww"));
+    if (iar.length > 0) return finish("iar", dir, iar);
   }
-  const keil = readdirSyncSafe(start).filter((name) => name.endsWith(".uvprojx") || name.endsWith(".uvproj"));
-  if (keil.length > 0) return finish("keil", start, keil);
-  const iar = readdirSyncSafe(start).filter((name) => name.endsWith(".ewp") || name.endsWith(".eww"));
-  if (iar.length > 0) return finish("iar", start, iar);
   return { kind: "unknown", root: start, evidence: [] };
 }
 
