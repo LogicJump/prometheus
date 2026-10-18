@@ -25,7 +25,7 @@ import { compactForce } from "../src/context.ts";
 import { discoverModels, FALLBACK_MODELS } from "../src/models.ts";
 import { detectLocale, isLocale } from "../src/i18n.ts";
 import { buildChange } from "../src/diff.ts";
-import { loadCheckpoints, restoreTo, clearCheckpoints, captureBefore } from "../src/checkpoints.ts";
+import { loadCheckpoints, restoreTo, restoreAfterMessage, clearCheckpoints, captureBefore } from "../src/checkpoints.ts";
 import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src/workspace.ts";
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
 import { publicProviders, providerFor } from "../src/providers.ts";
@@ -334,6 +334,8 @@ function emitState() {
     locale,
     mode: config.permissionMode,
     effort: config.thinkingEffort,
+    sandbox: config.sandbox ?? "enforce",
+    networkPolicy: config.networkPolicy ?? "off",
     model: config.model,
     models: pickerModels(),
     modelsSource: catalog.source,
@@ -544,6 +546,8 @@ async function handle(cmd) {
           effort: config?.thinkingEffort ?? "auto",
           maxTokens: config?.maxTokens ?? 16000,
           autoApprove: config?.autoApprove ?? [],
+          sandbox: config?.sandbox ?? "enforce",
+          networkPolicy: config?.networkPolicy ?? "off",
           contextWindow: config?.contextWindow ?? 1_000_000,
           modelContext: config ? catalog.models.find((model) => model.id === config.model)?.contextLength ?? null : null,
           locale,
@@ -575,6 +579,8 @@ async function handle(cmd) {
       if (Number.isFinite(Number(patch.contextWindow))) {
         filePatch.contextWindow = Math.max(8_000, Math.min(4_000_000, Number(patch.contextWindow)));
       }
+      if (patch.sandbox === "off" || patch.sandbox === "enforce") filePatch.sandbox = patch.sandbox;
+      if (["off", "proxy", "open"].includes(patch.networkPolicy)) filePatch.networkPolicy = patch.networkPolicy;
       if (typeof patch.autoApprove === "string" || Array.isArray(patch.autoApprove)) {
         const list = Array.isArray(patch.autoApprove) ? patch.autoApprove : String(patch.autoApprove).split(",");
         filePatch.autoApprove = list.map((name) => String(name).trim()).filter(Boolean);
@@ -602,6 +608,8 @@ async function handle(cmd) {
         agent.config.maxTokens = config.maxTokens;
         agent.config.contextWindow = config.contextWindow;
         agent.config.autoApprove = config.autoApprove;
+        agent.config.sandbox = config.sandbox;
+        agent.config.networkPolicy = config.networkPolicy;
         agent.config.thinkingEffort = config.thinkingEffort;
         agent.config.permissionMode = config.permissionMode;
         agent.refreshSystemPrompt();
@@ -812,6 +820,38 @@ async function handle(cmd) {
     case "getCheckpoints":
       send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
       return;
+    case "rewindTo": {
+      // Undo everything after a message: truncate the conversation, restore the
+      // files those turns changed, and persist as a new JSONL generation.
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      const requested = Number(cmd.index);
+      if (!Number.isFinite(requested) || requested < 1) {
+        return send({ type: "notice", level: "error", text: "rewind needs a message index" });
+      }
+      let index = Math.min(Math.floor(requested), agent.messages.length);
+      while (index > 1 && agent.messages[index]?.role !== "user") index--;
+      const removed = agent.messages.length - index;
+      if (removed <= 0) return send({ type: "notice", level: "warn", text: "nothing to rewind" });
+
+      const files = restoreAfterMessage(sessionId, index);
+      agent.messages = agent.messages.slice(0, index);
+      resetChanges();
+      persist();
+      send({ type: "session_loaded", messages: publicMessages(agent.messages), cwd });
+      send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
+      emitChanges();
+      emitState();
+      send({ type: "run_end", context: agent.contextUsage(), usage: agent.usage, todos: agent.todos.items, files: changedFiles() });
+      const restored = files.restored.length;
+      send({
+        type: "notice",
+        level: files.errors.length ? "warn" : "info",
+        text: files.errors.length
+          ? `rewound ${removed} message(s), restored ${restored} file(s); ${files.errors.join("; ")}`
+          : `rewound ${removed} message(s)` + (restored ? `, restored ${restored} file(s)` : ""),
+      });
+      return;
+    }
     case "restoreCheckpoint": {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
       const result = restoreTo(sessionId, cmd.id);
@@ -977,14 +1017,15 @@ async function handle(cmd) {
 /** Strip internal assistant/tool structure down to what the transcript needs. */
 function publicMessages(messages) {
   const out = [];
-  for (const message of messages) {
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
     if (message.role === "user") {
       if (typeof message.content === "string") {
-        out.push({ role: "user", text: message.content });
+        out.push({ role: "user", text: message.content, index });
       } else if (Array.isArray(message.content)) {
         const text = message.content.filter((part) => part.type === "text").map((part) => part.text).join(" ");
         const images = message.content.filter((part) => part.type === "image_url").length;
-        out.push({ role: "user", text, images });
+        out.push({ role: "user", text, images, index });
       }
     } else if (message.role === "assistant") {
       if (typeof message.content === "string" && message.content.trim()) {

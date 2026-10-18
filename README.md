@@ -51,8 +51,15 @@ Prometheus.exe D:\code\my-project
 - **Streaming chat with tool use.** The model reads files, edits them, searches
   the tree, and runs shell commands, then loops until the task is done.
 - **Three permission modes.** `ask` confirms every mutating tool, `auto` runs
-  them but still prompts for destructive shell commands, `plan` only allows
+  them but still prompts for `confirm`-class shell commands, `plan` only allows
   read-only tools so you can investigate before changing anything.
+- **Command sandbox.** Commands are classified (allow / confirm / deny), paths
+  outside the workspace are refused, the environment is scrubbed of secrets, and
+  network access can be cut off. It is a policy check, not an OS-level sandbox.
+- **Rewind.** Any user turn can be rewound to: later turns are dropped and the
+  files they changed are restored.
+- **Resilient edits.** `edit_file` tolerates CRLF, trailing whitespace, and
+  indentation drift, and accepts atomic batches or SEARCH/REPLACE patches.
 - **Context that survives long sessions.** Three progressive compaction levels
   (trim oldest turns, then a deterministic recap, then clipping oversized tool
   output) keep a conversation inside the window without an extra model call.

@@ -449,6 +449,22 @@
               <span data-i18n="settingsContext">Context window</span>
               <input id="setting-context" type="number" min="8000" max="4000000" step="1000" />
             </label>
+            <label class="field">
+              <span data-i18n="settingsSandbox">Command isolation</span>
+              <select id="setting-sandbox">
+                <option value="enforce" data-i18n="sandboxEnforce">On</option>
+                <option value="off" data-i18n="sandboxOff">Off</option>
+              </select>
+            </label>
+            <label class="field">
+              <span data-i18n="settingsNetwork">Command network</span>
+              <select id="setting-network">
+                <option value="off" data-i18n="networkOff">Off</option>
+                <option value="proxy" data-i18n="networkProxy">Proxy only</option>
+                <option value="open" data-i18n="networkOpen">Allowed</option>
+              </select>
+            </label>
+            <div class="settings-hint" data-i18n="sandboxHint">Classifies commands, keeps paths inside the workspace, and does not inherit secrets. It is a policy check, not an OS-level sandbox.</div>
           </section>
           <section class="settings-section" data-settings-pane="appearance" hidden>
             <label class="field">

@@ -18,6 +18,10 @@ export interface Config {
   allowedDirs: string[];
   /** Tool names auto-approved in ask mode. */
   autoApprove: string[];
+  /** Command sandbox strength. "enforce" classifies and confines commands. */
+  sandbox?: "off" | "enforce";
+  /** Network access for commands: off rejects fetchers and injects a dead proxy. */
+  networkPolicy?: "off" | "proxy" | "open";
 }
 
 export interface ToolCall {

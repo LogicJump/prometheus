@@ -45,7 +45,7 @@ export function estimateTokens(messages: ChatMessage[]): number {
   return Math.ceil(total);
 }
 
-export type CompactionLevel = "trim" | "summarize" | "aggressive";
+export type CompactionLevel = "trim" | "summarize" | "aggressive" | "local-fallback";
 
 export interface CompactionResult {
   messages: ChatMessage[];
@@ -60,6 +60,107 @@ export interface CompactionResult {
 export function compact(messages: ChatMessage[], contextWindow: number): CompactionResult | null {
   return compactAt(messages, Math.floor(contextWindow * BUDGET_RATIO));
 }
+
+/**
+ * Model-assisted compaction.
+ *
+ * Level 1 (trim) is a free local rewrite. Levels 2-3 need a summary, and a
+ * keyword recap loses the reasons behind decisions, so the caller supplies a
+ * model-backed `summarize`. Any failure falls back to the local recap; the
+ * result names which path ran so the UI can say so.
+ */
+export async function compactWithModel(
+  messages: ChatMessage[],
+  contextWindow: number,
+  options: {
+    summarize: (old: ChatMessage[], localSummary: string) => Promise<string>;
+    signal?: AbortSignal;
+  },
+): Promise<CompactionResult | null> {
+  const budget = Math.floor(contextWindow * BUDGET_RATIO);
+  const before = estimateTokens(messages);
+  if (before <= budget) return null;
+
+  const system = messages[0]?.role === "system" ? messages[0] : undefined;
+  const rest = system ? messages.slice(1) : messages;
+  if (rest.length <= 2) return null;
+
+  // 1. trim, if it is enough on its own nothing is summarized
+  const trimSplit = splitPoint(rest, TRIM_KEEP);
+  if (trimSplit > 0) {
+    const candidate: ChatMessage[] = system ? [system, ...rest.slice(trimSplit)] : rest.slice(trimSplit);
+    if (estimateTokens(candidate) <= budget) {
+      return result(candidate, trimSplit, "trim", "(oldest turns trimmed)", before);
+    }
+  }
+
+  // 2/3. summarize with the model
+  const summarizeSplit = splitPoint(rest, SUMMARIZE_KEEP);
+  const old = rest.slice(0, summarizeSplit);
+  const recent = rest.slice(summarizeSplit);
+  const local = summarize(old);
+  let summary = local;
+  let level: CompactionLevel = "summarize";
+  try {
+    if (!options.signal?.aborted) {
+      const generated = (await options.summarize(old, local)).trim();
+      if (generated.length > 0) summary = generated;
+      else level = "local-fallback";
+    } else {
+      level = "local-fallback";
+    }
+  } catch {
+    level = "local-fallback";
+  }
+
+  const recap = recapMessage(summary);
+  const summarized: ChatMessage[] = system ? [system, recap, ...recent] : [recap, ...recent];
+  if (estimateTokens(summarized) <= budget) {
+    return result(summarized, old.length, level, summary, before);
+  }
+
+  const aggressiveSplit = splitPoint(recent, AGGRESSIVE_KEEP);
+  const clipped = recent.slice(aggressiveSplit).map(clipMessage);
+  const aggressive: ChatMessage[] = system ? [system, recapMessage(summary), ...clipped] : [recapMessage(summary), ...clipped];
+  return result(aggressive, old.length + aggressiveSplit, "aggressive", summary, before);
+}
+
+/** Build the transcript the summarizer sees: text plus clipped tool results. */
+export function summarizerInput(messages: ChatMessage[], maxChars = 60_000): string {
+  const lines: string[] = [];
+  let used = 0;
+  for (const message of messages) {
+    let line = "";
+    if (message.role === "user") {
+      const text = typeof message.content === "string"
+        ? message.content
+        : message.content.filter((part) => part.type === "text").map((part) => part.text).join(" ");
+      line = `USER: ${text}`;
+    } else if (message.role === "assistant") {
+      const text = typeof message.content === "string" ? message.content : "";
+      const calls = (message.tool_calls ?? []).map((call) => `${call.function.name}(${call.function.arguments.slice(0, 400)})`);
+      line = `ASSISTANT: ${text}${calls.length ? `\n  tools: ${calls.join("; ")}` : ""}`;
+    } else if (message.role === "tool") {
+      const body = String(message.content);
+      line = `TOOL RESULT: ${body.length > 4_000 ? `${body.slice(0, 4_000)} [...${body.length - 4_000} chars clipped]` : body}`;
+    }
+    if (!line) continue;
+    if (used + line.length > maxChars) break;
+    lines.push(line);
+    used += line.length;
+  }
+  return lines.join("\n\n");
+}
+
+/** The prompt the summarizer model answers. */
+export const SUMMARIZE_PROMPT = `Summarize the earlier part of a coding session so the agent can continue without it.
+Use short markdown sections and keep every fact needed to continue:
+- Goal: what the user asked for.
+- Decisions: choices made and why; reject approaches only if the reason still matters.
+- Files: paths changed and what changed in each; paths read only if still relevant.
+- Commands: what was run and its result (tests failing, build errors).
+- Open items: what is unfinished or uncertain, and the next concrete step.
+Do not invent anything. Do not repeat the transcript. Aim for 200-400 words.`;
 
 /** Force a compaction regardless of size (the /compact command). */
 export function compactForce(messages: ChatMessage[]): ChatMessage[] {

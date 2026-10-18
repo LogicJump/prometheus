@@ -39,6 +39,8 @@ interface FileConfig {
   maxTurns?: number;
   allowedDirs?: string[];
   autoApprove?: string[];
+  sandbox?: "off" | "enforce";
+  networkPolicy?: "off" | "proxy" | "open";
 }
 
 function readJson(path: string): FileConfig {
@@ -53,6 +55,14 @@ function readJson(path: string): FileConfig {
 
 function validMode(value: string | undefined): PermissionMode | undefined {
   return value === "ask" || value === "auto" || value === "plan" ? value : undefined;
+}
+
+function validSandbox(value: string | undefined): "off" | "enforce" | undefined {
+  return value === "off" || value === "enforce" ? value : undefined;
+}
+
+function validNetwork(value: string | undefined): "off" | "proxy" | "open" | undefined {
+  return value === "off" || value === "proxy" || value === "open" ? value : undefined;
 }
 
 function validEffort(value: string | undefined): ThinkingEffort | undefined {
@@ -100,6 +110,16 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
     maxTurns: cli.maxTurns ?? file.maxTurns ?? 60,
     allowedDirs: cli.allowedDirs ?? file.allowedDirs ?? [],
     autoApprove: cli.autoApprove ?? file.autoApprove ?? [],
+    sandbox:
+      cli.sandbox ??
+      validSandbox(process.env.PROMETHEUS_SANDBOX) ??
+      file.sandbox ??
+      "enforce",
+    networkPolicy:
+      cli.networkPolicy ??
+      validNetwork(process.env.PROMETHEUS_NETWORK_POLICY) ??
+      file.networkPolicy ??
+      "off",
   };
 
   if (!config.apiKey) {

@@ -13,7 +13,7 @@ import { ChatClient, type ApiTool } from "./llm.ts";
 import type { Config, TodoList, Tool, Usage, UserContentPart } from "./types.ts";
 import type { TerminalUi } from "./ui.ts";
 import { Permissions } from "./permissions.ts";
-import { estimateTokens } from "./context.ts";
+import { estimateTokens, summarizerInput, SUMMARIZE_PROMPT } from "./context.ts";
 import { loadMemory } from "./memory.ts";
 import { SUBAGENT_TOOLS, ALL_TOOLS } from "./tools/index.ts";
 import { loadProjectInstructions } from "./instructions.ts";
@@ -200,6 +200,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         sessionId: this.sessionId,
         onBeforeMutate: this.onBeforeMutate,
         runSubagent: (prompt) => this.runSubagent(prompt, this.abortController?.signal ?? new AbortController().signal),
+        messageIndex: () => this.messages.length,
         trusted: this.isSubagent,
         cwd: process.cwd(),
       },
@@ -220,6 +221,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         apiTools: () => toApiTools(this.tools),
         signal,
         drainQueue: () => this.queued.splice(0),
+        summarize: (old, local) => this.summarizeWithModel(old, local, signal),
         maxRetries: 3,
       });
 
@@ -233,6 +235,31 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       this.ui.thinkingEnd();
       this.abortController = null;
     }
+  }
+
+  /**
+   * One non-streaming request for a compaction recap. It reuses the session's
+   * client (same provider, key, and model) and never touches the transcript.
+   */
+  private async summarizeWithModel(old: ChatMessage[], localSummary: string, signal: AbortSignal): Promise<string> {
+    if (this.isSubagent) return localSummary;
+    const input = summarizerInput(old);
+    if (!input.trim()) return localSummary;
+    const request = this.client.chat(
+      [
+        { role: "system", content: SUMMARIZE_PROMPT },
+        { role: "user", content: `Transcript to summarize:\n\n${input}` },
+      ],
+      [],
+      () => {},
+      () => {},
+      signal,
+    );
+    // A slow summarizer must not stall the turn indefinitely.
+    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 45_000));
+    const result = await Promise.race([request, timeout]);
+    if (!result) return localSummary;
+    return result.content.trim() || localSummary;
   }
 
   /** Translate a loop event into the terminal UI calls. */

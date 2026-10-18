@@ -70,8 +70,8 @@ Three progressive levels, all local (no summarization model call):
 
 | Level | Trigger | Effect |
 | --- | --- | --- |
-| trim | over 75% of the window | drop the oldest complete turns, keep 24 recent |
-| summarize | still over after trimming | recap of requests/files/commands + 8 recent messages |
+| trim | over 75% of the window | drop the oldest complete turns, keep 24 recent (local, free) |
+| summarize | still over after trimming | the session model writes a structured recap; falls back to a local recap if the call fails |
 | aggressive | the recent window itself overflows | 4 recent messages, tool payloads clipped to 4k characters |
 
 Split points always snap to a user message so a tool result never loses its
@@ -118,6 +118,28 @@ messages.0002.jsonl    a new generation after compaction rewrote the history
   read.
 - Legacy single-file `<id>.json` sessions are read transparently and migrate to
   the directory layout on first write.
+
+## Sandbox — `src/sandbox.ts`
+
+A policy layer, not an OS sandbox (the settings UI says so):
+
+- **Classification**: deny (disk formatting, fork bombs, power off, piping a
+  download into an interpreter) / confirm (recursive deletes, history rewrites,
+  package installs, privilege escalation) / allow. `auto` mode consults it;
+  `ask` still prompts for every mutating tool.
+- **Path confinement**: absolute paths and parent escapes outside the workspace
+  are refused with the offending path named.
+- **Environment scrub**: commands get a minimal env; API keys and unrelated
+  secrets are not inherited.
+- **Network policy**: `off` rejects known fetchers and injects a dead proxy.
+
+## Rewind — checkpoints keyed by message
+
+`captureBefore` records `messageIndex`, so `restoreAfterMessage` can undo every
+file change made at or after a message. The host's `rewindTo` truncates the
+conversation, restores files, persists (a shorter conversation starts a new JSONL
+generation), and re-renders the transcript. The transcript offers the action on
+user turns.
 
 ## Wiring — `src/agent.ts` and `desktop/host.js`
 

@@ -101,3 +101,61 @@ test("streaming accumulates split tool-call deltas and usage", async () => {
   assert.equal(second.content, "finished");
   await fake.close();
 });
+
+/* ---------- model-assisted compaction ---------- */
+
+/** Messages big enough that trimming to 24 still overflows, but 8 fit. */
+function overflowingConversation(chars: number, pairs: number): ChatMessage[] {
+  const messages: ChatMessage[] = [{ role: "system", content: "system" }];
+  for (let i = 0; i < pairs; i++) {
+    messages.push({ role: "user", content: `request ${i} ${"x".repeat(chars)}` });
+    messages.push({ role: "assistant", content: `answer ${i} ${"y".repeat(chars)}` });
+  }
+  return messages;
+}
+
+test("compaction asks the model for the recap when one is available", async () => {
+  const { compactWithModel } = await import("../src/context.ts");
+  // 40 pairs x ~1000 tokens each; keeping 24 recent messages still overflows.
+  const messages = overflowingConversation(4_000, 40);
+  let asked = false;
+  const result = await compactWithModel(messages, 20_000, {
+    summarize: async () => {
+      asked = true;
+      return "## Goal\nShip the feature.";
+    },
+  });
+  assert.ok(result, "compaction should run");
+  assert.ok(asked, "the model summarizer should be called");
+  assert.equal(result.level, "summarize");
+  assert.match(String(result.messages[1].content), /Ship the feature/);
+});
+
+test("a failed model summary falls back to the local recap", async () => {
+  const { compactWithModel } = await import("../src/context.ts");
+  const messages = overflowingConversation(4_000, 40);
+  const result = await compactWithModel(messages, 20_000, {
+    summarize: async () => {
+      throw new Error("provider down");
+    },
+  });
+  assert.ok(result);
+  assert.equal(result.level, "local-fallback");
+  assert.match(String(result.messages[1].content), /User requests/);
+});
+
+test("trim handles small overflows without calling the model", async () => {
+  const { compactWithModel } = await import("../src/context.ts");
+  // 77 small pairs: the 24-message window fits once the oldest turns are gone.
+  const messages = overflowingConversation(200, 77);
+  let asked = false;
+  const result = await compactWithModel(messages, 4_000, {
+    summarize: async () => {
+      asked = true;
+      return "summary";
+    },
+  });
+  assert.ok(result);
+  assert.equal(result.level, "trim");
+  assert.equal(asked, false);
+});

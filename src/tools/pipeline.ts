@@ -31,6 +31,8 @@ export interface PipelineDeps {
   onBeforeMutate?: ((toolName: string, input: Record<string, unknown>) => void) | null;
   /** Run a sub-task; only the top-level agent provides this. */
   runSubagent: (prompt: string) => Promise<string>;
+  /** Conversation length right now, recorded on each checkpoint for rewind. */
+  messageIndex?: () => number;
   /** Skip permission prompts and hooks (sub-agents run under the parent's grant). */
   trusted?: boolean;
   cwd: string;
@@ -127,7 +129,7 @@ export class ToolPipeline {
     // 3. prepare
     if (this.deps.sessionId && MUTATING_FILE_TOOLS.has(name) && typeof input.path === "string") {
       try {
-        captureBefore(this.deps.sessionId, name, this.deps.cwd, input.path);
+        captureBefore(this.deps.sessionId, name, this.deps.cwd, input.path, this.deps.messageIndex?.());
       } catch {
         /* checkpointing must never block a tool */
       }

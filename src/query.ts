@@ -23,7 +23,7 @@
 import type { ChatMessage } from "./types.ts";
 import type { ApiTool, ChatClient } from "./llm.ts";
 import type { Config, Usage } from "./types.ts";
-import { compact, type CompactionLevel } from "./context.ts";
+import { compactWithModel, type CompactionLevel } from "./context.ts";
 import { classifyError, type ClassifiedError } from "./errors.ts";
 import type { ToolPipeline } from "./tools/pipeline.ts";
 
@@ -55,6 +55,11 @@ export interface QueryOptions {
   drainQueue?: () => string[];
   /** How many recoverable failures to tolerate in one turn. */
   maxRetries?: number;
+  /**
+   * Ask the model for the recap when compaction needs one. Without it the
+   * local keyword summary is used (tests, offline runs).
+   */
+  summarize?: (old: ChatMessage[], localSummary: string) => Promise<string>;
 }
 
 export interface QueryResult {
@@ -114,7 +119,9 @@ export async function* query(options: QueryOptions): AsyncGenerator<QueryEvent, 
     }
 
     // compact: shrink the window before paying for a request
-    const compaction = compact(messages, config.contextWindow);
+    const compaction = options.summarize
+      ? await compactWithModel(messages, config.contextWindow, { summarize: options.summarize, signal })
+      : await compactWithModel(messages, config.contextWindow, { summarize: async () => "" });
     if (compaction) {
       messages.splice(0, messages.length, ...compaction.messages);
       yield {

@@ -23,6 +23,8 @@ export interface CheckpointEntry {
   absPath: string;
   /** "created" means the file did not exist; "modified" keeps the prior content. */
   kind: "created" | "modified" | "deleted";
+  /** Conversation length when this change ran; used to rewind by message. */
+  messageIndex?: number;
   /** Relative blob file holding prior content, when kind === "modified" or "deleted". */
   blob?: string;
   bytes: number;
@@ -66,6 +68,7 @@ export function captureBefore(
   tool: string,
   cwd: string,
   inputPath: string,
+  messageIndex?: number,
 ): CheckpointEntry | null {
   const absPath = isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath);
   const existed = existsSync(absPath);
@@ -100,6 +103,7 @@ export function captureBefore(
     kind: existed ? "modified" : "created",
     blob,
     bytes: Buffer.byteLength(prior, "utf8"),
+    ...(Number.isFinite(messageIndex) ? { messageIndex } : {}),
   };
   state.entries.push(entry);
   // Keep the log bounded; old blobs are pruned with the entries.
@@ -157,6 +161,45 @@ export function restoreTo(sessionId: string, checkpointId: string | "start"): { 
   state.entries = state.entries.slice(0, stopIndex);
   saveCheckpoints(state);
   return { restored: [...new Set(restored)], errors };
+}
+
+/**
+ * Rewind files to the state at a message index: every change recorded at or
+ * after that point is undone, newest first, and pruned. Mirrors `restoreTo`,
+ * which rewinds by checkpoint id.
+ */
+export function restoreAfterMessage(sessionId: string, messageIndex: number): { restored: string[]; errors: string[]; affected: number } {
+  const state = loadCheckpoints(sessionId);
+  const restored: string[] = [];
+  const errors: string[] = [];
+  const affected = state.entries.filter((entry) => entry.messageIndex !== undefined && entry.messageIndex >= messageIndex);
+  if (affected.length === 0) return { restored, errors, affected: 0 };
+
+  for (let index = state.entries.length - 1; index >= 0; index--) {
+    const entry = state.entries[index];
+    // Entries from before message indexes existed cannot be placed in time,
+    // so they are never rolled back by this path.
+    if (entry.messageIndex === undefined || entry.messageIndex < messageIndex) continue;
+    try {
+      if (entry.kind === "created") {
+        rmSync(entry.absPath, { force: true });
+      } else if (entry.blob) {
+        const dir = sessionDir(sessionId);
+        const rel = relative(dir, join(dir, entry.blob));
+        if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("invalid blob path");
+        const content = readFileSync(join(dir, entry.blob), "utf8");
+        mkdirSync(dirname(entry.absPath), { recursive: true });
+        writeFileSync(entry.absPath, content, "utf8");
+      }
+      restored.push(entry.path);
+    } catch (err) {
+      errors.push(`${entry.path}: ${(err as Error).message}`);
+    }
+  }
+
+  state.entries = state.entries.filter((entry) => entry.messageIndex === undefined || entry.messageIndex < messageIndex);
+  saveCheckpoints(state);
+  return { restored: [...new Set(restored)], errors, affected: affected.length };
 }
 
 /** Discard a session's checkpoint history. */

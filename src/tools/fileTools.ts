@@ -3,6 +3,8 @@ import { existsSync } from "node:fs";
 import type { Tool, ToolResult } from "../types.ts";
 import { resolveSafePath } from "../permissions.ts";
 import { readTextFile, relPath, withLineNumbers } from "./fsUtil.ts";
+import { diffFile } from "../diff.ts";
+import { findMatch, parsePatch, reindent } from "./match.ts";
 
 const LIMIT = 2000;
 
@@ -94,64 +96,136 @@ export const writeFileTool: Tool = {
   },
 };
 
+interface EditSpec {
+  old_string: string;
+  new_string: string;
+  replace_all?: boolean;
+}
+
+interface AppliedEdit {
+  rung: string;
+  occurrences: number;
+}
+
 export const editFileTool: Tool = {
   name: "edit_file",
   description:
-    "Replace an exact text occurrence in a file. old_string must match byte-for-byte, including indentation, and must be unique unless replace_all is true. Prefer small, surgical edits over rewriting files.",
+    "Change a file with one or more search/replace edits. Provide old_string + new_string for a single edit, `edits` for an atomic batch, or `patch` with <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks. Matching tolerates CRLF, trailing whitespace, and differing indentation, but each search must resolve to exactly one place. All edits in one call succeed or nothing is written.",
   readonly: false,
   parameters: {
     type: "object",
     properties: {
       path: { type: "string" },
-      old_string: { type: "string", description: "Exact text to find" },
-      new_string: { type: "string", description: "Replacement text" },
-      replace_all: { type: "boolean", description: "Replace every occurrence" },
+      old_string: { type: "string", description: "Exact text to find (single edit)" },
+      new_string: { type: "string", description: "Replacement text (single edit)" },
+      replace_all: { type: "boolean", description: "Replace every occurrence of old_string" },
+      edits: {
+        type: "array",
+        description: "Several edits applied in order, atomically",
+        items: {
+          type: "object",
+          properties: {
+            old_string: { type: "string" },
+            new_string: { type: "string" },
+            replace_all: { type: "boolean" },
+          },
+          required: ["old_string", "new_string"],
+          additionalProperties: false,
+        },
+      },
+      patch: {
+        type: "string",
+        description: "One or more <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks",
+      },
     },
-    required: ["path", "old_string", "new_string"],
+    required: ["path"],
     additionalProperties: false,
   },
-  summarize: (input) => String(input.path ?? ""),
+  summarize: (input) => {
+    const count = Array.isArray(input.edits) ? input.edits.length : input.patch ? "patch" : 1;
+    return `${input.path ?? ""}${typeof count === "number" && count > 1 ? ` (${count} edits)` : ""}`;
+  },
   async execute(input, ctx): Promise<ToolResult> {
     const abs = resolveSafePath(String(input.path), ctx.cwd, ctx.config.allowedDirs);
-    const oldString = String(input.old_string ?? "");
-    const newString = String(input.new_string ?? "");
-    if (oldString === newString) return { isError: true, content: "old_string and new_string are identical" };
-    if (oldString === "") return { isError: true, content: "old_string must not be empty" };
+    const specs = collectEdits(input);
+    if (typeof specs === "string") return { isError: true, content: specs };
 
     const { readTextFile: read, writeTextFile: write } = await import("./fsUtil.ts");
-    const text = await read(abs);
+    const before = await read(abs);
+    let text = before;
+    const applied: AppliedEdit[] = [];
 
-    const indexes: number[] = [];
-    let from = 0;
-    for (;;) {
-      const idx = text.indexOf(oldString, from);
-      if (idx === -1) break;
-      indexes.push(idx);
-      from = idx + oldString.length;
-    }
-    if (indexes.length === 0) {
-      return {
-        isError: true,
-        content: `old_string not found in ${input.path}. It must match exactly, including whitespace. Re-read the file and copy the exact text.`,
-      };
-    }
-    if (indexes.length > 1 && !input.replace_all) {
-      const shown = indexes.slice(0, 5).map((i) => text.slice(0, i).split("\n").length);
-      return {
-        isError: true,
-        content: `old_string is ambiguous (${indexes.length} matches at lines ${shown.join(", ")}). Add more context or set replace_all.`,
-      };
+    for (let index = 0; index < specs.length; index++) {
+      const spec = specs[index];
+      if (!spec.old_string) return { isError: true, content: `edit ${index + 1}: old_string must not be empty` };
+      if (spec.old_string === spec.new_string) {
+        return { isError: true, content: `edit ${index + 1}: old_string and new_string are identical` };
+      }
+
+      const found = findMatch(text, spec.old_string, Boolean(spec.replace_all));
+      if (!found.ok) {
+        const where = found.failure.candidates.length > 0 ? ` Closest lines: ${found.failure.candidates.join(", ")}.` : "";
+        const verdict = found.failure.reason === "ambiguous" ? "ambiguous" : "not found";
+        return {
+          isError: true,
+          content: `edit ${index + 1} failed in ${input.path}: ${verdict} - ${found.failure.message}.${where} Nothing was written; re-read the file and retry.`,
+        };
+      }
+
+      const { match } = found;
+      const replacement = match.rung === "indent" ? reindent(match.matchedText, spec.old_string, spec.new_string) : spec.new_string;
+      if (spec.replace_all) {
+        const occurrences = text.split(match.matchedText).length - 1;
+        text = text.split(match.matchedText).join(replacement);
+        applied.push({ rung: match.rung, occurrences });
+      } else {
+        text = `${text.slice(0, match.start)}${replacement}${text.slice(match.end)}`;
+        applied.push({ rung: match.rung, occurrences: 1 });
+      }
     }
 
-    const updated = input.replace_all ? text.split(oldString).join(newString) : text.replace(oldString, newString);
-    await write(abs, updated);
-    const replaced = input.replace_all ? indexes.length : 1;
+    if (text === before) return { content: `No change to ${input.path}.`, display: "unchanged" };
+    await write(abs, text);
+
+    const summary = diffFile(relPath(abs, ctx.cwd), before, text);
+    const rungs = [...new Set(applied.map((entry) => entry.rung))];
+    const softened = rungs.filter((rung) => rung !== "exact");
     return {
-      content: `Edited ${relPath(abs, ctx.cwd)}: replaced ${replaced} occurrence${replaced === 1 ? "" : "s"}.`,
-      display: `${replaced} occurrence${replaced === 1 ? "" : "s"} replaced`,
+      content:
+        `Edited ${relPath(abs, ctx.cwd)}: +${summary.additions} -${summary.deletions} in ${applied.length} edit(s).` +
+        (softened.length ? ` Matching was tolerant on: ${softened.join(", ")}.` : ""),
+      display: `+${summary.additions} -${summary.deletions}${softened.length ? ` (${softened.join("/")})` : ""}`,
     };
   },
 };
+
+/** Turn the three accepted input shapes into one ordered list of edits. */
+function collectEdits(input: Record<string, unknown>): EditSpec[] | string {
+  const fromPatch = typeof input.patch === "string" && input.patch.trim() ? parsePatch(input.patch) : [];
+  const fromList = Array.isArray(input.edits) ? input.edits : [];
+  const single =
+    typeof input.old_string === "string"
+      ? [{ old_string: input.old_string, new_string: String(input.new_string ?? ""), replace_all: Boolean(input.replace_all) }]
+      : [];
+
+  const specs: EditSpec[] = [];
+  for (const block of fromPatch) specs.push({ old_string: block.search, new_string: block.replace });
+  for (const entry of fromList) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    specs.push({
+      old_string: String(item.old_string ?? ""),
+      new_string: String(item.new_string ?? ""),
+      replace_all: Boolean(item.replace_all),
+    });
+  }
+  for (const spec of single) specs.push(spec);
+
+  if (specs.length === 0) {
+    return "Provide old_string + new_string, an `edits` array, or a `patch` with SEARCH/REPLACE blocks.";
+  }
+  return specs;
+}
 
 export const listFilesTool: Tool = {
   name: "list_files",

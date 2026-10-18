@@ -3,8 +3,16 @@
 import { spawn } from "node:child_process";
 import type { Tool, ToolResult, TodoItem } from "../types.ts";
 import { resolveSafePath } from "../permissions.ts";
+import { SandboxError, classifyCommand, sandboxEnv, shellFor, type SandboxPolicy } from "../sandbox.ts";
 
 const DEFAULT_TIMEOUT = 120_000;
+
+function sandboxHint(violations: string[]): string {
+  if (violations.length === 0) return "";
+  return `Offending: ${violations.slice(0, 3).join(", ")}. Rewrite the command to stay inside the workspace, or let the user run it.`;
+}
+
+export { SandboxError };
 const MAX_OUTPUT = 30_000;
 
 export const bashTool: Tool = {
@@ -29,12 +37,27 @@ export const bashTool: Tool = {
     const command = String(input.command);
     const timeout = Math.min(600_000, Math.max(1000, Number(input.timeout_ms ?? DEFAULT_TIMEOUT)));
 
+    const policy: SandboxPolicy = {
+      mode: ctx.config.sandbox ?? "enforce",
+      network: ctx.config.networkPolicy ?? "off",
+      allowedDirs: ctx.config.allowedDirs ?? [],
+    };
+    // The pipeline already asked the user; the sandbox is the backstop that
+    // holds even in auto mode.
+    const verdict = classifyCommand(command, ctx.cwd, policy);
+    if (verdict.class === "deny") {
+      return {
+        isError: true,
+        content: `Blocked by the command sandbox: ${verdict.reason}. ${sandboxHint(verdict.violations)}`,
+        display: "blocked",
+      };
+    }
+
     return new Promise<ToolResult>((resolve) => {
-      const shell = process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
-      const args = process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-c", command];
+      const { shell, args } = shellFor(command, policy);
       const child = spawn(shell, args, {
         cwd,
-        env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", CI: "1" },
+        env: sandboxEnv(policy),
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       });

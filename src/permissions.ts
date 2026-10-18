@@ -5,17 +5,8 @@ import { join, relative, isAbsolute, resolve } from "node:path";
 import type { Config, PermissionManager, PermissionMode, Tool } from "./types.ts";
 import type { TerminalUi } from "./ui.ts";
 import { CONFIG_HOME } from "./config.ts";
+import { classifyCommand, type SandboxPolicy } from "./sandbox.ts";
 
-const DANGEROUS_BASH = [
-  /\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+/,
-  /\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|push\s+.*--force|checkout\s+--\s+\.)/,
-  /\bmkfs\b|\bdd\s+if=/,
-  /\b(shutdown|reboot|halt)\b/,
-  /:\(\)\s*\{/,
-  /\b(curl|wget)\b.*\|\s*(sh|bash|zsh)\b/,
-  />\s*\/dev\/(sd|nvme|disk)/,
-  /\bchmod\s+-R\s+777\s+\//,
-];
 
 export class Permissions implements PermissionManager {
   mode: PermissionMode;
@@ -43,14 +34,28 @@ export class Permissions implements PermissionManager {
     if (tool.readonly) return this.allow(tool.name, summary);
 
     if (this.mode === "auto") {
-      if (tool.name === "bash" && DANGEROUS_BASH.some((re) => re.test(String(input.command ?? "")))) {
-        return this.prompt(tool.name, summary);
+      if (tool.name === "bash") {
+        const command = String(input.command ?? "");
+        const verdict = classifyCommand(command, process.cwd(), this.sandboxPolicy());
+        if (verdict.class === "deny") {
+          this.audit(tool.name, summary, `denied by sandbox: ${verdict.reason}`);
+          return { allowed: false, reason: `the command sandbox blocked this: ${verdict.reason}` };
+        }
+        if (verdict.class === "confirm") return this.prompt(tool.name, `${summary} (${verdict.reason})`);
       }
       return this.allow(tool.name, summary);
     }
 
     if (this.always.has(tool.name)) return this.allow(tool.name, summary);
     return this.prompt(tool.name, summary);
+  }
+
+  private sandboxPolicy(): SandboxPolicy {
+    return {
+      mode: this.config.sandbox ?? "enforce",
+      network: this.config.networkPolicy ?? "off",
+      allowedDirs: this.config.allowedDirs ?? [],
+    };
   }
 
   private allow(tool: string, summary: string): { allowed: boolean } {

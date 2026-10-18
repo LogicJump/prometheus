@@ -77,6 +77,7 @@ const state = {
   pane: "diff",
   cwd: "",
   context: { tokens: 0, percent: 0 },
+  sandbox: "enforce",
   usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
   /** Explicit project fold states; anything not listed follows the active-project default. */
   expandedProjects: new Set(JSON.parse(localStorage.getItem("prometheus.expandedProjects") || "[]")),
@@ -207,6 +208,26 @@ function addUserTurn(text, imageCount = 0) {
       `</div>`,
   );
   node.dataset.queued = queued ? "1" : "";
+  return node;
+}
+
+/** Offer "rewind to here" on a user turn once the conversation moved past it. */
+function attachRewind(node, index) {
+  if (!node || !Number.isFinite(index)) return;
+  node.dataset.index = String(index);
+  if (node.querySelector(".rewind-button")) return;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "rewind-button";
+  button.dataset.i18n = "rewindHere";
+  button.textContent = t.rewindHere;
+  button.title = t.rewindTitle;
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (!confirm(t.rewindConfirm)) return;
+    api.send({ cmd: "rewindTo", index });
+  });
+  node.appendChild(button);
 }
 
 function markQueuedDelivered() {
@@ -724,6 +745,13 @@ function setMode(mode) {
   modeControl.querySelectorAll("button").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === mode);
   });
+  // Make "auto without isolation" visible instead of implicit.
+  const autoButton = modeControl.querySelector('[data-mode="auto"]');
+  if (autoButton) {
+    const unsafe = state.sandbox === "off";
+    autoButton.classList.toggle("unsandboxed", unsafe);
+    autoButton.title = unsafe ? t.sandboxOffBadge : "";
+  }
 }
 
 function setEffort(effort) {
@@ -830,7 +858,8 @@ function handleEvent(message) {
       applyLocale(state.locale);
       setMode(message.mode);
       setEffort(message.effort || "auto");
-      if (Array.isArray(message.models) && message.models.length > 0) {
+      if (message.sandbox) state.sandbox = message.sandbox;
+  if (Array.isArray(message.models) && message.models.length > 0) {
         renderModels(message.models, message.model, message.modelsSource);
       } else if (message.model) {
         renderModels(state.models, message.model, state.modelsSource);
@@ -1140,7 +1169,10 @@ function handleEvent(message) {
       state.currentTool = null;
       state.lastToolNode = null;
       for (const item of message.messages || []) {
-        if (item.role === "user") addUserTurn(item.text, item.images ?? 0);
+        if (item.role === "user") {
+          const node = addUserTurn(item.text, item.images ?? 0);
+          attachRewind(node, item.index);
+        }
         else if (item.role === "assistant") {
           const node = addNode(`<div class="turn assistant"><div class="markdown">${md(item.text)}</div></div>`);
           bindCodeCopy(node);
@@ -2794,6 +2826,11 @@ function fillSettings(s) {
   $("setting-effort").value = s.effort;
   $("setting-max-tokens").value = s.maxTokens;
   $("setting-auto-approve").value = (s.autoApprove ?? []).join(", ");
+  $("setting-sandbox").value = s.sandbox === "off" ? "off" : "enforce";
+  $("setting-network").value = ["off", "proxy", "open"].includes(s.networkPolicy) ? s.networkPolicy : "off";
+  state.sandbox = $("setting-sandbox").value;
+  // Refresh the mode chip so the un-isolated marker tracks the saved value.
+  setMode(state.mode);
   $("setting-context").value = s.contextWindow;
   const modelContext = $("setting-context").parentElement.querySelector(".field-hint");
   if (modelContext) modelContext.remove();
@@ -2835,6 +2872,8 @@ function saveSettings() {
       effort: $("setting-effort").value,
       maxTokens: Number($("setting-max-tokens").value),
       autoApprove: $("setting-auto-approve").value,
+      sandbox: $("setting-sandbox").value,
+      networkPolicy: $("setting-network").value,
       contextWindow: Number($("setting-context").value),
       locale: $("setting-locale").value,
       theme: $("setting-theme").value,
@@ -3001,6 +3040,7 @@ transcript.addEventListener("click", (event) => {
 api.onEvent(handleEvent);
 if (api.platform) document.documentElement.classList.add(`platform-${api.platform}`);
 applyLocale(state.locale);
+setMode(state.mode);
 setTheme(state.theme);
 setDensity(state.density);
 setupVoice();
