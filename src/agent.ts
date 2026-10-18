@@ -88,12 +88,20 @@ export class Agent {
     if (!isSubagent) this.hooks = loadHooks(process.cwd());
   }
 
-  /** Replace the system prompt (mode or model changed mid-session). */
-  refreshSystemPrompt(): void {
+  /**
+   * Replace the system prompt (mode, model, or output style changed mid-session).
+   * An optional note is appended once, so a mid-session style change is visible
+   * to the model instead of silently rewriting its instructions.
+   */
+  refreshSystemPrompt(note?: string): void {
     if (this.messages[0]?.role === "system") {
-      this.messages[0] = { role: "system", content: this.systemPrompt() };
+      const content = this.systemPrompt();
+      this.messages[0] = { role: "system", content: note ? `${content}\n\n# Update\n${note}` : content };
     }
   }
+
+  /** Response style chosen in Settings; folded into the system prompt. */
+  outputStyle: "default" | "concise" | "explanatory" = "default";
 
   get busy(): boolean {
     return this.abortController !== null;
@@ -114,6 +122,13 @@ export class Agent {
           ? "You are in AUTO mode: most tools run without asking. Stay conservative with destructive commands."
           : "You are in ASK mode: mutating tools require user confirmation. Explain what you are about to do in one short line first.";
 
+    const styleNote =
+      this.outputStyle === "concise"
+        ? "- Reply in the fewest words that still answer. Prefer a sentence over a paragraph; skip preamble and recaps."
+        : this.outputStyle === "explanatory"
+          ? "- Explain the reasoning behind non-obvious changes in a short paragraph, naming the tradeoff you chose."
+          : "";
+
     return `You are Prometheus, a general-purpose software engineering agent running in a terminal.
 
 # Environment
@@ -133,6 +148,7 @@ export class Agent {
 - If a tool call fails, read the error and adapt; do not repeat the same failing call.
 - Keep responses short. The user sees tool activity directly, so do not narrate what you are about to do at length.
 - Report outcomes faithfully. If a test fails, say so with the output.
+${styleNote}
 
 # Tools
 Prefer dedicated file tools over bash for reading and editing. Use bash for builds, tests, git, and package managers. Never run interactive commands. Paths are relative to the workspace root unless absolute.

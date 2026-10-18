@@ -1,6 +1,6 @@
 /** Electron main process: one window, one agent host child process per window. */
 
-import { app, BrowserWindow, dialog, ipcMain, Notification, shell } from "electron";
+import { app, BrowserWindow, dialog, globalShortcut, ipcMain, Notification, shell } from "electron";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { browserNavigate, browserSnapshot, closeBrowser, openBrowser, setBrowserBounds } from "./browser.js";
+import { SystemIntegration } from "./system.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const HOST = join(here, "host.js");
@@ -263,6 +264,21 @@ app.whenReady().then(() => {
     }
   };
   debugLog(`ready cwd=${process.cwd()} cliArgs=${JSON.stringify(cliArgs)}`);
+
+  // Tray, launch-at-login, keep-awake, and the quick-entry shortcut are the
+  // user's choices; the window is not.
+  const system = new SystemIntegration({
+    iconPath: join(here, "..", "build", "icon.png"),
+    onShow: () => {
+      const win = BrowserWindow.getAllWindows()[0];
+      if (!win) return;
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    },
+  });
+  system.start();
+
   startWindow();
   debugLog("window created");
 
@@ -348,6 +364,9 @@ app.whenReady().then(() => {
 
   ipcMain.handle("app-version", async () => appVersion());
 
+  ipcMain.handle("system-state", async () => system.state());
+  ipcMain.handle("system-set", async (_event, key, value) => system.set(key, value));
+
   /**
    * Update check against a JSON feed at PROMETHEUS_UPDATE_URL, shaped like a
    * GitHub latest-release response: { tag_name, html_url, body }. Updates are
@@ -401,4 +420,14 @@ app.whenReady().then(() => {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+
+app.on("will-quit", () => {
+  // Unregister the global shortcut before exit; Electron does not do this on
+  // every platform, and a stale shortcut survives into the next launch.
+  try {
+    globalShortcut.unregisterAll();
+  } catch {
+    /* nothing registered */
+  }
 });

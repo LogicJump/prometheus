@@ -9,6 +9,7 @@
     />
     <title>Prometheus</title>
     <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="settings.css" />
   </head>
   <body>
     <div class="shell">
@@ -114,6 +115,7 @@
             <div class="menu-setting" role="group" aria-label="Theme">
               <span class="menu-setting-label" data-i18n="settingsTheme">Theme</span>
               <div class="menu-segmented" id="menu-theme">
+                <button data-theme-choice="system" data-i18n="themeSystem">System</button>
                 <button data-theme-choice="light" data-i18n="themeLight">Light</button>
                 <button data-theme-choice="dark" data-i18n="themeDark">Dark</button>
               </div>
@@ -386,135 +388,39 @@
 
     <div class="modal-scrim" id="modal-scrim" hidden></div>
 
+    <!-- Settings is a full-window page, not a modal: a rail of groups on the
+         left, one scrolling pane on the right, and every change applies
+         immediately. The old Save/Cancel footer made the page feel like a
+         form and hid whether a value had actually taken effect. -->
     <dialog class="settings-dialog" id="settings-dialog" hidden>
-      <form method="dialog" class="settings-form" id="settings-form">
-        <header class="dialog-head">
-          <h2 data-i18n="settings">Settings</h2>
-          <button type="button" class="icon-button" id="settings-close" title="Close">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
-          </button>
-        </header>
-        <div class="dialog-body settings-layout">
-          <nav class="settings-nav" id="settings-nav" role="tablist" aria-orientation="vertical">
-            <button type="button" class="settings-nav-item active" data-settings-tab="connection" role="tab" data-i18n="settingsConnection">Connection</button>
-            <button type="button" class="settings-nav-item" data-settings-tab="defaults" role="tab" data-i18n="settingsDefaults">Defaults</button>
-            <button type="button" class="settings-nav-item" data-settings-tab="appearance" role="tab" data-i18n="settingsAppearance">Appearance</button>
-            <button type="button" class="settings-nav-item" data-settings-tab="about" role="tab" data-i18n="settingsAbout">About</button>
-          </nav>
-          <div class="settings-panes">
-          <section class="settings-section" data-settings-pane="connection">
-            <label class="field">
-              <span data-i18n="settingsProvider">Provider</span>
-              <select id="setting-provider"></select>
-            </label>
-            <label class="field">
-              <span data-i18n="settingsBaseUrl">Base URL</span>
-              <input id="setting-base-url" type="text" spellcheck="false" />
-            </label>
-            <label class="field">
-              <span data-i18n="settingsApiKey">API key</span>
-              <input id="setting-api-key" type="password" spellcheck="false" autocomplete="off" />
-            </label>
-            <label class="field">
-              <span data-i18n="settingsDefaultModel">Default model</span>
-              <select id="setting-model"></select>
-            </label>
-            <div class="settings-hint" id="models-hint"></div>
-          </section>
-          <section class="settings-section" data-settings-pane="defaults" hidden>
-            <label class="field">
-              <span data-i18n="settingsMode">Permission mode</span>
-              <select id="setting-mode">
-                <option value="ask" data-i18n="modeAsk">Ask</option>
-                <option value="auto" data-i18n="modeAuto">Auto</option>
-                <option value="plan" data-i18n="modePlan">Plan</option>
-              </select>
-            </label>
-            <label class="field">
-              <span data-i18n="settingsEffort">Thinking effort</span>
-              <select id="setting-effort">
-                <option value="auto" data-i18n="effortAuto">Auto</option>
-                <option value="low" data-i18n="effortLow">Low</option>
-                <option value="medium" data-i18n="effortMedium">Med</option>
-                <option value="high" data-i18n="effortHigh">High</option>
-              </select>
-            </label>
-            <label class="field">
-              <span data-i18n="settingsMaxTokens">Max response tokens</span>
-              <input id="setting-max-tokens" type="number" min="256" max="128000" step="256" />
-            </label>
-            <label class="field">
-              <span data-i18n="settingsAutoApprove">Auto-approve tools</span>
-              <input id="setting-auto-approve" type="text" spellcheck="false" placeholder="read_file, glob, grep" />
-            </label>
-            <label class="field">
-              <span data-i18n="settingsContext">Context window</span>
-              <input id="setting-context" type="number" min="8000" max="4000000" step="1000" />
-            </label>
-            <label class="field">
-              <span data-i18n="settingsSandbox">Command isolation</span>
-              <select id="setting-sandbox">
-                <option value="enforce" data-i18n="sandboxEnforce">On</option>
-                <option value="off" data-i18n="sandboxOff">Off</option>
-              </select>
-            </label>
-            <label class="field">
-              <span data-i18n="settingsNetwork">Command network</span>
-              <select id="setting-network">
-                <option value="off" data-i18n="networkOff">Off</option>
-                <option value="proxy" data-i18n="networkProxy">Proxy only</option>
-                <option value="open" data-i18n="networkOpen">Allowed</option>
-              </select>
-            </label>
-            <label class="field">
-              <span data-i18n="settingsFallback">Fallback models</span>
-              <input id="setting-fallback" type="text" spellcheck="false" placeholder="deepseek-v4.1-flash, glm-5.3" />
-            </label>
-            <div class="field rules-field">
-              <span data-i18n="rulesTitle">Saved approvals</span>
-              <div class="rules-list" id="setting-rules"></div>
-            </div>
-            <div class="settings-hint" data-i18n="sandboxHint">Classifies commands, keeps paths inside the workspace, and does not inherit secrets. It is a policy check, not an OS-level sandbox.</div>
-          </section>
-          <section class="settings-section" data-settings-pane="appearance" hidden>
-            <label class="field">
-              <span data-i18n="language">Language</span>
-              <select id="setting-locale">
-                <option value="en">English</option>
-                <option value="zh">中文</option>
-              </select>
-            </label>
-            <label class="field">
-              <span data-i18n="settingsTheme">Theme</span>
-              <select id="setting-theme">
-                <option value="dark" data-i18n="themeDark">Dark</option>
-                <option value="light" data-i18n="themeLight">Light</option>
-              </select>
-            </label>
-            <label class="field">
-              <span data-i18n="densityLabel">Density</span>
-              <select id="setting-density">
-                <option value="compact" data-i18n="densityCompact">Compact</option>
-                <option value="balanced" data-i18n="densityBalanced">Balanced</option>
-                <option value="detailed" data-i18n="densityDetailed">Detailed</option>
-              </select>
-            </label>
-          </section>
-          <section class="settings-section" data-settings-pane="about" hidden>
-            <div class="about-row">
-              <span class="about-version">Prometheus <span id="about-version">0.1.0</span></span>
-              <button type="button" class="btn small" id="check-update" data-i18n="checkUpdate">Check for updates</button>
-            </div>
-            <div class="settings-hint" id="update-note"></div>
-          </section>
+      <div class="settings-form" id="settings-form">
+        <aside class="settings-rail">
+          <div class="settings-rail-head">
+            <button type="button" class="icon-button small" id="settings-back" title="Back">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6" /></svg>
+            </button>
+            <h2 data-i18n="settings">Settings</h2>
+          </div>
+          <div class="settings-search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>
+            <input id="settings-search" type="search" spellcheck="false" autocomplete="off" placeholder="Search settings" />
+          </div>
+          <nav class="settings-nav" id="settings-nav" role="tablist" aria-orientation="vertical"></nav>
+          <div class="settings-rail-foot">
+            <button type="button" class="settings-profile" id="settings-profile">
+              <span class="settings-avatar" aria-hidden="true">P</span>
+              <span class="settings-profile-copy">
+                <span class="settings-profile-name" id="settings-profile-name">Local workspace</span>
+                <span class="settings-profile-sub" id="settings-profile-sub">Not signed in</span>
+              </span>
+            </button>
+          </div>
+        </aside>
+        <div class="settings-main">
+          <div class="settings-panes" id="settings-panes">
           </div>
         </div>
-        <footer class="dialog-foot">
-          <span class="settings-note" id="settings-note"></span>
-          <button type="button" class="btn" id="settings-cancel" data-i18n="cancel">Cancel</button>
-          <button type="button" class="btn btn-primary" id="settings-save" data-i18n="save">Save</button>
-        </footer>
-      </form>
+      </div>
     </dialog>
 
     <div class="palette-scrim" id="palette-scrim" hidden></div>

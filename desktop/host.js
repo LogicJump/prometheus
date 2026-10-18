@@ -31,6 +31,18 @@ import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
 import { loadRules, removeRule } from "../src/rules.ts";
 import { publicProviders, providerFor } from "../src/providers.ts";
+import { recordUsage, usageSummary } from "../src/usage.ts";
+import {
+  listMcpServers,
+  listSkills,
+  readInstructions,
+  removeMcpServer,
+  removeSkill,
+  saveMcpServer,
+  saveSkill,
+  writeInstructions,
+} from "../src/settingsFiles.ts";
+import { readMemorySections, deleteMemory } from "../src/memory.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
@@ -70,6 +82,8 @@ let worktree = null;
 /** The workspace the session started from, before switching into a worktree. */
 let baseCwd = null;
 const persistedUi = readUiSettings();
+/** Settings written by the renderer; re-read on save so this process stays current. */
+let uiPrefs = { ...persistedUi };
 let locale = isLocale(persistedUi.locale) ? persistedUi.locale : detectLocale();
 /** Discovered model catalog; replaced whenever /models is (re)read. */
 let catalog = { models: FALLBACK_MODELS, fetchedAt: new Date().toISOString(), source: "fallback" };
@@ -256,12 +270,15 @@ class HostUi {
   subagentEnd(ok, summary) {
     send({ type: "subagent_end", ok, summary: String(summary ?? "") });
   }
-  thinking() {
+  thinking(delta = "") {
     if (this.assistantActive) this.assistantEnd();
     if (!this.thinkingActive) {
       this.thinkingActive = true;
       send({ type: "thinking_start" });
     }
+    // The text is forwarded so the transcript can show it in the Thinking and
+    // Verbose views; the Normal view keeps only the one-line marker.
+    if (delta) send({ type: "thinking_text", text: String(delta) });
   }
   thinkingEnd() {
     if (this.thinkingActive) {
@@ -390,6 +407,7 @@ function createAgent(messages = []) {
   permissions = new Permissions(config, ui);
   agent = new Agent(config, ui, client, ALL_TOOLS, permissions, messages);
   agent.sessionId = sessionId;
+  agent.outputStyle = uiPrefs.outputStyle ?? "default";
   agent.onBeforeMutate = (name, input) => recordChange(name, input);
   // Compaction rewrote the history; persist the new generation immediately so
   // an interrupted turn cannot leave a stale transcript on disk.
@@ -483,6 +501,22 @@ async function emitPrStatus(generation = gitStatusGeneration) {
   send({ type: "pr_status", ...result });
 }
 
+/** Archive sessions untouched for `days` days; the current one is never touched. */
+function archiveInactive(days) {
+  const cutoff = Date.now() - Math.max(1, days) * 86_400_000;
+  let archived = 0;
+  for (const session of listSessions(false)) {
+    if (session.id === sessionId || session.archived) continue;
+    if (new Date(session.updatedAt).getTime() >= cutoff) continue;
+    updateSessionFlags(session.id, { archived: true });
+    archived++;
+  }
+  if (archived > 0) {
+    send({ type: "sessions", sessions: listSessions(false, false).slice(0, 80) });
+    send({ type: "notice", level: "dim", text: `archived ${archived} inactive session(s)` });
+  }
+}
+
 async function runPrompt(text, images) {
   if (running) {
     // A message typed mid-turn is queued and delivered at the next tool
@@ -493,6 +527,7 @@ async function runPrompt(text, images) {
   }
   running = true;
   turnBaseline = new Map();
+  const usageBefore = { ...agent.usage };
   markRunActive({ sessionId, cwd, startedAt: new Date().toISOString() });
   send({ type: "queued", count: 0 });
   send({ type: "run_start" });
@@ -511,6 +546,16 @@ async function runPrompt(text, images) {
     ui.assistantEnd();
     ui.thinkingEnd();
     persist();
+    // Persist this turn's spend before the next one starts, so the Usage page
+    // has real history instead of a number that dies with the process.
+    recordUsage({
+      sessionId,
+      cwd,
+      model: config.model,
+      inputTokens: agent.usage.inputTokens - usageBefore.inputTokens,
+      outputTokens: agent.usage.outputTokens - usageBefore.outputTokens,
+      cachedTokens: agent.usage.cachedTokens - usageBefore.cachedTokens,
+    });
     send({
       type: "run_end",
       context: agent.contextUsage(),
@@ -599,9 +644,116 @@ async function handle(cmd) {
           contextWindow: config?.contextWindow ?? 1_000_000,
           modelContext: config ? catalog.models.find((model) => model.id === config.model)?.contextLength ?? null : null,
           locale,
-          theme: persistedUi.theme ?? "dark",
+          theme: uiPrefs.theme ?? "dark",
+          density: uiPrefs.density ?? "balanced",
+          fontScale: uiPrefs.fontScale ?? 1,
+          transcriptWidth: uiPrefs.transcriptWidth ?? "standard",
+          transcriptView: uiPrefs.transcriptView ?? "normal",
+          reduceMotion: Boolean(uiPrefs.reduceMotion),
+          codeFont: uiPrefs.codeFont ?? "",
+          notifications: uiPrefs.notifications !== false,
+          keepAwake: Boolean(uiPrefs.keepAwake),
+          branchPrefix: uiPrefs.branchPrefix ?? "prometheus/",
+          outputStyle: uiPrefs.outputStyle ?? "default",
+          archiveAfterDays: uiPrefs.archiveAfterDays ?? 0,
         },
       });
+      return;
+    case "setUiPreference": {
+      // Appearance and behaviour toggles apply immediately and survive restarts;
+      // the Settings dialog sends them one at a time, with no Save step.
+      const key = String(cmd.key ?? "");
+      const value = cmd.value;
+      const allowed = new Set([
+        "theme",
+        "density",
+        "fontScale",
+        "transcriptWidth",
+        "transcriptView",
+        "reduceMotion",
+        "codeFont",
+        "notifications",
+        "keepAwake",
+        "branchPrefix",
+        "outputStyle",
+        "archiveAfterDays",
+      ]);
+      if (!allowed.has(key)) return;
+      writeUiSettings({ [key]: value });
+      uiPrefs = { ...uiPrefs, [key]: value };
+      if (key === "outputStyle" && agent) {
+        agent.outputStyle = ["concise", "explanatory"].includes(value) ? value : "default";
+        agent.refreshSystemPrompt(`The response style is now "${agent.outputStyle}".`);
+      }
+      if (key === "archiveAfterDays" && Number(value) > 0) archiveInactive(Number(value));
+      send({ type: "ui_preference", key, value });
+      return;
+    }
+    case "getUsage":
+      send({ type: "usage_summary", days: Number(cmd.days) || 30, summary: usageSummary(Number(cmd.days) || 30) });
+      return;
+    case "getMcp":
+      send({ type: "mcp_servers", servers: listMcpServers(cwd) });
+      return;
+    case "saveMcpServer":
+      try {
+        saveMcpServer(cwd, {
+          name: String(cmd.server?.name ?? "").trim(),
+          scope: cmd.server?.scope === "project" ? "project" : "user",
+          command: typeof cmd.server?.command === "string" ? cmd.server.command.trim() : undefined,
+          args: Array.isArray(cmd.server?.args) ? cmd.server.args.map(String) : String(cmd.server?.args ?? "").split(/\s+/).filter(Boolean),
+          url: typeof cmd.server?.url === "string" ? cmd.server.url.trim() : undefined,
+          disabled: Boolean(cmd.server?.disabled),
+        });
+        send({ type: "mcp_servers", servers: listMcpServers(cwd) });
+        if (!running) void startMcp();
+      } catch (err) {
+        send({ type: "notice", level: "error", text: `MCP: ${err.message}` });
+      }
+      return;
+    case "removeMcpServer":
+      removeMcpServer(cwd, cmd.scope === "project" ? "project" : "user", String(cmd.name ?? ""));
+      send({ type: "mcp_servers", servers: listMcpServers(cwd) });
+      if (!running) void startMcp();
+      return;
+    case "getSkills":
+      send({ type: "skills", skills: listSkills(cwd) });
+      return;
+    case "saveSkill":
+      try {
+        saveSkill(cwd, {
+          name: String(cmd.skill?.name ?? ""),
+          description: String(cmd.skill?.description ?? ""),
+          argumentHint: String(cmd.skill?.argumentHint ?? ""),
+          scope: cmd.skill?.scope === "project" ? "project" : "user",
+          body: String(cmd.skill?.body ?? ""),
+        });
+        send({ type: "skills", skills: listSkills(cwd) });
+        send({ type: "commands", commands: listCommands(cwd).map(({ name, description, argumentHint }) => ({ name, description, argumentHint })) });
+      } catch (err) {
+        send({ type: "notice", level: "error", text: `skill: ${err.message}` });
+      }
+      return;
+    case "removeSkill":
+      removeSkill(cwd, cmd.scope === "project" ? "project" : "user", String(cmd.name ?? ""));
+      send({ type: "skills", skills: listSkills(cwd) });
+      send({ type: "commands", commands: listCommands(cwd).map(({ name, description, argumentHint }) => ({ name, description, argumentHint })) });
+      return;
+    case "getInstructions":
+      send({ type: "instructions", text: readInstructions() });
+      return;
+    case "saveInstructions":
+      writeInstructions(String(cmd.text ?? ""));
+      agent?.refreshSystemPrompt();
+      send({ type: "instructions", text: readInstructions() });
+      return;
+    case "getMemory":
+      send({ type: "memory", global: readMemorySections("global"), project: readMemorySections("project") });
+      return;
+    case "deleteMemory":
+      deleteMemory(cmd.scope === "project" ? "project" : "global", String(cmd.name ?? ""));
+      agent?.refreshSystemPrompt();
+      send({ type: "memory", global: readMemorySections("global"), project: readMemorySections("project") });
       return;
     case "saveSettings": {
       const patch = cmd.settings ?? {};
@@ -639,14 +791,38 @@ async function handle(cmd) {
       }
       try {
         writeConfigFile(filePatch);
-        if (isLocale(patch.locale) || patch.theme === "dark" || patch.theme === "light") {
-          writeUiSettings({
-            ...(isLocale(patch.locale) ? { locale: patch.locale } : {}),
-            ...(patch.theme === "dark" || patch.theme === "light" ? { theme: patch.theme } : {}),
-          });
+        const uiPatch = {};
+        if (isLocale(patch.locale)) uiPatch.locale = patch.locale;
+        if (["dark", "light", "system"].includes(patch.theme)) uiPatch.theme = patch.theme;
+        if (["compact", "balanced", "detailed"].includes(patch.density)) uiPatch.density = patch.density;
+        if (Number.isFinite(Number(patch.fontScale))) uiPatch.fontScale = Math.max(0.85, Math.min(1.3, Number(patch.fontScale)));
+        if (["narrow", "standard", "wide"].includes(patch.transcriptWidth)) uiPatch.transcriptWidth = patch.transcriptWidth;
+        if (["normal", "thinking", "verbose"].includes(patch.transcriptView)) uiPatch.transcriptView = patch.transcriptView;
+        if (typeof patch.reduceMotion === "boolean") uiPatch.reduceMotion = patch.reduceMotion;
+        if (typeof patch.codeFont === "string") uiPatch.codeFont = patch.codeFont.slice(0, 80);
+        if (typeof patch.notifications === "boolean") uiPatch.notifications = patch.notifications;
+        if (typeof patch.keepAwake === "boolean") uiPatch.keepAwake = patch.keepAwake;
+        if (typeof patch.branchPrefix === "string") uiPatch.branchPrefix = patch.branchPrefix.trim().slice(0, 40) || "prometheus/";
+        if (["default", "concise", "explanatory"].includes(patch.outputStyle)) uiPatch.outputStyle = patch.outputStyle;
+        if (Number.isFinite(Number(patch.archiveAfterDays))) {
+          uiPatch.archiveAfterDays = Math.max(0, Math.min(365, Math.round(Number(patch.archiveAfterDays))));
+        }
+        if (Object.keys(uiPatch).length > 0) {
+          writeUiSettings(uiPatch);
+          uiPrefs = { ...uiPrefs, ...uiPatch };
         }
         if (isLocale(patch.locale)) locale = patch.locale;
-        config = loadConfig({ permissionMode: config.permissionMode });
+        // The output style is part of the system prompt, so the agent has to
+        // be told about it before the next turn rather than at the next restart.
+        if (patch.outputStyle !== undefined) {
+          agent.outputStyle = uiPrefs.outputStyle ?? "default";
+          agent.refreshSystemPrompt(`The response style is now "${agent.outputStyle}".`);
+        }
+        // The live mode may have been changed from the composer without being
+        // written to disk; keep it unless this save explicitly sets a new one.
+        const liveMode = config.permissionMode;
+        config = loadConfig();
+        if (!["ask", "auto", "plan"].includes(patch.mode)) config.permissionMode = liveMode;
         client = makeClient();
         permissions.mode = config.permissionMode;
         agent.config.model = config.model;
@@ -660,7 +836,9 @@ async function handle(cmd) {
         agent.config.permissionMode = config.permissionMode;
         agent.refreshSystemPrompt();
         emitState();
-        void refreshCatalog(true);
+        // Only a connection change invalidates the catalog; a slider or a
+        // permission toggle must not spend a network round-trip.
+        if (!cmd.skipCatalog) void refreshCatalog(true);
         send({ type: "settings_saved", ok: true });
       } catch (err) {
         send({ type: "settings_saved", ok: false, error: err.message });
@@ -717,6 +895,13 @@ async function handle(cmd) {
       }
       config.model = cmd.model;
       client.options.model = cmd.model;
+      // The model picked in the composer is the default from now on; keeping it
+      // in memory only made a restart silently switch back.
+      try {
+        writeConfigFile({ model: cmd.model });
+      } catch {
+        /* a read-only config is not a reason to refuse the switch */
+      }
       applyModelContext(cmd.model);
       agent.refreshSystemPrompt();
       ui.setModelName(cmd.model);
@@ -809,7 +994,11 @@ async function handle(cmd) {
         disposeTerminal();
         sessionId = newSessionId();
         try {
-          config = loadConfig({ permissionMode: config.permissionMode });
+          // The live mode may have been changed from the composer without being
+        // written to disk; keep it unless this save explicitly sets a new one.
+        const liveMode = config.permissionMode;
+        config = loadConfig();
+        if (!["ask", "auto", "plan"].includes(patch.mode)) config.permissionMode = liveMode;
           client = makeClient();
         } catch (err) {
           send({ type: "fatal", message: err.message });
@@ -932,7 +1121,7 @@ async function handle(cmd) {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
       if (worktree) return send({ type: "notice", level: "dim", text: "this session is already isolated" });
       baseCwd = cwd;
-      const created = await createWorktree(cwd, sessionId);
+      const created = await createWorktree(cwd, sessionId, "HEAD", uiPrefs.branchPrefix || "prometheus/");
       if (!created.ok) {
         baseCwd = null;
         return send({ type: "notice", level: "error", text: `worktree: ${created.error}` });

@@ -2,17 +2,41 @@
  * Settings persistence for the desktop app.
  *
  * The host owns ~/.prometheus/config.json; it also keeps a small UI state file
- * (locale, theme, last workspace) so both survive restarts without the
- * renderer touching the filesystem.
+ * (locale, theme, transcript preferences, notifications) so both survive
+ * restarts without the renderer touching the filesystem.
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
 
+export type ThemePreference = "dark" | "light" | "system";
+
 export interface UiSettings {
   locale?: "en" | "zh";
-  theme?: "dark" | "light";
+  theme?: ThemePreference;
+  /** How much detail tool calls show in the transcript. */
+  density?: "compact" | "balanced" | "detailed";
+  /** Transcript body size multiplier: 0.9 small, 1 default, 1.12 large. */
+  fontScale?: number;
+  /** Reading column width for the conversation. */
+  transcriptWidth?: "narrow" | "standard" | "wide";
+  /** What the transcript shows by default: collapsed tools, thinking, or everything. */
+  transcriptView?: "normal" | "thinking" | "verbose";
+  /** Disable entrance animations and transitions. */
+  reduceMotion?: boolean;
+  /** "system" follows the platform monospace stack. */
+  codeFont?: string;
+  /** Desktop notification when a turn finishes while the window is not focused. */
+  notifications?: boolean;
+  /** Keep the machine from idle-sleeping while a turn runs. */
+  keepAwake?: boolean;
+  /** Prefix for branches created by an isolated worktree. */
+  branchPrefix?: string;
+  /** Default response style injected into the system prompt. */
+  outputStyle?: "default" | "concise" | "explanatory";
+  /** Archive sessions untouched for this many days; 0 disables. */
+  archiveAfterDays?: number;
 }
 
 const UI_FILE = join(CONFIG_HOME, "ui.json");

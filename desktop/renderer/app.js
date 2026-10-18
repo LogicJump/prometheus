@@ -2,6 +2,7 @@
 
 import { detectLocale, getDict } from "./i18n.js";
 import { escapeHtml, renderMarkdown } from "./markdown.js";
+import { createSettings } from "./settings.js";
 
 /** Saved preferences are restored here; the host gets them on init. */
 const savedLocale = localStorage.getItem("prometheus.locale");
@@ -351,7 +352,10 @@ function attachToolOutput(node, name, output) {
   }
   const outputNode = document.createElement("pre");
   outputNode.className = "tool-output";
-  outputNode.hidden = true;
+  // Verbose opens every result as it arrives; the other views keep it behind
+  // the details toggle.
+  const expanded = state.transcriptView === "verbose";
+  outputNode.hidden = !expanded;
   outputNode.textContent = output;
   // A detail block belongs to its call, so it is wrapped with it rather than
   // being a sibling inside the activity group.
@@ -360,7 +364,9 @@ function attachToolOutput(node, name, output) {
   row.before(block);
   block.append(row, outputNode);
   const button = row.querySelector(".tool-expand");
-  button.hidden = false;
+  button.hidden = expanded;
+  button.textContent = expanded ? t.hide : t.details;
+  row.classList.toggle("open", expanded);
   button.addEventListener("click", () => {
     outputNode.hidden = !outputNode.hidden;
     button.textContent = outputNode.hidden ? t.details : t.hide;
@@ -371,14 +377,30 @@ function attachToolOutput(node, name, output) {
 
 function startThinking() {
   if (state.currentThinking) return;
-  state.currentThinking = addNode(`<div class="thinking">${escapeHtml(t.thinking)}</div>`);
+  state.currentThinking = addNode(
+    `<div class="thinking streaming"><span class="thinking-label">${escapeHtml(t.thinking)}</span><span class="thinking-text"></span></div>`,
+  );
+  state.currentThinkingText = state.currentThinking.querySelector(".thinking-text");
 }
 
+function appendThinking(text) {
+  if (!state.currentThinkingText || !text) return;
+  state.currentThinkingText.textContent += text;
+}
+
+/**
+ * Keep the block after the turn: the Normal view hides finished reasoning in
+ * CSS, while the Thinking and Verbose views show what the model actually said.
+ */
 function endThinking() {
-  if (state.currentThinking) {
-    state.currentThinking.remove();
-    state.currentThinking = null;
-  }
+  if (!state.currentThinking) return;
+  const node = state.currentThinking;
+  const text = state.currentThinkingText?.textContent?.trim() ?? "";
+  node.classList.remove("streaming");
+  const label = node.querySelector(".thinking-label");
+  if (label) label.textContent = text ? t.thoughtBriefly : t.thinking;
+  state.currentThinking = null;
+  state.currentThinkingText = null;
 }
 
 function addNotice(level, text) {
@@ -686,6 +708,7 @@ input.addEventListener("blur", () => setTimeout(closeMention, 120));
 /** Only notify when the window is not in front; otherwise the UI already told them. */
 function notifyIfAway(title, body) {
   if (!api.notify || !body) return;
+  if (state.notifications === false) return;
   if (document.visibilityState === "visible" && document.hasFocus()) return;
   void api.notify(title, body.slice(0, 180));
 }
@@ -1065,30 +1088,29 @@ function handleEvent(message) {
       break;
 
     case "settings":
-      fillSettings(message.settings);
+      settings.handleEvent(message);
       break;
 
-    case "rules": {
-      const current = $("setting-rules");
-      if (current) {
-        renderRules(message.rules ?? []);
-        api.send({ cmd: "getSettings" });
-      }
+    case "rules":
+      settings.handleEvent(message);
       break;
-    }
+
 
     case "settings_saved":
-      if (message.ok) {
-        $("settings-note").textContent = t.settingsSaved;
-        setTimeout(() => closeModal(settingsDialog), 700);
-      } else {
-        $("settings-note").textContent = `${t.settingsError} ${message.error ?? ""}`;
-        $("settings-note").style.color = "var(--danger)";
-      }
+      // Applied immediately, so a failure is surfaced inline and the page stays open.
+      if (!message.ok) addNotice("error", `${t.settingsError} ${message.error ?? ""}`);
       break;
 
     case "locale":
       applyLocale(message.locale);
+      break;
+
+    case "usage_summary":
+    case "mcp_servers":
+    case "skills":
+    case "memory":
+    case "instructions":
+      settings.handleEvent(message);
       break;
 
     case "usage":
@@ -1130,6 +1152,10 @@ function handleEvent(message) {
       if (state.currentAssistant) flushAssistant();
       startThinking();
       scrollToBottom();
+      break;
+
+    case "thinking_text":
+      appendThinking(message.text);
       break;
 
     case "thinking_end":
@@ -1254,12 +1280,13 @@ function handleEvent(message) {
     case "session_loaded": {
       const target = scrollTarget();
       target
-        .querySelectorAll(".turn, .tool-row, .tool-group, .tool-output, .notice, .plan, .thinking, .subagent, .compact-marker")
+        .querySelectorAll(".turn, .tool-row, .tool-group, .tool-item, .tool-output, .notice, .plan, .thinking, .subagent, .compact-marker")
         .forEach((node) => node.remove());
       state.currentAssistant = null;
       state.currentThinking = null;
       state.currentTool = null;
       state.lastToolNode = null;
+      state.currentThinkingText = null;
       for (const item of message.messages || []) {
         if (item.role === "user") {
           const node = addUserTurn(item.text, item.images ?? 0);
@@ -2265,10 +2292,29 @@ function setDensity(density) {
   localStorage.setItem("prometheus.density", density);
 }
 
+const systemTheme = matchMedia("(prefers-color-scheme: light)");
+systemTheme.addEventListener("change", () => {
+  if (state.theme === "system") document.documentElement.dataset.theme = systemTheme.matches ? "light" : "dark";
+});
+
+function resolvedTheme(theme) {
+  if (theme !== "system") return theme;
+  return systemTheme.matches ? "light" : "dark";
+}
+
+/** The code font preference swaps the monospace stack for the whole window. */
+function applyCodeFont(font) {
+  const stack = String(font ?? "").trim()
+    ? `"${String(font).trim()}", "SF Mono", "Cascadia Code", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace`
+    : '"SF Mono", "Cascadia Code", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace';
+  document.documentElement.style.setProperty("--mono", stack);
+  localStorage.setItem("prometheus.codeFont", String(font ?? ""));
+}
+
 function setTheme(theme) {
   state.theme = theme;
   syncMenuControls();
-  document.documentElement.dataset.theme = theme;
+  document.documentElement.dataset.theme = resolvedTheme(theme);
   localStorage.setItem("prometheus.theme", theme);
 }
 
@@ -2408,6 +2454,7 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     const order = ["auto", "low", "medium", "high"];
     const next = order[(order.indexOf(state.effort) + 1) % order.length];
+    setEffort(next);
     api.send({ cmd: "setEffort", effort: next });
   } else if (key === "\\") {
     event.preventDefault();
@@ -2680,14 +2727,20 @@ pendingPermission.querySelectorAll("[data-permission]").forEach((button) => {
 
 modeControl.querySelectorAll("button").forEach((button) => {
   button.addEventListener("click", () => {
-    if (button.dataset.mode !== state.mode) api.send({ cmd: "setMode", mode: button.dataset.mode });
+    if (button.dataset.mode === state.mode) return;
+    // Show the choice at once; the host confirms with a state event, and a
+    // rejected mode would be corrected by that same event.
+    setMode(button.dataset.mode);
+    api.send({ cmd: "setMode", mode: button.dataset.mode });
   });
 });
 
 effortControl.querySelectorAll("[data-effort]").forEach((button) => {
   button.addEventListener("click", () => {
     setEffortMenu(false);
-    if (button.dataset.effort !== state.effort) api.send({ cmd: "setEffort", effort: button.dataset.effort });
+    if (button.dataset.effort === state.effort) return;
+    setEffort(button.dataset.effort);
+    api.send({ cmd: "setEffort", effort: button.dataset.effort });
   });
 });
 
@@ -2857,8 +2910,10 @@ if (api.platform && api.platform !== "darwin") {
   void api.windowState?.().then(applyWindowState);
 }
 
-/* ---------- settings dialog ---------- */
+/* ---------- settings ---------- */
 
+// The Settings page lives in its own module; this file owns the modal shell,
+// the shared state, and the dialog helpers it needs.
 const settingsDialog = $("settings-dialog");
 const shortcutsDialog = $("shortcuts-dialog");
 const modalScrim = $("modal-scrim");
@@ -2875,208 +2930,26 @@ function closeModal(dialog) {
   if (settingsDialog.hidden && shortcutsDialog.hidden) modalScrim.hidden = true;
 }
 
-function openSettings(tab = "connection") {
-  api.send({ cmd: "getSettings" });
-  selectSettingsTab(tab);
-  openModal(settingsDialog);
-  // Land focus on the category rail, not the close button.
-  document.querySelector("[data-settings-tab].active")?.focus();
-}
-
-function selectSettingsTab(tab) {
-  document.querySelectorAll("[data-settings-tab]").forEach((button) => {
-    const active = button.dataset.settingsTab === tab;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-selected", active ? "true" : "false");
-  });
-  document.querySelectorAll("[data-settings-pane]").forEach((pane) => {
-    pane.hidden = pane.dataset.settingsPane !== tab;
-  });
-  state.settingsTab = tab;
-}
-
-$("settings-nav").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-settings-tab]");
-  if (button) selectSettingsTab(button.dataset.settingsTab);
+const settings = createSettings({
+  state,
+  $,
+  api,
+  formatTokens,
+  setTheme,
+  setDensity,
+  setMode,
+  applyLocale,
+  openModal,
+  closeModal,
+  applyCodeFont,
+  getT: () => t,
 });
 
-/** First-run path: open Settings on the connection fields with a short prompt. */
-function openSetup() {
-  $("models-hint").textContent = t.setupHint;
-  $("models-hint").hidden = false;
-  openSettings("connection");
-  setTimeout(() => $("setting-base-url").focus(), 60);
-}
-
-$("setup-button").addEventListener("click", openSetup);
-
-/** Saved approval rules with a remove action, newest last. */
-function renderRules(rules) {
-  const list = $("setting-rules");
-  list.innerHTML = "";
-  if (rules.length === 0) {
-    const empty = document.createElement("span");
-    empty.className = "rules-empty";
-    empty.textContent = t.rulesEmpty;
-    list.appendChild(empty);
-    return;
-  }
-  for (const rule of rules) {
-    const row = document.createElement("div");
-    row.className = "rules-row";
-    const label = document.createElement("span");
-    label.className = "rules-label";
-    label.textContent = `${rule.action === "deny" ? "✕" : "✓"} ${rule.tool}${rule.match ? ` · ${rule.match}` : ""}`;
-    label.title = `${rule.scope}${rule.cwd ? ` · ${rule.cwd}` : ""}`;
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "link-button";
-    remove.textContent = t.rulesRemove;
-    remove.addEventListener("click", () => api.send({ cmd: "removeRule", id: rule.id }));
-    row.append(label, remove);
-    list.appendChild(row);
-  }
-}
-
-function fillSettings(s) {
-  state.providers = s.providers || [];
-  state.provider = s.provider || "custom";
-  const providerSelect = $("setting-provider");
-  providerSelect.innerHTML = "";
-  for (const provider of s.providers || []) {
-    const option = document.createElement("option");
-    option.value = provider.id;
-    option.textContent = provider.configured ? provider.label : `${provider.label} · ${t.providerNoKey}`;
-    providerSelect.appendChild(option);
-  }
-  if (s.baseUrl && ![...providerSelect.options].some((option) => option.value === s.provider)) {
-    const custom = document.createElement("option");
-    custom.value = "custom";
-    custom.textContent = t.providerCustom;
-    providerSelect.appendChild(custom);
-  }
-  if (s.provider === "custom" && ![...providerSelect.options].some((option) => option.value === "custom")) {
-    const custom = document.createElement("option");
-    custom.value = "custom";
-    custom.textContent = t.providerCustom;
-    providerSelect.appendChild(custom);
-  }
-  providerSelect.value = s.provider || "custom";
-  providerSelect.dataset.last = providerSelect.value;
-  $("setting-base-url").value = s.baseUrl || "";
-  $("models-hint").hidden = true;
-  $("setting-api-key").value = s.apiKeyMasked || "";
-  $("setting-api-key").dataset.masked = "1";
-  const modelSelect = $("setting-model");
-  modelSelect.innerHTML = "";
-  for (const model of s.models || []) {
-    const option = document.createElement("option");
-    option.value = model.id;
-    option.textContent = model.id;
-    modelSelect.appendChild(option);
-  }
-  if (s.model && ![...modelSelect.options].some((o) => o.value === s.model)) {
-    const option = document.createElement("option");
-    option.value = s.model;
-    option.textContent = s.model;
-    modelSelect.appendChild(option);
-  }
-  modelSelect.value = s.model;
-  $("setting-mode").value = s.mode;
-  $("setting-effort").value = s.effort;
-  $("setting-max-tokens").value = s.maxTokens;
-  $("setting-auto-approve").value = (s.autoApprove ?? []).join(", ");
-  $("setting-fallback").value = (s.fallbackModels ?? []).join(", ");
-  renderRules(s.rules ?? []);
-  $("setting-sandbox").value = s.sandbox === "off" ? "off" : "enforce";
-  $("setting-network").value = ["off", "proxy", "open"].includes(s.networkPolicy) ? s.networkPolicy : "off";
-  state.sandbox = $("setting-sandbox").value;
-  // Refresh the mode chip so the un-isolated marker tracks the saved value.
-  setMode(state.mode);
-  $("setting-context").value = s.contextWindow;
-  const modelContext = $("setting-context").parentElement.querySelector(".field-hint");
-  if (modelContext) modelContext.remove();
-  if (s.modelContext) {
-    const hint = document.createElement("span");
-    hint.className = "field-hint";
-    hint.textContent = t.contextFromEndpoint(Math.round(s.modelContext / 1000));
-    $("setting-context").parentElement.appendChild(hint);
-  }
-  $("setting-locale").value = s.locale;
-  $("setting-theme").value = s.theme;
-  $("setting-density").value = state.density;
-  $("settings-note").textContent = "";
-}
-
-$("setting-api-key").addEventListener("focus", (event) => {
-  if (event.target.dataset.masked === "1") {
-    event.target.value = "";
-    event.target.dataset.masked = "";
-  }
-});
-
-// Choosing a provider fills in its base URL so the two controls stay coherent.
-$("setting-provider").addEventListener("change", (event) => {
-  const providers = state.providers ?? [];
-  const chosen = providers.find((provider) => provider.id === event.target.value);
-  if (chosen) $("setting-base-url").value = chosen.baseUrl;
-});
-
-function saveSettings() {
-  api.send({
-    cmd: "saveSettings",
-    settings: {
-      provider: $("setting-provider").value,
-      baseUrl: $("setting-base-url").value,
-      apiKey: $("setting-api-key").value,
-      model: $("setting-model").value,
-      mode: $("setting-mode").value,
-      effort: $("setting-effort").value,
-      maxTokens: Number($("setting-max-tokens").value),
-      autoApprove: $("setting-auto-approve").value,
-      fallbackModels: $("setting-fallback").value,
-      sandbox: $("setting-sandbox").value,
-      networkPolicy: $("setting-network").value,
-      contextWindow: Number($("setting-context").value),
-      locale: $("setting-locale").value,
-      theme: $("setting-theme").value,
-    },
-  });
-  setDensity($("setting-density").value);
-}
-
-$("settings-button").addEventListener("click", openSettings);
-$("settings-close").addEventListener("click", () => closeModal(settingsDialog));
-$("settings-cancel").addEventListener("click", () => closeModal(settingsDialog));
-$("settings-save").addEventListener("click", saveSettings);
-
-/* ---------- about / update check ---------- */
-
-async function refreshVersion() {
-  if (!api.appVersion) return;
-  const version = await api.appVersion();
-  const node = $("about-version");
-  if (node && version) node.textContent = version;
-}
-
-$("check-update").addEventListener("click", async () => {
-  const note = $("update-note");
-  note.textContent = t.updateChecking;
-  const result = await api.checkUpdate();
-  if (!result || result.status === "unconfigured") {
-    note.textContent = t.updateUnconfigured;
-  } else if (result.status === "error") {
-    note.textContent = `${t.updateError} ${result.message ?? ""}`;
-  } else if (result.status === "available") {
-    note.innerHTML =
-      `${escapeHtml(t.updateAvailable)} ${escapeHtml(result.latest)} ` +
-      (result.url ? `<button class="link-button" id="update-open">${escapeHtml(t.updateOpen)}</button>` : "");
-    const open = $("update-open");
-    if (open) open.addEventListener("click", () => api.openExternal(result.url));
-  } else {
-    note.textContent = t.updateCurrent;
-  }
-});
+// Kept as free functions so the rest of this file can call them by name.
+const openSettings = (tab) => settings.open(tab);
+const openSetup = () => settings.openSetup();
+const refreshVersion = () => settings.refreshVersion();
+$("settings-button").addEventListener("click", () => openSettings());
 
 /* ---------- shortcuts sheet ---------- */
 
@@ -3200,12 +3073,44 @@ transcript.addEventListener("click", (event) => {
   }
 });
 
+// Startup runs at the bottom of the module: everything above is a declaration.
+// A thrown error here would leave the first paint unstyled, so the boot steps
+// are individually guarded and reported rather than silently skipped.
+function bootStep(name, fn) {
+  try {
+    fn();
+  } catch (err) {
+    console.error(`[boot] ${name}:`, err);
+  }
+}
+
 api.onEvent(handleEvent);
 if (api.platform) document.documentElement.classList.add(`platform-${api.platform}`);
-applyLocale(state.locale);
-setMode(state.mode);
-setTheme(state.theme);
-setDensity(state.density);
+bootStep("locale", () => applyLocale(state.locale));
+bootStep("mode", () => setMode(state.mode));
+// Preferences are restored from localStorage so the first paint is already
+// correct; the host's copy is authoritative once it answers getSettings.
+if (localStorage.getItem("prometheus.theme") === "system" || !localStorage.getItem("prometheus.theme")) {
+  state.theme = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+bootStep("theme", () => setTheme(state.theme));
+bootStep("density", () => setDensity(state.density));
+bootStep("width", () => {
+  document.documentElement.dataset.width = localStorage.getItem("prometheus.width") || "standard";
+});
+bootStep("view", () => {
+  document.documentElement.dataset.view = localStorage.getItem("prometheus.view") || "normal";
+});
+bootStep("motion", () => {
+  document.documentElement.dataset.motion = localStorage.getItem("prometheus.motion") || "full";
+});
+bootStep("fontScale", () => {
+  document.documentElement.style.setProperty("--font-scale", localStorage.getItem("prometheus.fontScale") || "1");
+});
+bootStep("codeFont", () => {
+  const saved = localStorage.getItem("prometheus.codeFont");
+  if (saved) applyCodeFont(saved);
+});
 setupVoice();
 void refreshVersion();
 api.send({ cmd: "listSessions" });

@@ -79,13 +79,19 @@ export interface Worktree {
  *
  * @param repoRoot the repository root the session's workspace belongs to
  */
-export async function createWorktree(repoRoot: string, sessionId: string, base = "HEAD"): Promise<{ ok: true; worktree: Worktree } | { ok: false; error: string }> {
+export async function createWorktree(
+  repoRoot: string,
+  sessionId: string,
+  base = "HEAD",
+  branchPrefix = "prometheus/",
+): Promise<{ ok: true; worktree: Worktree } | { ok: false; error: string }> {
   const root = await git(repoRoot, ["rev-parse", "--show-toplevel"]);
   if (!root.ok) return { ok: false, error: "this workspace is not a git repository" };
 
   const top = root.out.trim();
   const name = slug(sessionId);
-  const branch = `prometheus/${name}`;
+  const prefix = branchPrefix.trim() ? (branchPrefix.trim().endsWith("/") ? branchPrefix.trim() : `${branchPrefix.trim()}/`) : "";
+  const branch = `${prefix}${name}`;
   const parent = join(top, ".prometheus", "worktrees");
   const path = join(parent, name);
 

@@ -44,6 +44,42 @@ export function loadMemory(): string {
   return parts.join("\n\n");
 }
 
+export interface MemorySection {
+  name: string;
+  description: string;
+  body: string;
+}
+
+/** Split one memory file into its `### name` blocks. */
+export function readMemorySections(scope: "global" | "project"): MemorySection[] {
+  const file = scope === "project" ? paths().project : paths().global;
+  const text = readSection(file);
+  const out: MemorySection[] = [];
+  const pattern = /^###\s+(.+)\n(?:_(.+)_\n)?\n?([\s\S]*?)(?=\n###\s|\s*$)/gm;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    out.push({
+      name: match[1].trim(),
+      description: (match[2] ?? "").trim(),
+      body: match[3].trim(),
+    });
+  }
+  return out;
+}
+
+/** Remove one `### name` block; the file stays even when it empties. */
+export function deleteMemory(scope: "global" | "project", name: string): void {
+  const file = scope === "project" ? paths().project : paths().global;
+  if (!existsSync(file)) return;
+  const text = readSection(file);
+  const marker = `### ${name}`;
+  const start = text.indexOf(marker);
+  if (start < 0) return;
+  const next = text.indexOf("\n### ", start + marker.length);
+  const updated = (text.slice(0, start) + (next >= 0 ? text.slice(next + 1) : "")).trim();
+  writeFileSync(file, updated ? `${updated}\n` : "", "utf8");
+}
+
 export function saveMemory(entry: MemoryEntry): string {
   mkdirSync(MEMORY_DIR, { recursive: true });
   const file = entry.type === "project" ? paths().project : paths().global;

@@ -1322,10 +1322,47 @@ mark.find-hit.current {
   border: 3px solid var(--bg);
 }
 
+/* Conversation width and body size are user preferences (Settings > Appearance).
+   The column and every fixed-width block move together so a wide window does
+   not leave tool output stranded in a narrow strip. */
+:root {
+  --reading-width: 780px;
+  --font-scale: 1;
+}
+
+:root[data-width="narrow"] {
+  --reading-width: 620px;
+}
+
+:root[data-width="wide"] {
+  --reading-width: 980px;
+}
+
 .turn {
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 0 auto 22px;
   padding: 0 28px;
+}
+
+.turn.assistant .markdown {
+  font-size: calc(14px * var(--font-scale));
+  line-height: calc(1.6 + (var(--font-scale) - 1) * 0.6);
+}
+
+:root[data-motion="reduced"] *,
+:root[data-motion="reduced"] *::before,
+:root[data-motion="reduced"] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
 }
 
 .user-bubble {
@@ -1347,7 +1384,7 @@ mark.find-hit.current {
   display: flex;
   align-items: center;
   gap: 12px;
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 4px auto 24px;
   padding: 0 28px;
   font-size: 11.5px;
@@ -1532,7 +1569,7 @@ mark.find-hit.current {
    groups a build's steps. The block is a list of actions, not a second
    transcript, so it sits at a lower contrast than the prose. */
 .tool-group {
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 2px auto 18px;
   padding: 0 28px;
   display: flex;
@@ -1673,7 +1710,7 @@ mark.find-hit.current {
 }
 
 .thinking {
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 0 auto 10px;
   padding: 0 28px;
   font-size: 12.5px;
@@ -1682,6 +1719,34 @@ mark.find-hit.current {
   display: flex;
   gap: 8px;
   align-items: baseline;
+}
+
+/* Normal view keeps reasoning as a one-line marker; the Thinking and Verbose
+   views show the text the model actually produced. */
+:root[data-view="normal"] .thinking-text {
+  display: none;
+}
+
+:root[data-view="thinking"] .thinking,
+:root[data-view="verbose"] .thinking {
+  display: block;
+  color: var(--text-secondary);
+  font-style: normal;
+  line-height: 1.55;
+}
+
+:root[data-view="thinking"] .thinking::before,
+:root[data-view="verbose"] .thinking::before {
+  display: none;
+}
+
+:root[data-view="thinking"] .thinking-label,
+:root[data-view="verbose"] .thinking-label {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-style: italic;
 }
 
 .thinking::before {
@@ -1695,7 +1760,7 @@ mark.find-hit.current {
 }
 
 .plan {
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 0 auto 18px;
   padding: 0 28px;
 }
@@ -1751,7 +1816,7 @@ mark.find-hit.current {
 }
 
 .notice {
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 0 auto 12px;
   padding: 0 28px;
   font-size: 12.5px;
@@ -1847,7 +1912,7 @@ mark.find-hit.current {
 }
 
 .pending-permission {
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 0 auto 10px;
   border: 1px solid var(--accent);
   background: var(--accent-soft);
@@ -1882,7 +1947,7 @@ mark.find-hit.current {
 
 .composer {
   position: relative;
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -2395,7 +2460,7 @@ mark.find-hit.current {
 /* ---------- sub-agent group ---------- */
 
 .subagent {
-  max-width: 780px;
+  max-width: var(--reading-width);
   margin: 2px auto 10px;
   padding: 8px 12px 9px 14px;
   border-left: 2px solid var(--border-strong);
@@ -3260,11 +3325,13 @@ mark.find-hit.current {
   width: min(520px, 92vw);
 }
 
-.settings-form {
-  display: flex;
-  flex-direction: column;
-  max-height: 82vh;
+/* The settings page is a window-sized surface, not a dialog card. */
+.settings-dialog {
+  width: min(1080px, 96vw);
+  height: min(760px, 90vh);
+  max-height: 90vh;
 }
+
 
 .dialog-head {
   display: flex;
@@ -3285,160 +3352,7 @@ mark.find-hit.current {
   padding: 4px 16px 12px;
 }
 
-/* Settings: a narrow category rail on the left, one pane at a time on the
-   right. Four categories fit without scrolling; each pane does. */
-.settings-dialog {
-  width: min(760px, 94vw);
-}
-
-.settings-layout {
-  display: flex;
-  gap: 18px;
-  padding: 0;
-  overflow: hidden;
-  min-height: 320px;
-}
-
-.settings-nav {
-  flex: 0 0 168px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 14px 10px;
-  border-right: 1px solid var(--border);
-  background: var(--surface);
-}
-
-.settings-nav-item {
-  padding: 7px 10px;
-  border-radius: var(--radius-sm);
-  font-size: 12.5px;
-  text-align: left;
-  color: var(--text-secondary);
-}
-
-.settings-nav-item:hover {
-  background: var(--surface-hover);
-  color: var(--text);
-}
-
-.settings-nav-item.active {
-  background: var(--accent-soft);
-  color: var(--accent-text);
-}
-
-.settings-panes {
-  flex: 1;
-  min-width: 0;
-  overflow-y: auto;
-  padding: 8px 18px 12px 0;
-}
-
-.rules-field {
-  align-items: flex-start;
-}
-
-.rules-list {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  max-height: 128px;
-  overflow-y: auto;
-}
-
-.rules-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 6px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  font-size: 11.5px;
-}
-
-.rules-label {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--mono);
-  color: var(--text-secondary);
-}
-
-.rules-empty {
-  font-size: 11.5px;
-  color: var(--text-faint);
-}
-
-.settings-panes .settings-section {
-  border-bottom: none;
-  padding-top: 8px;
-}
-
-.settings-section {
-  padding: 14px 0 6px;
-  border-bottom: 1px solid var(--border);
-}
-
-.settings-section:last-child {
-  border-bottom: none;
-}
-
-.settings-section h3 {
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--text-faint);
-  margin: 0 0 10px;
-}
-
-.field {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-bottom: 10px;
-}
-
-.field > span {
-  flex: 0 0 150px;
-  font-size: 12.5px;
-  color: var(--text-secondary);
-}
-
-.field input,
-.field select {
-  flex: 1;
-  min-width: 0;
-  padding: 6px 9px;
-  border-radius: 7px;
-  border: 1px solid var(--border-strong);
-  background: var(--surface);
-  color: var(--text);
-  font-family: var(--mono);
-  font-size: 12px;
-  outline: none;
-}
-
-.field input:focus,
-.field select:focus {
-  border-color: var(--accent);
-}
-
-.dialog-foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 16px;
-  border-top: 1px solid var(--border);
-}
-
-.settings-note {
-  flex: 1;
-  font-size: 11.5px;
-  color: var(--text-faint);
-}
+/* Settings styles live in settings.css, next to the page they style. */
 
 .shortcut-grid {
   display: grid;
