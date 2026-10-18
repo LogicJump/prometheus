@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { createWriteStream, rmSync } from "node:fs";
+import { createReadStream, createWriteStream, rmSync } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { PackSource } from "./manifest.ts";
@@ -127,5 +127,58 @@ function safeHost(url: string): string | null {
     return new URL(url).host;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Hash an archive already on disk, as though it had been downloaded.
+ *
+ * "Install from file" is for machines that cannot reach the vendor — an
+ * air-gapped build server, a locked-down corporate network. The file is still
+ * checked against the checksum in the accompanying `pack.json`; the only thing
+ * that changes is where the bytes came from.
+ *
+ * The file is copied rather than hashed in place because the transaction owns
+ * every file it will later delete, and deleting something the user picked from
+ * their own disk would be a surprise.
+ */
+export async function importArchive(source: PackSource, file: string, options: DownloadOptions): Promise<{ bytes: number; sha256: string }> {
+  const hash = createHash("sha256");
+  let received = 0;
+  const abort = options.signal;
+  if (abort?.aborted) throw new DownloadError("cancelled before starting");
+
+  try {
+    const body = createReadStream(file);
+    body.on("data", (chunk: string | Buffer) => {
+      const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      received += buffer.length;
+      hash.update(buffer);
+      options.onProgress?.({ received, ...(source.bytes > 0 ? { total: source.bytes } : {}) });
+    });
+    await pipeline(body, createWriteStream(options.destination));
+
+    if (source.bytes > 0 && received !== source.bytes) {
+      throw new DownloadError(`${file} is ${received} bytes, but the manifest says ${source.bytes}`);
+    }
+
+    const sha256 = hash.digest("hex");
+    if (sha256 !== source.sha256.toLowerCase()) {
+      throw new DownloadError(
+        `checksum mismatch for ${file}\n  expected ${source.sha256}\n  received ${sha256}\n` +
+          `The file was not installed. It may be a different build than the one its pack.json describes.`,
+      );
+    }
+    return { bytes: received, sha256 };
+  } catch (error) {
+    try {
+      rmSync(options.destination, { force: true });
+    } catch {
+      /* already gone */
+    }
+    if (error instanceof DownloadError) throw error;
+    if (abort?.aborted) throw new DownloadError("cancelled");
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new DownloadError(`no such file: ${file}`);
+    throw new DownloadError(error instanceof Error ? error.message : String(error));
   }
 }

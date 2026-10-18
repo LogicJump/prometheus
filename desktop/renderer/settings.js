@@ -1287,6 +1287,26 @@ function buildToolsPage() {
       }
       list.appendChild(group);
     }
+
+    // 离线安装：内网机器连不上下载站时，用户手上只有别人拷过来的
+    // pack.json 和压缩包。它和在线安装走同一个事务，只是字节来源不同。
+    const offline = el("div", "pack-offline");
+    offline.appendChild(el("p", "setting-note", s.packOfflineHint));
+    offline.appendChild(
+      sButton(s.packOffline, async () => {
+        const manifestPath = await api.pickFile?.({ filters: [{ name: "pack.json", extensions: ["json"] }] });
+        if (!manifestPath) return;
+        // 同一个目录里的 .zip / .tar.xz 就是它的归档；找不到就让安装器
+        // 自己按 manifest 里的 URL 去取。
+        const dir = manifestPath.replace(/[\\/][^\\/]+$/, "");
+        const archive = await api.pickFile?.({
+          defaultPath: dir,
+          filters: [{ name: "Archive", extensions: ["zip", "xz", "gz"] }],
+        });
+        api.send({ cmd: "installFromManifest", path: manifestPath, files: archive ? [archive] : [] });
+      }),
+    );
+    list.appendChild(offline);
   };
 
   // 进度条独立于列表，安装时它出现在最上面。

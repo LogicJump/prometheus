@@ -317,6 +317,16 @@ app.whenReady().then(() => {
     return result.canceled ? null : result.filePaths[0];
   });
 
+  // 离线安装：内网机器连不上工具链的下载站，用户手上只有一个压缩包。
+  ipcMain.handle("pick-file", async (_event, options = {}) => {
+    const result = await dialog.showOpenDialog({
+      properties: ["openFile"],
+      filters: options.filters ?? [],
+      ...(options.defaultPath ? { defaultPath: options.defaultPath } : {}),
+    });
+    return result.canceled ? null : result.filePaths[0];
+  });
+
   ipcMain.handle("reveal-file", async (_event, path) => {
     if (existsSync(path)) shell.showItemInFolder(path);
   });

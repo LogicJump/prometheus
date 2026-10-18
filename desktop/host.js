@@ -43,7 +43,7 @@ import {
   writeInstructions,
 } from "../src/settingsFiles.ts";
 import { readMemorySections, deleteMemory } from "../src/memory.ts";
-import { installPack } from "../src/packs/install.ts";
+import { installFromManifest, installPack } from "../src/packs/install.ts";
 import { listPacks, packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
 import { catalogFor, isInstallable, toInstallEntry } from "../src/packs/catalog.ts";
 import { resetToolchainCache } from "../src/embedded/toolchain.ts";
@@ -816,6 +816,30 @@ async function handle(cmd) {
     case "cancelPack": {
       packAbort?.abort();
       packAbort = null;
+      return;
+    }
+    // 离线安装：用户手上是别人拷过来的 pack.json + 压缩包，机器连不上
+    // 工具链的下载站。校验照样做，哈希来自那个 pack.json。
+    case "installFromManifest": {
+      packAbort?.abort();
+      packAbort = new AbortController();
+      const controller = packAbort;
+      installFromManifest(cmd.path, {
+        signal: controller.signal,
+        localFiles: Array.isArray(cmd.files) && cmd.files.length > 0 ? cmd.files : undefined,
+        onProgress: (progress) => send({ type: "pack_progress", ...progress }),
+      })
+        .then((manifest) => {
+          resetToolchainCache();
+          send({ type: "pack_installed", id: manifest.id });
+          handle({ cmd: "getPacks" });
+        })
+        .catch((error) => {
+          send({ type: "pack_error", id: null, message: error.message });
+        })
+        .finally(() => {
+          if (packAbort === controller) packAbort = null;
+        });
       return;
     }
     case "removePack": {

@@ -1081,3 +1081,15 @@
   font-size: var(--text-sm);
   white-space: pre-wrap;
 }
+
+/* 离线安装是外网受限时的唯一出路，但它不是主路径：放在列表末尾，
+   用一条分隔线而不是一张卡片，避免和"可安装"那组抢注意力。 */
+.pack-offline {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.pack-offline .setting-note {
+  margin-bottom: 8px;
+}

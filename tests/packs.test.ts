@@ -269,6 +269,14 @@ function fakeDeps(options: { extractThrows?: boolean; validationFails?: boolean;
     walk: (root) => walkStats(root),
     hashTree: async () => "sha256:tree",
     runValidation: async () => (options.validationFails ? { ok: false, output: "x", reason: "validation failed: wrong triple" } : { ok: true, output: "arm-none-eabi" }),
+    // 离线安装走这条路：字节从本地文件来，但校验一步都不能少。
+    importArchive: async (source, file, opts) => {
+      writeFileSync(opts.destination, readFileSync(file));
+      if (options.badHash) {
+        throw new Error(`checksum mismatch for ${file}\n  expected ${source.sha256}\n  received deadbeef`);
+      }
+      return { bytes: 13, sha256: source.sha256 };
+    },
   };
 }
 
@@ -306,8 +314,45 @@ test("every failed install leaves nothing in packs/ and cleans tmp", async () =>
   }
 });
 
-test("an unsafe archive is refused before extraction writes anything", async () => {
-  const root = scratch("prometheus-unsafe-");
+test("an offline install uses the local archive and still checks its checksum", async () => {
+  const root = scratch("prometheus-offline-");
+  const archive = join(root, "arm.zip");
+  writeFileSync(archive, "archive bytes");
+
+  const manifest = await installPack(entry(), {
+    root,
+    localFiles: [archive],
+    deps: fakeDeps(),
+  });
+  assert.ok(existsSync(join(root, "packs", manifest.id, "payload", "bin", "gcc.exe")));
+
+  // The user's own file is still where they left it — the transaction copied
+  // it, and nothing in this feature may delete a file the user picked.
+  assert.ok(existsSync(archive), "the source archive must not be consumed");
+});
+
+test("an offline archive that does not match its manifest is refused", async () => {
+  const root = scratch("prometheus-offline-bad-");
+  const archive = join(root, "tampered.zip");
+  writeFileSync(archive, "not the bytes the manifest describes");
+
+  await assert.rejects(
+    installPack(entry(), { root, localFiles: [archive], deps: fakeDeps({ badHash: true }) }),
+    /checksum mismatch/,
+  );
+  assert.deepEqual(readdirSync(join(root, "packs")), [], "nothing installed");
+  assert.deepEqual(readdirSync(join(root, "tmp")), [], "nothing left behind");
+});
+
+test("offline file count must match the manifest's source count", async () => {
+  const root = scratch("prometheus-offline-count-");
+  await assert.rejects(
+    installPack(entry(), { root, localFiles: [], deps: fakeDeps() }),
+    /1 archive\(s\) but 0 file\(s\)/,
+  );
+});
+
+test("an unsafe archive is refused before extraction writes anything", async () => {  const root = scratch("prometheus-unsafe-");
   let extracted = false;
   const deps = {
     ...fakeDeps(),

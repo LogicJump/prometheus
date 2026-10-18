@@ -23,10 +23,10 @@
  * without a network or a real 300 MB download.
  */
 
-import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
-import { downloadVerified } from "./download.ts";
+import { downloadVerified, importArchive } from "./download.ts";
 import { extractArchive, listArchive, planExtraction, tarBinary, treeHash, walkStats } from "./archive.ts";
 import { parseManifest, writeManifest, type PackManifest } from "./manifest.ts";
 import { acquireRootLock, assertPackId, ensureRoot, isOwnedRoot, packDir, packsRoot, tmpDir } from "./paths.ts";
@@ -51,6 +51,7 @@ export interface CatalogEntry {
 
 export interface InstallDeps {
   download?: typeof downloadVerified;
+  importArchive?: typeof importArchive;
   list?: typeof listArchive;
   extract?: typeof extractArchive;
   walk?: typeof walkStats;
@@ -64,6 +65,12 @@ export interface InstallOptions {
   replace?: boolean;
   /** Skip the catalog hash check; only for "install from file". */
   allowUnverified?: boolean;
+  /**
+   * Local archives to use instead of downloading, one per entry in
+   * `manifest.sources`. Used by "install from file"; the bytes are still
+   * checked against the manifest's checksums.
+   */
+  localFiles?: string[];
   onProgress?: (progress: PackProgress) => void;
   deps?: InstallDeps;
 }
@@ -200,6 +207,7 @@ export async function installPack(entry: CatalogEntry, options: InstallOptions =
 
   const deps: Required<InstallDeps> = {
     download: options.deps?.download ?? downloadVerified,
+    importArchive: options.deps?.importArchive ?? importArchive,
     list: options.deps?.list ?? listArchive,
     extract: options.deps?.extract ?? extractArchive,
     walk: options.deps?.walk ?? walkStats,
@@ -262,14 +270,30 @@ export async function installPack(entry: CatalogEntry, options: InstallOptions =
     mkdirSync(payloadStage, { recursive: true });
     // Download every source; a composite pack (Zephyr) has more than one.
     const archives: { path: string; format: PackManifest["sources"][number]["archive"] }[] = [];
+    if (options.localFiles && options.localFiles.length !== manifest.sources.length) {
+      throw new InstallError(
+        `this pack is built from ${manifest.sources.length} archive(s) but ${options.localFiles.length} file(s) were given`,
+      );
+    }
     for (const [index, source] of manifest.sources.entries()) {
       phase("download", { received: 0, ...(source.bytes ? { total: source.bytes } : {}) });
       const archivePath = join(txn, `archive-${index}.${source.archive.replace(".", "")}`);
-      await deps.download(source, {
-        destination: archivePath,
-        ...(options.signal ? { signal: options.signal } : {}),
-        onProgress: (progress) => phase("download", { received: progress.received, ...(progress.total ? { total: progress.total } : {}) }),
-      });
+      const onProgress = (progress: { received: number; total?: number }) =>
+        phase("download", { received: progress.received, ...(progress.total ? { total: progress.total } : {}) });
+      const local = options.localFiles?.[index];
+      if (local) {
+        await deps.importArchive(source, local, {
+          destination: archivePath,
+          ...(options.signal ? { signal: options.signal } : {}),
+          onProgress,
+        });
+      } else {
+        await deps.download(source, {
+          destination: archivePath,
+          ...(options.signal ? { signal: options.signal } : {}),
+          onProgress,
+        });
+      }
       archives.push({ path: archivePath, format: source.archive });
     }
 
@@ -411,6 +435,35 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/**
+ * Install from a local `pack.json` plus its archive(s).
+ *
+ * This is the air-gapped path: a machine that cannot reach the vendor gets the
+ * same transaction, the same member checks and the same validation — the only
+ * difference is where the bytes came from. The checksum still comes from the
+ * file the user supplied, so a mangled copy is caught rather than trusted.
+ *
+ * `localFiles` is optional. A `pack.json` with `sources` whose archives are
+ * reachable still installs the normal way; this entry point exists so the UI
+ * has one command for "the user handed us a file".
+ */
+export async function installFromManifest(
+  manifestPath: string,
+  options: InstallOptions & { localFiles?: string[] } = {},
+): Promise<PackManifest> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch (error) {
+    throw new InstallError(
+      `could not read ${manifestPath}: ${error instanceof Error ? error.message : String(error)}. ` +
+        `An offline install needs the pack.json that came with the archive.`,
+    );
+  }
+  const manifest = parseManifest(raw, manifestPath);
+  return installPack({ manifest }, { ...options, allowUnverified: options.allowUnverified ?? false });
 }
 
 /** Directory size, without following symlinks. */
