@@ -43,6 +43,10 @@ import {
   writeInstructions,
 } from "../src/settingsFiles.ts";
 import { readMemorySections, deleteMemory } from "../src/memory.ts";
+import { installPack } from "../src/packs/install.ts";
+import { listPacks, packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
+import { catalogFor, toInstallEntry } from "../src/packs/catalog.ts";
+import { resetToolchainCache } from "../src/embedded/toolchain.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
@@ -667,6 +671,9 @@ async function runPrompt(text, images) {
   }
 }
 
+/** 正在进行的安装；同时只允许一个，取消就是 abort 它。 */
+let packAbort = null;
+
 async function handle(cmd) {
   switch (cmd.cmd) {
     case "init": {
@@ -710,6 +717,114 @@ async function handle(cmd) {
       writeUiSettings({ locale });
       send({ type: "locale", locale });
       if (config) emitState();
+      return;
+    }
+    // ---- 工具链包 ----
+    // 安装会跑几分钟，所以进度要一边跑一边发；取消用 AbortController 记住。
+    case "getPacks": {
+      try {
+        const summary = packsSummary();
+        send({
+          type: "packs",
+          root: summary.root,
+          freeBytes: summary.freeBytes,
+          totalBytes: summary.totalBytes,
+          packs: summary.packs.map((pack) => ({
+            manifest: {
+              id: pack.manifest.id,
+              name: pack.manifest.name,
+              version: pack.manifest.version,
+              provides: pack.manifest.provides,
+              license: pack.manifest.license,
+            },
+            bytes: pack.bytes,
+            status: pack.status,
+            problem: pack.problem,
+          })),
+        });
+      } catch (error) {
+        send({ type: "notice", level: "warn", text: `toolchain packs: ${error.message}` });
+      }
+      return;
+    }
+    case "getPackCatalog": {
+      try {
+        // includeUnverified: 目录里没填哈希的条目也列出来，但标成不可安装 ——
+        // 静默隐藏会让用户以为"没有这个工具链"，而不是"还没准备好"。
+        send({
+          type: "pack_catalog",
+          entries: catalogFor(undefined, undefined, { includeUnverified: true }).map((entry) => ({
+            id: entry.id,
+            name: entry.name,
+            version: entry.version,
+            downloadBytes: entry.downloadBytes,
+            provides: entry.provides,
+            installable: entry.sources.every((source) => /^[0-9a-f]{64}$/.test(source.sha256)),
+          })),
+        });
+      } catch (error) {
+        send({ type: "notice", level: "warn", text: `toolchain catalog: ${error.message}` });
+      }
+      return;
+    }
+    case "installPack": {
+      const entry = catalogFor(undefined, undefined, { includeUnverified: true }).find((item) => item.id === cmd.id);
+      if (!entry) {
+        send({ type: "pack_error", id: cmd.id, message: "no such pack in the catalog" });
+        return;
+      }
+      if (!entry.sources.every((source) => /^[0-9a-f]{64}$/.test(source.sha256))) {
+        send({ type: "pack_error", id: cmd.id, message: "this pack has not been checksummed yet and cannot be installed" });
+        return;
+      }
+      packAbort?.abort();
+      packAbort = new AbortController();
+      const controller = packAbort;
+      // 不 await：命令循环必须继续响应，否则用户在下载时点取消都没反应。
+      installPack(toInstallEntry(entry), {
+        signal: controller.signal,
+        onProgress: (progress) => send({ type: "pack_progress", ...progress }),
+      })
+        .then(() => {
+          resetToolchainCache();
+          send({ type: "pack_installed", id: entry.id });
+          handle({ cmd: "getPacks" });
+        })
+        .catch((error) => {
+          send({ type: "pack_error", id: entry.id, message: error.message });
+        })
+        .finally(() => {
+          if (packAbort === controller) packAbort = null;
+        });
+      return;
+    }
+    case "cancelPack": {
+      packAbort?.abort();
+      packAbort = null;
+      return;
+    }
+    case "removePack": {
+      try {
+        await removePack(cmd.id);
+        resetToolchainCache();
+        handle({ cmd: "getPacks" });
+      } catch (error) {
+        send({ type: "pack_error", id: cmd.id, message: error.message });
+      }
+      return;
+    }
+    case "verifyPack": {
+      verifyPack(cmd.id, { onProgress: (progress) => send({ type: "pack_progress", ...progress }) })
+        .then((result) => {
+          send({ type: "pack_verified", id: cmd.id, ok: result.ok, problems: result.problems });
+        })
+        .catch((error) => send({ type: "pack_error", id: cmd.id, message: error.message }));
+      return;
+    }
+    case "prunePacks": {
+      const result = await pruneTmp();
+      send({ type: "pack_pruned", removed: result.removed.length, bytes: result.bytes });
+      handle({ cmd: "getPacks" });
       return;
     }
     case "getSettings":

@@ -1126,6 +1126,13 @@ function handleEvent(message) {
     case "skills":
     case "memory":
     case "instructions":
+    case "packs":
+    case "pack_catalog":
+    case "pack_progress":
+    case "pack_installed":
+    case "pack_error":
+    case "pack_verified":
+    case "pack_pruned":
       settings.handleEvent(message);
       break;
 

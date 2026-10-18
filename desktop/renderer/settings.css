@@ -930,3 +930,154 @@
   }
 }
 
+
+/* ---------- toolchain packs ---------- */
+
+.pack-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+/* 根目录是一条路径，等宽字体让它可读，也让它显然可以被复制。 */
+.pack-root {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.pack-usage {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.pack-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pack-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.pack-row.pack-available {
+  border-style: dashed;
+  background: transparent;
+}
+
+.pack-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.pack-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pack-version {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  font-family: var(--font-mono, monospace);
+}
+
+.pack-meta {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 3px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.pack-size {
+  font-variant-numeric: tabular-nums;
+}
+
+.pack-provides {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-faint);
+}
+
+.pack-problem {
+  margin-top: 4px;
+  color: var(--danger);
+}
+
+.pack-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* 进度条是确定的：下载 289 MB 时一个转圈说明不了任何事。 */
+.pack-progress {
+  margin-bottom: 12px;
+}
+
+.pack-progress-label {
+  display: block;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pack-progress-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.pack-progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 160ms var(--ease);
+}
+
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent-text);
+  font-size: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.link-button:hover {
+  color: var(--accent-hover);
+}
+
+.pack-error {
+  padding: 10px 14px;
+  margin-bottom: 10px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+}

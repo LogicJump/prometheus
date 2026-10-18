@@ -29,6 +29,8 @@ state.mcpServers = [];
 state.skills = [];
 state.memory = { global: [], project: [] };
 state.systemState = null;
+state.packState = null;
+state.packProgress = null;
 state.settingsQuery = "";
 
 const S = () => settingsStrings[state.locale] ?? settingsStrings.en;
@@ -46,6 +48,7 @@ const SETTINGS_ICON_NAMES = {
   skills: "sparkle",
   memory: "book",
   instructions: "file-code",
+  tools: "layers",
   system: "monitor",
   about: "info",
 };
@@ -66,6 +69,7 @@ function settingsPages() {
     { id: "skills", group: s.groupCustomize, title: s.pageSkills, build: buildSkillsPage },
     { id: "memory", group: s.groupCustomize, title: s.pageMemory, build: buildMemoryPage },
     { id: "instructions", group: s.groupCustomize, title: s.pageInstructions, build: buildInstructionsPage },
+    { id: "tools", group: s.groupComputer, title: s.pageTools, build: buildToolsPage },
     { id: "system", group: s.groupComputer, title: s.pageSystem, build: buildSystemPage },
     { id: "about", group: s.groupComputer, title: s.pageAbout, build: buildAboutPage },
   ];
@@ -1149,6 +1153,187 @@ function buildInstructionsPage() {
   return pane;
 }
 
+/**
+ * 工具链包。
+ *
+ * 这一页要回答的第一个问题不是"装了什么"，而是"磁盘被谁占了、能不能删"。
+ * 所以最上面一行永远是根目录、已用、剩余 —— 用户装了几个 GB 的编译器之后
+ * 第一件想确认的事就是这个。
+ *
+ * 进度是确定的（显示百分比和阶段），因为下载 289 MB 时一个转圈什么都说明
+ * 不了；到底是在下载、校验、解压还是验证，决定了用户要不要等。
+ */
+function buildToolsPage() {
+  const s = S();
+  const pane = sPage(s.pageTools, s.pageToolsDesc);
+  // 顺序即优先级：根目录与占用在第一行，进度条其次，包列表最后。
+  const summary = el("div", "pack-summary");
+  pane.appendChild(summary);
+
+  const list = el("div", "pack-list");
+  pane.appendChild(list);
+
+  const formatBytes = (bytes) => {
+    if (!bytes) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return `${value.toFixed(unit >= 3 ? 2 : 1)} ${units[unit]}`;
+  };
+
+  const render = () => {
+    const packs = state.packState;
+    list.innerHTML = "";
+
+    if (!packs) {
+      list.appendChild(el("p", "setting-note", s.packLoading));
+      return;
+    }
+
+    // 错误要留在页面上，而不是变成一个一闪而过的提示：安装失败的原因
+    // （磁盘不够、哈希不对、包已损坏）恰恰是用户需要读的东西。
+    if (state.packError) {
+      const box = el("div", "pack-error");
+      box.textContent = state.packError;
+      list.appendChild(box);
+    }
+
+    // 根目录与占用：这是"别把文件系统搞乱"这个问题最直接的回答。
+    summary.innerHTML = "";
+    summary.appendChild(el("code", "pack-root", packs.root));
+    summary.appendChild(
+      el(
+        "span",
+        "pack-usage",
+        `${s.packUsed} ${formatBytes(packs.totalBytes)}${packs.freeBytes ? ` · ${s.packFree} ${formatBytes(packs.freeBytes)}` : ""}`,
+      ),
+    );
+
+    if (packs.packs.length === 0) {
+      const empty = el("div", "settings-empty-card");
+      empty.appendChild(el("h3", "", s.packEmptyTitle));
+      empty.appendChild(el("p", "", s.packEmptyBody));
+      list.appendChild(empty);
+    }
+
+    for (const pack of packs.packs) {
+      const row = el("div", "pack-row");
+
+      const main = el("div", "pack-main");
+      const title = el("div", "pack-title");
+      title.appendChild(el("strong", "", pack.manifest.name));
+      title.appendChild(el("span", "pack-version", pack.manifest.version));
+      if (pack.status === "broken") title.appendChild(el("span", "mcp-scope disabled", s.packBroken));
+      main.appendChild(title);
+
+      const meta = el("div", "pack-meta");
+      meta.appendChild(el("span", "pack-size", formatBytes(pack.bytes)));
+      if (pack.manifest.provides.length) meta.appendChild(el("span", "pack-provides", pack.manifest.provides.join(", ")));
+      if (pack.manifest.license?.url) {
+        const link = el("button", "link-button", s.packLicence);
+        link.type = "button";
+        link.addEventListener("click", () => api.openExternal?.(pack.manifest.license.url));
+        meta.appendChild(link);
+      }
+      main.appendChild(meta);
+
+      if (pack.problem) main.appendChild(el("p", "setting-note pack-problem", pack.problem));
+
+      const actions = el("div", "pack-actions");
+      actions.appendChild(sButton(s.packVerify, () => api.send({ cmd: "verifyPack", id: pack.manifest.id }), { quiet: true }));
+
+      // 删除要两次点击：一个 pack 是一 GB，误删的代价是重新下载十分钟。
+      let armed = false;
+      const remove = sButton(s.packRemove, () => {
+        if (!armed) {
+          armed = true;
+          remove.textContent = s.packRemoveConfirm;
+          remove.classList.add("danger");
+          setTimeout(() => {
+            armed = false;
+            remove.textContent = s.packRemove;
+          }, 4000);
+          return;
+        }
+        api.send({ cmd: "removePack", id: pack.manifest.id });
+      }, { quiet: true, danger: true });
+      actions.appendChild(remove);
+
+      row.append(main, actions);
+      list.appendChild(row);
+    }
+
+    // 可安装的条目
+    if (state.packCatalog?.length) {
+      const group = el("section", "setting-group");
+      group.appendChild(el("h3", "setting-group-title", s.packAvailable));
+      for (const entry of state.packCatalog) {
+        const row = el("div", "pack-row pack-available");
+        const main = el("div", "pack-main");
+        const title = el("div", "pack-title");
+        title.appendChild(el("strong", "", entry.name));
+        title.appendChild(el("span", "pack-version", entry.version));
+        main.appendChild(title);
+        main.appendChild(el("div", "pack-meta", `${formatBytes(entry.downloadBytes)} · ${entry.provides.join(", ")}`));
+
+        const actions = el("div", "pack-actions");
+        actions.appendChild(sButton(s.packInstall, () => api.send({ cmd: "installPack", id: entry.id }), { primary: true }));
+        row.append(main, actions);
+        group.appendChild(row);
+      }
+      list.appendChild(group);
+    }
+  };
+
+  // 进度条独立于列表，安装时它出现在最上面。
+  const progressBar = el("div", "pack-progress");
+  progressBar.hidden = true;
+  progressBar.appendChild(el("div", "pack-progress-label"));
+  const bar = el("div", "pack-progress-track");
+  const fill = el("div", "pack-progress-fill");
+  bar.appendChild(fill);
+  progressBar.appendChild(bar);
+  pane.insertBefore(progressBar, list);
+
+  state.renderPackPage = render;
+  state.renderPackProgress = (progress) => {
+    if (!progress) {
+      progressBar.hidden = true;
+      return;
+    }
+    progressBar.hidden = false;
+    const label = progressBar.querySelector(".pack-progress-label");
+    const phaseText = {
+      preflight: s.packPhasePreflight,
+      download: s.packPhaseDownload,
+      verify: s.packPhaseVerify,
+      extract: s.packPhaseExtract,
+      inspect: s.packPhaseInspect,
+      validate: s.packPhaseValidate,
+      commit: s.packPhaseCommit,
+    }[progress.phase] ?? progress.phase;
+
+    if (progress.phase === "download" && progress.total) {
+      const pct = Math.min(100, Math.round(((progress.received ?? 0) / progress.total) * 100));
+      label.textContent = `${phaseText} ${pct}% · ${formatBytes(progress.received ?? 0)} / ${formatBytes(progress.total)}`;
+      fill.style.width = `${pct}%`;
+    } else {
+      label.textContent = phaseText;
+      // 非下载阶段没有可比的量，用一个不确定宽度表示"在动"而不是假装有进度。
+      fill.style.width = progress.phase === "commit" ? "100%" : "60%";
+    }
+  };
+
+  api.send({ cmd: "getPacks" });
+  api.send({ cmd: "getPackCatalog" });
+  render();
+  return pane;
+}
+
 function buildSystemPage() {
   const s = S();
   const pane = sPage(s.pageSystem, s.pageSystemDesc);
@@ -1488,6 +1673,34 @@ function basename(path) {
         break;
       case "rules":
         if (!settingsDialog.hidden) api.send({ cmd: "getSettings" });
+        break;
+      case "packs":
+        state.packState = message;
+        state.renderPackPage?.();
+        break;
+      case "pack_catalog":
+        state.packCatalog = message.entries ?? [];
+        state.renderPackPage?.();
+        break;
+      case "pack_progress":
+        state.renderPackProgress?.(message);
+        break;
+      case "pack_installed":
+        state.renderPackProgress?.(null);
+        // 装完之后目录和列表都变了，重新拉一次而不是就地改状态。
+        api.send({ cmd: "getPackCatalog" });
+        break;
+      case "pack_error":
+        state.renderPackProgress?.(null);
+        state.packError = message.message ?? "";
+        state.renderPackPage?.();
+        break;
+      case "pack_verified":
+        state.packError = message.ok ? "" : (message.problems ?? []).join("; ");
+        state.renderPackPage?.();
+        break;
+      case "pack_pruned":
+        api.send({ cmd: "getPacks" });
         break;
       default:
         break;
