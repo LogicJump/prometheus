@@ -15,6 +15,7 @@ import { capture, parseLine } from "../src/embedded/serial.ts";
 import { classifyOutput, commandFor, flash, parseSize, validate } from "../src/embedded/flash.ts";
 import { findArtifacts } from "../src/embedded/build.ts";
 import { miFields, miList, parseMiLine, parseStackFrames, parseStopReason, parseVariables, SERVER_PORTS, serverCommand } from "../src/embedded/debug.ts";
+import { findRegister, parseSvd, peripheralIndex, registerAddress } from "../src/embedded/svd.ts";
 import { existsSync } from "node:fs";
 
 function scratch(prefix: string): string {
@@ -346,6 +347,7 @@ test("a port that cannot be opened reports the reason, not a hang", async () => 
 
 const ELF_FIXTURE = "C:/Users/Admin/AppData/Local/Temp/fltest/t.elf";
 const hasFixture = existsSync(ELF_FIXTURE);
+const hasStm32Svd = existsSync("G:/software/cubeprogrammer/SVD/STM32F411.svd");
 
 test("a flash is refused before running when it would be ambiguous", () => {
   const tmp = scratch("prometheus-flash-");
@@ -578,4 +580,142 @@ test("each probe family gets the GDB server command it actually accepts", () => 
   // Ports differ per tool; getting this wrong is a silent timeout.
   assert.equal(SERVER_PORTS["probe-rs"], 1337);
   assert.equal(SERVER_PORTS.jlink, 2331);
+});
+
+// ---- SVD ------------------------------------------------------------------
+
+const SVD_MINIMAL = `<?xml version="1.0"?>
+<device schemaVersion="1.1">
+  <name>TESTCHIP</name>
+  <vendor>Acme</vendor>
+  <cpu><name>CM4</name><revision>r0p1</revision><fpuPresent>true</fpuPresent></cpu>
+  <peripherals>
+    <peripheral>
+      <name>UART1</name>
+      <description>Universal async receiver</description>
+      <baseAddress>0x40010000</baseAddress>
+      <interrupt><name>UART1</name><value>37</value></interrupt>
+      <registers>
+        <register>
+          <name>CR1</name><addressOffset>0xC</addressOffset><size>32</size>
+          <access>read-write</access><resetValue>0x0</resetValue>
+          <fields>
+            <field><name>RE</name><bitOffset>2</bitOffset><bitWidth>1</bitWidth></field>
+            <field><name>TE</name><lsb>3</lsb><msb>3</msb></field>
+            <field>
+              <name>MODE</name><bitOffset>4</bitOffset><bitWidth>2</bitWidth>
+              <enumeratedValues>
+                <enumeratedValue><name>EIGHT_BIT</name><value>0</value></enumeratedValue>
+                <enumeratedValue><name>NINE_BIT</name><value>1</value></enumeratedValue>
+              </enumeratedValues>
+            </field>
+          </fields>
+        </register>
+        <register><name>DR</name><addressOffset>0x4</addressOffset><size>32</size></register>
+      </registers>
+    </peripheral>
+    <peripheral derivedFrom="UART1">
+      <name>UART2</name>
+      <baseAddress>0x40011000</baseAddress>
+    </peripheral>
+  </peripherals>
+</device>`;
+
+test("a minimal SVD parses into a device with cpu, peripherals and interrupts", () => {
+  const device = parseSvd(SVD_MINIMAL);
+  assert.equal(device.name, "TESTCHIP");
+  assert.equal(device.vendor, "Acme");
+  assert.equal(device.cpu?.name, "CM4");
+  assert.equal(device.cpu?.fpuPresent, true);
+  assert.equal(device.peripherals.length, 2);
+
+  const uart = device.peripherals.find((peripheral) => peripheral.name === "UART1");
+  assert.ok(uart);
+  assert.equal(uart.baseAddress, 0x40010000);
+  assert.equal(uart.interrupts?.[0].value, 37);
+});
+
+test("both bit spellings yield the same field geometry", () => {
+  const device = parseSvd(SVD_MINIMAL);
+  const uart = device.peripherals.find((peripheral) => peripheral.name === "UART1");
+  const cr1 = uart?.registers.find((register) => register.name === "CR1");
+  assert.ok(cr1);
+
+  const re = cr1.fields.find((field) => field.name === "RE");
+  const te = cr1.fields.find((field) => field.name === "TE");
+  // bitOffset/bitWidth and lsb/msb describe the same one-bit field.
+  assert.equal(re?.bitOffset, 2);
+  assert.equal(re?.bitWidth, 1);
+  assert.equal(te?.bitOffset, 3);
+  assert.equal(te?.bitWidth, 1);
+  // Fields come back in bit order.
+  assert.deepEqual(cr1.fields.map((field) => field.bitOffset), [2, 3, 4]);
+});
+
+test("enumerated values are attached to their field", () => {
+  const device = parseSvd(SVD_MINIMAL);
+  const mode = findRegister(device, "UART1.CR1.MODE")?.field;
+  assert.ok(mode);
+  assert.deepEqual(mode.enums, { EIGHT_BIT: "0", NINE_BIT: "1" });
+});
+
+test("derivedFrom inherits the parent's registers and keeps its own address", () => {
+  const device = parseSvd(SVD_MINIMAL);
+  const uart2 = device.peripherals.find((peripheral) => peripheral.name === "UART2");
+  assert.ok(uart2);
+  // Without resolution a derived peripheral looks empty, which is the bug.
+  assert.equal(uart2.registers.length, 2);
+  assert.equal(uart2.baseAddress, 0x40011000);
+  assert.equal(uart2.interrupts?.[0].value, 37);
+
+  // Register lookup works through the derivation.
+  assert.equal(registerAddress(device, "UART2.CR1"), 0x40011000 + 0xc);
+  assert.equal(registerAddress(device, "UART1.CR1"), 0x40010000 + 0xc);
+});
+
+test("clusters flatten their registers to the right offsets", () => {
+  const xml = `<device><name>C</name><peripherals><peripheral><name>P</name><baseAddress>0x1000</baseAddress>
+    <registers>
+      <register><name>DIRECT</name><addressOffset>0x0</addressOffset></register>
+      <cluster><name>CH</name><addressOffset>0x100</addressOffset>
+        <register><name>CTRL</name><addressOffset>0x8</addressOffset></register>
+      </cluster>
+    </registers></peripheral></peripherals></device>`;
+  const device = parseSvd(xml);
+  assert.equal(registerAddress(device, "P.CTRL"), 0x1000 + 0x100 + 0x8);
+  assert.equal(registerAddress(device, "P.DIRECT"), 0x1000);
+});
+
+test("a file that is not an SVD is refused by name", () => {
+  assert.throws(() => parseSvd("#include <stdio.h>\nint main(void){return 0;}\n", { source: "notes.svd" }), /not an SVD/);
+});
+
+test("the index fits a context window and carries base addresses", () => {
+  const device = parseSvd(SVD_MINIMAL);
+  const index = peripheralIndex(device);
+  assert.match(index, /UART1 @0x40010000/);
+  // A derived peripheral must still show its own base address.
+  assert.match(index, /UART2 @0x40011000/);
+  assert.match(index, /CR1\+0xC/);
+});
+
+test("reading a real vendor SVD gives the right register addresses", { skip: !hasStm32Svd }, () => {
+  const device = parseSvd("G:/software/cubeprogrammer/SVD/STM32F411.svd");
+  assert.ok(device.peripherals.length > 30, `expected many peripherals, got ${device.peripherals.length}`);
+
+  // USART2 is a derived peripheral on STM32: without resolution it is empty.
+  const uart2 = device.peripherals.find((peripheral) => peripheral.name === "USART2");
+  assert.ok(uart2);
+  assert.ok(uart2.registers.length >= 6, "USART2 must inherit its registers from USART1");
+
+  // The datasheet values: USART2 base 0x40004400, CR1 at +0x0C, UE is bit 13.
+  assert.equal(registerAddress(device, "USART2.CR1"), 0x4000440c);
+  const ue = findRegister(device, "USART2.CR1.UE")?.field;
+  assert.ok(ue);
+  assert.equal(ue.bitOffset, 13);
+  assert.equal(ue.bitWidth, 1);
+
+  // The whole chip's index stays inside a context window.
+  const index = peripheralIndex(device);
+  assert.ok(index.length < 20_000, `index is ${index.length} chars, too big for the context`);
 });

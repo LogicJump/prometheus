@@ -263,6 +263,11 @@ const serialTool: Tool = {
       until: { type: "string", description: "Stop as soon as a received line matches this regular expression" },
       max_lines: { type: "integer", description: "Stop after this many lines, default 2000" },
       only_errors: { type: "boolean", description: "Return only lines parsed as error or warning level" },
+      reset_on_connect: {
+        type: "boolean",
+        description:
+          "Assert DTR when opening, which resets most dev boards. Use it to catch a boot banner; leave it off when the firmware is already running and you want what it is printing now. Default false.",
+      },
     },
     additionalProperties: false,
   },
@@ -296,7 +301,8 @@ const serialTool: Tool = {
     }
 
     const timeoutMs = Math.min(60_000, Math.max(100, Number(input.timeout_ms ?? 5000)));
-    const result = await capture(openPort, port, {
+    const assertDtr = Boolean(input.reset_on_connect);
+    const result = await capture((path, baud) => openPort(path, baud, { assertDtr }), port, {
       timeoutMs,
       baud: Number(input.baud ?? 115200),
       ...(until ? { until } : {}),

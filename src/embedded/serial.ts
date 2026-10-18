@@ -291,6 +291,12 @@ export interface CaptureOptions {
    * because sometimes the banner is the point.
    */
   skipUntil?: RegExp;
+  /**
+   * Assert DTR when opening. On most dev boards DTR is wired to RESET, so this
+   * reboots the target — useful to catch a boot banner, harmful when you are
+   * waiting for a message the running firmware will print. Default false.
+   */
+  assertDtr?: boolean;
 }
 
 export interface CaptureResult {
@@ -316,18 +322,21 @@ export interface CaptureResult {
  * Both are separate processes. That is deliberate: a wedged driver cannot take
  * the agent down with it, and killing the child closes the port.
  */
-export function openPort(path: string, baud: number): PortHandle {
-  if (process.platform === "win32") return openWindowsPort(path, baud);
+export function openPort(path: string, baud: number, options: { assertDtr?: boolean } = {}): PortHandle {
+  const assertDtr = options.assertDtr ?? false;
+  if (process.platform === "win32") return openWindowsPort(path, baud, assertDtr);
   return openPosixPort(path, baud);
 }
 
-function openWindowsPort(path: string, baud: number): PortHandle {
+function openWindowsPort(path: string, baud: number, assertDtr: boolean): PortHandle {
   const script = [
     "$ErrorActionPreference='Stop'",
     "$p=New-Object System.IO.Ports.SerialPort $env:PROM_PORT,$env:PROM_BAUD",
-    // DTR is asserted by default on open, which resets boards wired for it.
-    // Setting it explicitly makes the behaviour the same every time.
-    "$p.DtrEnable=$true",
+    // DTR is wired to RESET through a capacitor on most dev boards, so
+    // asserting it reboots the target. That is sometimes what you want (to
+    // catch a boot banner) and sometimes destroys the test (you lose the
+    // message you were waiting for). The caller decides.
+    `$p.DtrEnable=${assertDtr ? "$true" : "$false"}`,
     "$p.ReadTimeout=500",
     "$p.Open()",
     "while($true){",
