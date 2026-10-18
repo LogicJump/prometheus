@@ -3587,6 +3587,43 @@ mark.find-hit.current {
   margin-top: 16px;
 }
 
+/* 自主循环的可见性：一个在跑的循环必须随时看得见、随时能停。 */
+.goal-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft, rgba(59, 130, 246, 0.16));
+  border: 1px solid var(--accent);
+  color: var(--accent-text);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.goal-badge:hover {
+  filter: brightness(1.15);
+}
+
+.goal-summary {
+  margin: 14px 0;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.goal-summary.done {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.goal-summary.stopped {
+  border-color: var(--border-strong);
+}
+
 /* The settings page is a window-sized surface, not a dialog card. */
 .settings-dialog {
   width: min(1080px, 96vw);

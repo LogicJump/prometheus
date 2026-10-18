@@ -46,6 +46,7 @@ import { readMemorySections, deleteMemory } from "../src/memory.ts";
 import { installFromManifest, installPack } from "../src/packs/install.ts";
 import { packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
 import { catalogFor, isInstallable, toInstallEntry } from "../src/packs/catalog.ts";
+import { runGoal, runTaskLoop } from "../src/autoloop.ts";
 import { resetToolchainCache } from "../src/embedded/toolchain.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
@@ -618,7 +619,7 @@ async function runPrompt(text, images) {
     // boundary; the renderer already echoed it into the transcript.
     agent.enqueue(text);
     send({ type: "queued", count: agent.queuedCount });
-    return;
+    return { ok: true, queued: true };
   }
   running = true;
   setSessionStatus("working");
@@ -627,6 +628,7 @@ async function runPrompt(text, images) {
   markRunActive({ sessionId, cwd, startedAt: new Date().toISOString() });
   send({ type: "queued", count: 0 });
   send({ type: "run_start" });
+  let ok = true;
   try {
     if (Array.isArray(images) && images.length > 0) {
       await agent.runWithParts(text, images.map((url) => ({ type: "image_url", image_url: { url } })));
@@ -634,6 +636,7 @@ async function runPrompt(text, images) {
       await agent.run(text);
     }
   } catch (err) {
+    ok = false;
     const message = err instanceof Error ? err.message : String(err);
     if (err?.name !== "AbortError") {
       send({ type: "error", message });
@@ -669,10 +672,39 @@ async function runPrompt(text, images) {
     void emitGitStatus();
     void agent?.fireSessionHooks("Stop", { sessionId });
   }
+  return { ok };
 }
 
 /** 正在进行的安装；同时只允许一个，取消就是 abort 它。 */
 let packAbort = null;
+
+/** 正在跑的自主循环；同一时刻只允许一个。 */
+let goalRun = null;
+
+/**
+ * The most recent assistant text in this session.
+ *
+ * Used as a round's conclusion when driving an autonomous loop. It is a
+ * summary in the loose sense — whatever the model said last — but the driver
+ * only compares consecutive values to notice a stall, so precision is not the
+ * point; being comparable is.
+ */
+function lastAssistantText() {
+  const messages = agent?.messages ?? [];
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message.role !== "assistant") continue;
+    if (typeof message.content === "string") return message.content.trim();
+    if (Array.isArray(message.content)) {
+      const text = message.content
+        .filter((part) => part && part.type === "text")
+        .map((part) => part.text)
+        .join(" ");
+      if (text.trim()) return text.trim();
+    }
+  }
+  return "";
+}
 
 async function handle(cmd) {
   switch (cmd.cmd) {
@@ -1261,6 +1293,79 @@ async function handle(cmd) {
         stopMcp();
         void startMcp();
       }
+      return;
+    }
+    // ---- 自主循环 ----
+    // goal 和 loop 都是"跑一轮、判断、决定要不要再来一轮"。差别只在终止
+    // 条件：goal 问"目标达成了吗"，loop 问"清单上还有没做完的吗"。
+    // 驱动器在 src/autoloop.ts，这里的职责只是把一轮接进 agent。
+    case "startGoal":
+    case "startTaskLoop": {
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      if (goalRun) return send({ type: "notice", level: "warn", text: "a goal loop is already running" });
+      const goal = String(cmd.goal ?? "").trim();
+      if (cmd.cmd === "startGoal" && !goal) {
+        return send({ type: "notice", level: "error", text: "a goal needs a description" });
+      }
+      const controller = new AbortController();
+      const kind = cmd.cmd === "startGoal" ? "goal" : "loop";
+      goalRun = { controller, kind, goal };
+      const maxRounds = Number(cmd.maxRounds) || 8;
+      send({ type: "goal_start", kind, goal, maxRounds });
+
+      const runRound = async (prompt) => {
+        const result = await runPrompt(prompt);
+        // The round's conclusion is what the driver reasons about. The last
+        // assistant text is the closest thing to a summary we have without a
+        // second request; an empty one means the turn produced nothing, which
+        // the repeated-outcome guard will notice.
+        return { ok: result?.ok !== false, summary: lastAssistantText() };
+      };
+
+      const finish = (result) => {
+        goalRun = null;
+        send({ type: "goal_end", kind: result.kind, ...result });
+        if (result.stop !== "cancelled") {
+          send({ type: "notice", level: result.stop === "goal-met" || result.stop === "task-list-complete" ? "info" : "warn", text: result.detail });
+        }
+      };
+
+      try {
+        if (kind === "goal") {
+          const result = await runGoal({
+            goal,
+            maxRounds,
+            signal: controller.signal,
+            runRound,
+            isGoalMet: ({ goal: target, roundSummary, history }) => agent.assessGoal({ goal: target, roundSummary, history }, controller.signal),
+            onRound: (event) => send({ type: "goal_round", ...event }),
+          });
+          finish({ kind, ...result });
+        } else {
+          const result = await runTaskLoop({
+            maxRounds,
+            signal: controller.signal,
+            plan: async () =>
+              runRound(
+                goal
+                  ? `Plan the work for this request, then stop:\n\n${goal}\n\nUse todo_write to record the steps. Do not start executing yet.`
+                  : "Plan the work for the request above, then stop. Use todo_write to record the steps. Do not start executing yet.",
+              ),
+            readTasks: () => agent.todos.items,
+            runRound,
+            onRound: (event) => send({ type: "goal_round", ...event }),
+          });
+          finish({ kind, ...result });
+        }
+      } catch (error) {
+        goalRun = null;
+        send({ type: "goal_end", kind, stop: "failed", rounds: 0, detail: error.message, history: [] });
+      }
+      return;
+    }
+    case "stopGoal": {
+      goalRun?.controller.abort();
+      agent?.abort();
       return;
     }
     case "compact": {

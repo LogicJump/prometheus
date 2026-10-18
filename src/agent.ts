@@ -371,9 +371,48 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     return result.content.trim() || localSummary;
   }
 
+  /**
+   * Ask the model whether a stated goal has been reached.
+   *
+   * This is a separate, small request rather than a reading of the last
+   * message: an agent that just spent a round working is a poor judge of
+   * whether it is done, and its prose is optimistic. A fresh question with only
+   * the goal and the round's conclusion gets a sharper answer, and the loop
+   * stops on it.
+   *
+   * Failure to answer is treated as "not met", never as success. A goal loop
+   * that reports completion because the checker timed out is worse than one
+   * that runs an extra round.
+   */
+  async assessGoal(input: { goal: string; roundSummary: string; history: string[] }, signal?: AbortSignal): Promise<{ met: boolean; reason: string }> {
+    const own = signal ?? new AbortController().signal;
+    const transcript = input.history.length ? `What has happened so far:\n${input.history.join("\n")}\n\n` : "";
+    const request = this.client.chat(
+      [
+        {
+          role: "system",
+          content:
+            "You judge whether a goal has been reached. Answer with exactly one line: MET: <reason> or NOT MET: <what is missing>. " +
+            "Be strict: a goal is met only if the evidence in the transcript shows it, not because the work felt finished.",
+        },
+        { role: "user", content: `${transcript}Goal: ${input.goal}\n\nThis round concluded: ${input.roundSummary || "(nothing)"}` },
+      ],
+      [],
+      () => {},
+      () => {},
+      own,
+    );
+    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 30_000));
+    const result = await Promise.race([request, timeout]).catch(() => null);
+    if (!result) return { met: false, reason: "could not confirm the goal; treating it as unfinished" };
+
+    const text = result.content.trim();
+    const met = /^MET\s*:/i.test(text);
+    return { met, reason: text.replace(/^(NOT\s+)?MET\s*:\s*/i, "") || (met ? "The goal is met." : "Not yet.") };
+  }
+
   /** Translate a loop event into the terminal UI calls. */
-  private dispatch(event: QueryEvent): void {
-    const ui = this.ui;
+  private dispatch(event: QueryEvent): void {    const ui = this.ui;
     switch (event.type) {
       case "assistant_start":
         ui.spinnerStop();

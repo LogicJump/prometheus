@@ -52,6 +52,7 @@ const terminalPrompt = $("terminal-prompt");
 
 const state = {
   busy: false,
+  goalRun: null,
   mode: "ask",
   effort: "auto",
   model: "",
@@ -1272,6 +1273,59 @@ function handleEvent(message) {
           `<span class="compact-line"></span>` +
           `<span class="compact-label">${escapeHtml(t.compactedLabel(message.removed, message.level))}</span>` +
           `<span class="compact-line"></span>` +
+          `</div>`,
+      );
+      scrollToBottom();
+      break;
+
+    // ---- 自主循环 ----
+    // 每一轮的边界都要看得见：否则几轮下来，用户读到的是一段连续的对话，
+    // 分不清哪一段是自己说的、哪一段是循环自己接上的。
+    case "goal_start":
+      state.goalRun = { kind: message.kind, goal: message.goal, maxRounds: message.maxRounds, round: 0 };
+      addNode(
+        `<div class="compact-marker goal-marker">` +
+          `<span class="compact-line"></span>` +
+          `<span class="compact-label">${escapeHtml(
+            message.kind === "goal"
+              ? t.goalStarted.replace("{n}", String(message.maxRounds))
+              : t.loopStarted.replace("{n}", String(message.maxRounds)),
+          )}</span>` +
+          `<span class="compact-line"></span>` +
+          `</div>`,
+      );
+      renderGoalBadge();
+      scrollToBottom();
+      break;
+
+    case "goal_round":
+      if (message.phase === "start") {
+        // 第 1 轮也要标出来：它是规划轮，和后面的执行轮性质不同，用户
+        // 需要知道"这一轮只是拆步骤，还没动手"。
+        addNode(
+          `<div class="compact-marker">` +
+            `<span class="compact-line"></span>` +
+            `<span class="compact-label">${escapeHtml(
+              message.round === 1 && state.goalRun?.kind === "loop" ? t.loopPlanRound : t.goalRound.replace("{n}", String(message.round)),
+            )}</span>` +
+            `<span class="compact-line"></span>` +
+            `</div>`,
+        );
+        scrollToBottom();
+        if (state.goalRun) {
+          state.goalRun.round = message.round;
+          renderGoalBadge();
+        }
+      }
+      break;
+
+    case "goal_end":
+      state.goalRun = null;
+      renderGoalBadge();
+      addNode(
+        `<div class="goal-summary ${message.stop === "goal-met" || message.stop === "task-list-complete" ? "done" : "stopped"}">` +
+          `<strong>${escapeHtml(t.goalEnded)}</strong> ` +
+          escapeHtml(message.detail) +
           `</div>`,
       );
       scrollToBottom();
@@ -2682,6 +2736,47 @@ function askText(label, value = "") {
   });
 }
 
+/**
+ * The badge in the title bar while a goal or task loop is running.
+ *
+ * An autonomous run must be visible at all times and stoppable in one click.
+ * Without the badge, the only sign that something is looping is the transcript
+ * scrolling, and a user who looks away cannot tell whether it is still going.
+ */
+function renderGoalBadge() {
+  const badge = $("goal-badge");
+  const run = state.goalRun;
+  if (!badge) return;
+  if (!run) {
+    badge.hidden = true;
+    return;
+  }
+  badge.hidden = false;
+  const label = run.kind === "goal" ? t.goalBadge : t.loopBadge;
+  $("goal-badge-text").textContent = `${label} ${run.round}/${run.maxRounds}`;
+}
+
+$("goal-badge")?.addEventListener("click", () => api.send({ cmd: "stopGoal" }));
+
+/**
+ * Start a goal or task loop, asking for the goal first.
+ *
+ * The prompt names the round ceiling before anything runs: an autonomous loop
+ * spends the user's tokens without them typing again, so the cost has to be
+ * stated up front rather than discovered in the transcript.
+ */
+async function startAutonomous(command) {
+  if (state.goalRun) {
+    addNotice("warn", t.goalAlreadyRunning);
+    return;
+  }
+  const goal = await askText(command === "startGoal" ? t.goalPrompt : t.loopPrompt, "");
+  if (goal === null) return;
+  const trimmed = goal.trim();
+  if (!trimmed && command === "startGoal") return;
+  api.send({ cmd: command, goal: trimmed, maxRounds: 8 });
+}
+
 /* ---------- command palette ---------- */
 
 /**
@@ -2713,6 +2808,10 @@ function paletteEntries() {
     // 压缩一直是自动的，但那意味着用户没法在自己想腾出上下文的时候
     // 腾出上下文 —— 比如刚读完一大堆文件，马上要换一个话题。
     { label: t.compactNow, run: () => api.send({ cmd: "compact" }) },
+    // Goal 和 loop 都是自主循环，所以入口要明确写"会自己跑多轮"，
+    // 不能伪装成一次普通提问。
+    { label: t.startGoal, run: () => startAutonomous("startGoal") },
+    { label: t.startTaskLoop, run: () => startAutonomous("startTaskLoop") },
     { label: t.shortcutStop, run: () => api.send({ cmd: "abort" }) },
   ];
   for (const command of state.commands) {
