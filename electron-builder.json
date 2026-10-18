@@ -17,11 +17,14 @@
   ],
   "win": {
     "icon": "build/icon.png",
-    "target": ["nsis", "portable"],
-    "artifactName": "Prometheus-${version}-${arch}.${ext}"
+    "target": ["nsis", "portable"]
   },
   "nsis": {
     "oneClick": false,
-    "allowToChangeInstallationDirectory": true
+    "allowToChangeInstallationDirectory": true,
+    "artifactName": "Prometheus-${version}-${arch}-setup.${ext}"
+  },
+  "portable": {
+    "artifactName": "Prometheus-${version}-${arch}-portable.${ext}"
   }
 }

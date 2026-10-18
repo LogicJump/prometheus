@@ -1,7 +1,8 @@
 {
   "name": "prometheus",
   "version": "0.1.0",
-  "description": "A general-purpose terminal coding agent",
+  "description": "Open-source coding agent for embedded and firmware development",
+  "author": "Prometheus contributors",
   "type": "module",
   "bin": {
     "prometheus": "./bin/prometheus.js"
