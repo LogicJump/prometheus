@@ -81,6 +81,7 @@ const state = {
   selectedArtifact: null,
   queuedCount: 0,
   sessionQuery: "",
+  showArchived: false,
   commands: [],
   diffScope: "session",
   currentSubagent: null,
@@ -1069,7 +1070,15 @@ function handleEvent(message) {
       break;
 
     case "session_saved":
-      api.send({ cmd: "listSessions" });
+      api.send({ cmd: "listSessions", includeArchived: state.showArchived });
+      break;
+
+    case "session_title":
+      if (state.sessions.length > 0) {
+        const current = state.sessions.find((session) => session.id === state.sessionId);
+        if (current) current.title = message.title;
+        renderSessions(state.sessions);
+      }
       break;
 
     case "host_exit":
@@ -1700,7 +1709,10 @@ function renderSessions(sessions) {
   const query = state.sessionQuery.trim().toLowerCase();
   const visible = query
     ? state.sessions.filter(
-        (session) => session.summary.toLowerCase().includes(query) || session.cwd.toLowerCase().includes(query),
+        (session) =>
+          (session.title ?? session.summary).toLowerCase().includes(query) ||
+          session.summary.toLowerCase().includes(query) ||
+          session.cwd.toLowerCase().includes(query),
       )
     : state.sessions;
   if (visible.length === 0) {
@@ -1725,18 +1737,83 @@ function renderSessions(sessions) {
       sessionList.appendChild(heading);
     }
     const button = document.createElement("button");
-    button.className = `session-item${session.id === state.sessionId ? " active" : ""}`;
-    const title = session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages;
+    button.className = `session-item${session.id === state.sessionId ? " active" : ""}${session.pinned ? " pinned" : ""}`;
+    const title = session.title || (session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages);
     button.innerHTML =
+      (session.pinned ? `<span class="session-pin" title="${escapeHtml(t.sessionPinned)}">◆</span>` : "") +
       `<div class="session-title">${escapeHtml(title)}</div>` +
       `<div class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</div>`;
     button.title = `${title}\n${session.id}\n${session.cwd}`;
     button.addEventListener("click", () => {
       api.send({ cmd: "loadSession", id: session.id });
+      // On a narrow window the drawer covers the conversation once opened.
+      if (window.matchMedia("(max-width: 860px)").matches) document.querySelector(".shell").classList.add("collapsed");
+    });
+    button.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      openSessionMenu(event, session);
     });
     sessionList.appendChild(button);
   }
 }
+
+let sessionMenu = null;
+
+function closeSessionMenu() {
+  if (sessionMenu) {
+    sessionMenu.remove();
+    sessionMenu = null;
+  }
+}
+
+/** Right-click actions for one session: pin, rename, archive, delete. */
+function openSessionMenu(event, session) {
+  closeSessionMenu();
+  const menu = document.createElement("div");
+  menu.className = "session-menu";
+  const actions = [
+    [session.pinned ? t.sessionUnpin : t.sessionPin, () => sendSessionFlags(session, { pinned: !session.pinned })],
+    [t.sessionRename, () => renameSession(session)],
+    [session.archived ? t.sessionUnarchive : t.sessionArchive, () => {
+      sendSessionFlags(session, { archived: !session.archived });
+    }],
+    [t.sessionDelete, () => {
+      if (confirm(t.sessionDeleteConfirm)) api.send({ cmd: "deleteSession", id: session.id, includeArchived: state.showArchived });
+    }],
+  ];
+  for (const [label, action] of actions) {
+    const item = document.createElement("button");
+    item.className = "session-menu-item";
+    item.textContent = label;
+    if (label === t.sessionDelete) item.classList.add("danger");
+    item.addEventListener("click", () => {
+      closeSessionMenu();
+      action();
+    });
+    menu.appendChild(item);
+  }
+  menu.style.left = `${event.clientX}px`;
+  menu.style.top = `${event.clientY}px`;
+  document.body.appendChild(menu);
+  sessionMenu = menu;
+}
+
+function sendSessionFlags(session, flags) {
+  api.send({ cmd: "sessionFlags", id: session.id, includeArchived: state.showArchived, ...flags });
+}
+
+function renameSession(session) {
+  const current = session.title || session.summary || "";
+  const next = prompt(t.sessionRenamePrompt, current);
+  if (next === null) return;
+  sendSessionFlags(session, { title: next.trim() || null });
+}
+
+document.addEventListener("mousedown", (event) => {
+  if (sessionMenu && !event.target.closest(".session-menu")) closeSessionMenu();
+});
+window.addEventListener("blur", closeSessionMenu);
+
 
 function setDensity(density) {
   state.density = density;
@@ -1964,7 +2041,16 @@ $("clear-button").addEventListener("click", () => {
   if (confirm(t.clearConfirm)) api.send({ cmd: "newSession" });
 });
 $("new-session").addEventListener("click", () => api.send({ cmd: "newSession" }));
-$("refresh-sessions").addEventListener("click", () => api.send({ cmd: "listSessions" }));
+$("refresh-sessions").addEventListener("click", () => {
+  api.send({ cmd: "listSessions", includeArchived: state.showArchived });
+});
+
+$("toggle-archived").addEventListener("click", () => {
+  state.showArchived = !state.showArchived;
+  $("toggle-archived").classList.toggle("active", state.showArchived);
+  $("toggle-archived").title = state.showArchived ? t.hideArchived : t.showArchived;
+  api.send({ cmd: "listSessions", includeArchived: state.showArchived });
+});
 
 $("session-search").addEventListener("input", (event) => {
   state.sessionQuery = event.target.value;

@@ -20,7 +20,7 @@ import { ChatClient } from "../src/llm.ts";
 import { Agent } from "../src/agent.ts";
 import { Permissions } from "../src/permissions.ts";
 import { ALL_TOOLS } from "../src/tools/index.ts";
-import { listSessions, loadSession, newSessionId, saveSession } from "../src/sessions.ts";
+import { listSessions, loadSession, newSessionId, saveSession, updateSessionFlags, deleteSessionFile } from "../src/sessions.ts";
 import { compactForce } from "../src/context.ts";
 import { discoverModels, FALLBACK_MODELS } from "../src/models.ts";
 import { detectLocale, isLocale } from "../src/i18n.ts";
@@ -42,6 +42,8 @@ let agent;
 let permissions;
 let sessionId = newSessionId();
 let sessionCreatedAt = new Date().toISOString();
+/** Custom title for the current session, if the user set one. */
+let sessionTitle = "";
 let cwd = process.cwd();
 let pendingPermissions = new Map();
 let permissionSeq = 0;
@@ -282,6 +284,14 @@ function changedFiles() {
 }
 
 function sessionRecord() {
+  // Keep flags written by sessionFlags; persist() must not erase them.
+  const existing = (() => {
+    try {
+      return loadSession(sessionId);
+    } catch {
+      return null;
+    }
+  })();
   return {
     id: sessionId,
     cwd,
@@ -290,6 +300,9 @@ function sessionRecord() {
     createdAt: sessionCreatedAt,
     updatedAt: new Date().toISOString(),
     messages: agent.messages.filter((m) => m.role !== "system"),
+    title: sessionTitle || existing?.title,
+    pinned: existing?.pinned,
+    archived: existing?.archived,
   };
 }
 
@@ -613,6 +626,7 @@ async function handle(cmd) {
     case "newSession": {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
       sessionId = newSessionId();
+      sessionTitle = "";
       createAgent([]);
       send({ type: "session_loaded", messages: [] });
       return;
@@ -635,14 +649,38 @@ async function handle(cmd) {
         }
       }
       sessionId = session.id;
+      sessionTitle = session.title ?? "";
       createAgent(session.messages);
       sessionCreatedAt = session.createdAt;
       send({ type: "session_loaded", messages: publicMessages(session.messages), cwd });
       return;
     }
     case "listSessions":
-      send({ type: "sessions", sessions: listSessions(false).slice(0, 40) });
+      send({ type: "sessions", sessions: listSessions(false, Boolean(cmd.includeArchived)).slice(0, 80) });
       return;
+    case "sessionFlags": {
+      const updated = updateSessionFlags(String(cmd.id), {
+        title: cmd.title,
+        pinned: cmd.pinned,
+        archived: cmd.archived,
+      });
+      if (!updated) return send({ type: "notice", level: "error", text: `session not found: ${cmd.id}` });
+      send({ type: "sessions", sessions: listSessions(false, Boolean(cmd.includeArchived)).slice(0, 80) });
+      if (updated.id === sessionId) {
+        sessionTitle = updated.title ?? "";
+        send({ type: "session_title", title: sessionTitle });
+      }
+      return;
+    }
+    case "deleteSession": {
+      if (String(cmd.id) === sessionId) {
+        return send({ type: "notice", level: "warn", text: "open another session before deleting the current one" });
+      }
+      const deleted = deleteSessionFile(String(cmd.id));
+      send({ type: "sessions", sessions: listSessions(false, Boolean(cmd.includeArchived)).slice(0, 80) });
+      if (!deleted) send({ type: "notice", level: "error", text: `session not found: ${cmd.id}` });
+      return;
+    }
     case "setCwd": {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
       if (cmd.cwd && existsSync(cmd.cwd)) {

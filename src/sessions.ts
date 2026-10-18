@@ -1,6 +1,6 @@
 /** Session persistence: one JSON file per session under ~/.prometheus/sessions. */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { SESSIONS_DIR } from "./config.ts";
@@ -14,6 +14,10 @@ export interface SessionFile {
   createdAt: string;
   updatedAt: string;
   messages: ChatMessage[];
+  /** User-chosen title; falls back to the first message. */
+  title?: string;
+  pinned?: boolean;
+  archived?: boolean;
 }
 
 function fileFor(id: string): string {
@@ -50,15 +54,44 @@ export interface SessionSummary {
   cwd: string;
   updatedAt: string;
   summary: string;
+  title?: string;
+  pinned?: boolean;
+  archived?: boolean;
 }
 
-export function listSessions(cwdOnly: boolean): SessionSummary[] {
+/** Rewrite flags on a saved session without touching its messages. */
+export function updateSessionFlags(
+  id: string,
+  patch: { title?: string | null; pinned?: boolean; archived?: boolean },
+): SessionFile | null {
+  const session = loadSession(id);
+  if (!session) return null;
+  if (patch.title !== undefined) session.title = patch.title?.trim() || undefined;
+  if (patch.pinned !== undefined) session.pinned = patch.pinned;
+  if (patch.archived !== undefined) session.archived = patch.archived;
+  saveSession(session);
+  return session;
+}
+
+export function deleteSessionFile(id: string): boolean {
+  const session = loadSession(id);
+  if (!session) return false;
+  try {
+    rmSync(fileFor(session.id), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function listSessions(cwdOnly: boolean, includeArchived = false): SessionSummary[] {
   if (!existsSync(SESSIONS_DIR)) return [];
   const out: SessionSummary[] = [];
   for (const file of readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".json"))) {
     try {
       const session = JSON.parse(readFileSync(join(SESSIONS_DIR, file), "utf8")) as SessionFile;
       if (cwdOnly && session.cwd !== process.cwd()) continue;
+      if (session.archived && !includeArchived) continue;
       const firstUser = session.messages.find((m) => m.role === "user");
       const summary = typeof firstUser?.content === "string" ? firstUser.content : "(no messages)";
       out.push({
@@ -66,12 +99,19 @@ export function listSessions(cwdOnly: boolean): SessionSummary[] {
         cwd: session.cwd,
         updatedAt: session.updatedAt,
         summary: summary.replace(/\s+/g, " ").slice(0, 100),
+        title: session.title,
+        pinned: session.pinned,
+        archived: session.archived,
       });
     } catch {
       /* skip unreadable sessions */
     }
   }
-  return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  // Pinned sessions stay on top; everything else by recency.
+  return out.sort((a, b) => {
+    if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+    return b.updatedAt.localeCompare(a.updatedAt);
+  });
 }
 
 /** Hash used for project-scoped config/memory lookups. */
