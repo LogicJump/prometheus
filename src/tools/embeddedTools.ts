@@ -18,7 +18,7 @@
 
 import type { Tool, ToolContext, ToolResult } from "../types.ts";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { build } from "../embedded/build.ts";
 import { flash, type FlasherKind } from "../embedded/flash.ts";
@@ -26,6 +26,7 @@ import { capture, listSerialPorts, openPort } from "../embedded/serial.ts";
 import { listProbes, listTargets, matchTarget } from "../embedded/probe.ts";
 import { detectToolchains } from "../embedded/toolchain.ts";
 import { detectProject, buildCommand } from "../embedded/project.ts";
+import { findRegister, parseSvd, peripheralDetail } from "../embedded/svd.ts";
 import {
   MiSession,
   type MiRecord,
@@ -613,4 +614,168 @@ function describeStop(stop: MiRecord | null): string[] {
   return ["", `stopped: ${parsed.reason} in ${where}`];
 }
 
-export const embeddedTools: Tool[] = [buildTool, flashTool, serialTool, portsTool, targetsTool, projectTool, debugTool];
+// ---- embed_registers -------------------------------------------------------
+
+/**
+ * Where an SVD for this chip might be.
+ *
+ * The packs install into several places and none of them is standard on
+ * Windows. Rather than make the user find a file, the tool searches the places
+ * a vendor pack actually lands and reports which one it used.
+ */
+const SVD_DIRS = [
+  // STM32CubeProgrammer ships one SVD per sub-family with the tool.
+  "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/SVD",
+  "C:/Program Files (x86)/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/SVD",
+  "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/SVD",
+  // Keil and the CMSIS packs.
+  "C:/Keil_v5/ARM/PACK",
+  ...(process.env.CMSIS_PACK_ROOT ? [join(process.env.CMSIS_PACK_ROOT, ".Web")] : []),
+  ...(process.env.USERPROFILE ? [join(process.env.USERPROFILE, ".cache", "cmsis-pack-manager")] : []),
+  ...(process.env.HOME ? [join(process.env.HOME, ".cache", "cmsis-pack-manager")] : []),
+];
+
+function findSvd(name: string): string | null {
+  const wanted = name.toLowerCase();
+  // Exact filename first (`STM32F411.svd`), then a directory walk.
+  for (const dir of SVD_DIRS) {
+    if (!existsSync(dir)) continue;
+    const direct = join(dir, `${name}.svd`);
+    if (existsSync(direct)) return direct;
+    try {
+      for (const entry of readdirSync(dir)) {
+        if (entry.toLowerCase() === `${wanted}.svd` || entry.toLowerCase().startsWith(`${wanted}`)) {
+          return join(dir, entry);
+        }
+      }
+    } catch {
+      /* unreadable */
+    }
+  }
+  return null;
+}
+
+/** The chip name implied by the loaded project, when it has one. */
+function chipFromProject(): string | null {
+  const pio = "platformio.ini";
+  if (existsSync(pio)) {
+    const text = readFileSync(pio, "utf8");
+    const board = /board\s*=\s*(\S+)/.exec(text)?.[1];
+    if (board) {
+      // `nucleo_f411re` → STM32F411; `esp32dev` → ESP32.
+      const normalized = board.replace(/^nucleo[_-]?/i, "").replace(/re$/i, "").toUpperCase();
+      const stm = /STM32([A-Z]\d{3})/.exec(normalized);
+      if (stm) return `STM32${stm[1]}`;
+    }
+  }
+  return null;
+}
+
+const registersTool: Tool = {
+  name: "embed_registers",
+  description:
+    "Look up a chip's register map from its CMSIS-SVD file. Returns peripheral base addresses, register offsets, field bit positions and enumerated values — the ground truth for writing peripheral code. Call it before touching a register you are not certain about: a wrong offset does not fail to compile, it silently drives the wrong peripheral.",
+  readonly: true,
+  parameters: {
+    type: "object",
+    properties: {
+      device: { type: "string", description: "Chip name matching an installed SVD, e.g. `STM32F411`. Omit to use the board in the project" },
+      peripheral: { type: "string", description: "One peripheral in full, e.g. `USART2`. Omit to get the whole chip's index" },
+      register: { type: "string", description: "A specific register path, e.g. `USART2.CR1` or `USART2.CR1.UE`, to get its address and fields" },
+      search: { type: "string", description: "Only in index mode: show peripherals whose name contains this" },
+    },
+    additionalProperties: false,
+  },
+  summarize: (input) => String(input.register ?? input.peripheral ?? input.device ?? "registers"),
+  async execute(input, ctx): Promise<ToolResult> {
+    const deviceName = input.device ? String(input.device) : chipFromProject();
+    if (!deviceName) {
+      return {
+        isError: true,
+        content:
+          "No chip named. Pass `device` (e.g. STM32F411), or run this in a PlatformIO/CMake project whose board identifies the chip.",
+        display: "no device",
+      };
+    }
+
+    const svdPath = findSvd(deviceName);
+    if (!svdPath) {
+      return {
+        isError: true,
+        content:
+          `No SVD found for ${deviceName}. Looked in:\n` +
+          SVD_DIRS.map((dir) => `  ${dir}`).join("\n") +
+          `\nSTM32CubeProgrammer installs one per sub-family; CMSIS packs install under CMSIS_PACK_ROOT.`,
+        display: "no svd",
+      };
+    }
+
+    let device;
+    try {
+      device = parseSvd(svdPath);
+    } catch (error) {
+      return { isError: true, content: `could not parse ${svdPath}: ${error instanceof Error ? error.message : String(error)}`, display: "parse failed" };
+    }
+
+    const provenance = `source: ${svdPath} (device ${device.name}${device.cpu ? `, ${device.cpu.name}` : ""})`;
+
+    if (input.register) {
+      const path = String(input.register);
+      const found = findRegister(device, path);
+      if (!found) {
+        return { isError: true, content: `${path} not found in ${device.name}.\n${provenance}`, display: "not found" };
+      }
+      const address = found.peripheral.baseAddress + found.register.offset;
+      const lines = [`${path} → 0x${address.toString(16).toUpperCase().padStart(8, "0")}`, provenance, ""];
+      lines.push(`${found.peripheral.name} base 0x${found.peripheral.baseAddress.toString(16)}`);
+      lines.push(`${found.register.name} +0x${found.register.offset.toString(16)} (${found.register.size}b${found.register.access ? ` ${found.register.access}` : ""})`);
+      if (found.register.resetValue !== undefined) lines.push(`reset 0x${found.register.resetValue.toString(16)}`);
+      for (const field of found.register.fields) {
+        // `[msb:lsb]`, the spelling every datasheet uses.
+        const range =
+          field.bitWidth === 1
+            ? `[${field.bitOffset}]`
+            : `[${field.bitOffset + field.bitWidth - 1}:${field.bitOffset}]`;
+        const enums = field.enums ? ` {${Object.entries(field.enums).map(([k, v]) => `${k}=${v}`).join(", ")}}` : "";
+        lines.push(`  ${field.name}${range}${enums}${field.description ? ` — ${field.description}` : ""}`);
+      }
+      return { content: lines.join("\n"), display: path };
+    }
+
+    if (input.peripheral) {
+      const detail = peripheralDetail(device, String(input.peripheral));
+      if (!detail) {
+        return { isError: true, content: `${input.peripheral} not in ${device.name}.\n${provenance}`, display: "not found" };
+      }
+      return { content: `${detail}\n\n${provenance}`, display: String(input.peripheral) };
+    }
+
+    let periphs = device.peripherals;
+    const search = input.search ? String(input.search).toLowerCase() : null;
+    if (search) periphs = periphs.filter((peripheral) => peripheral.name.toLowerCase().includes(search));
+
+    const lines: string[] = [];
+    for (const peripheral of periphs) {
+      const base = `0x${peripheral.baseAddress.toString(16).toUpperCase().padStart(8, "0")}`;
+      lines.push(`${peripheral.name} @${base}${peripheral.description ? ` — ${peripheral.description.slice(0, 80)}` : ""}`);
+      if (peripheral.registers.length) {
+        lines.push(`  ${peripheral.registers.map((register) => `${register.name}+0x${register.offset.toString(16).toUpperCase()}`).join(" ")}`);
+      }
+    }
+    return {
+      content: `${device.name}: ${periphs.length} peripheral(s)\n${lines.join("\n")}\n\n${provenance}\nAsk for a peripheral by name to get its full register and field detail.`,
+      display: `${periphs.length} peripherals`,
+    };
+  },
+};
+
+export const embeddedTools: Tool[] = [
+  buildTool,
+  flashTool,
+  serialTool,
+  portsTool,
+  targetsTool,
+  projectTool,
+  debugTool,
+  registersTool,
+];

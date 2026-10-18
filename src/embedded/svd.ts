@@ -474,7 +474,12 @@ export function peripheralDetail(device: SvdDevice, name: string): string | null
     lines.push(`\n${register.name} +0x${register.offset.toString(16).toUpperCase()} (${bits}${access}${reset})`);
     if (register.description) lines.push(`  ${register.description}`);
     for (const field of register.fields) {
-      const range = field.bitWidth === 1 ? `[${field.bitOffset}]` : `[${field.bitOffset}:${field.bitWidth}]`;
+      // `[msb:lsb]` is what every datasheet prints; `[offset:width]` is
+      // ambiguous because the two spellings differ by one for wide fields.
+      const range =
+        field.bitWidth === 1
+          ? `[${field.bitOffset}]`
+          : `[${field.bitOffset + field.bitWidth - 1}:${field.bitOffset}]`;
       const enums = field.enums
         ? ` {${Object.entries(field.enums).map(([enumName, value]) => `${enumName}=${value}`).join(", ")}}`
         : "";
