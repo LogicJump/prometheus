@@ -171,6 +171,13 @@ export interface AnalyzeOptions {
   paths?: string[];
   /** cppcheck `--enable=` set. Default `warning,style,performance,portability`. */
   enable?: string;
+  /**
+   * Ask cppcheck for its most expensive value-flow analysis. Slower, and it
+   * reports things `--inconclusive` can only guess at; it still does not catch
+   * an interprocedural overflow through a pointer, which is noted in the tool
+   * description rather than papered over.
+   */
+  thorough?: boolean;
   /** A compile_commands.json to use, when the project has one. */
   compileCommands?: string;
   /** How many files to analyse at most. Large trees take minutes. */
@@ -253,12 +260,13 @@ export async function analyze(options: AnalyzeOptions): Promise<AnalysisResult> 
     // is given. Both surprises are handled here rather than by each caller.
     const buildDir = join(cwd, "build", "cppcheck");
     const args = [
-      "--enable=" + (options.enable ?? "warning,style,performance,portability"),
+      "--enable=" + (options.enable ?? (options.thorough ? "all" : "warning,style,performance,portability")),
       "--xml",
       "--xml-version=2",
       "--quiet",
       "--inline-suppr",
       "--suppress=missingIncludeSystem",
+      ...(options.thorough ? ["--inconclusive", "--check-level=exhaustive"] : []),
       // Parallel analysis is the difference between 13s and 5s on 300 files.
       "-j", String(Math.max(1, Math.min(8, cpus().length))),
     ];

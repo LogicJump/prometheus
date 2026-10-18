@@ -775,13 +775,14 @@ const registersTool: Tool = {
 const analyzeTool: Tool = {
   name: "embed_analyze",
   description:
-    "Run static analysis (cppcheck, and clang-tidy when installed) over the firmware and return findings ranked by severity. Finds the bugs that compile cleanly and then fail on the board: out-of-bounds indices, null dereferences, uninitialised reads. Also reports flash/RAM headroom and worst-case stack depth when the build produced them. Use it after embed_build succeeds and before embedding_flash — a clean link is not a correct program.",
+    "Run static analysis (cppcheck, and clang-tidy when installed) over the firmware and return findings ranked by severity. Finds the bugs that compile cleanly and then fail on the board: out-of-bounds indices, null dereferences, uninitialised reads. Also reports flash/RAM headroom and worst-case stack depth when the build produced them. Use it after embed_build succeeds and before embed_flash — a clean link is not a correct program. A clean result is not proof: current cppcheck does not catch an interprocedural overflow through a pointer, so still read the code you changed.",
   readonly: true,
   parameters: {
     type: "object",
     properties: {
       paths: { type: "array", items: { type: "string" }, description: "Files or directories to analyse, relative to the workspace root. Default: the whole project" },
       enable: { type: "string", description: "cppcheck checks to enable, default `warning,style,performance,portability`" },
+      thorough: { type: "boolean", description: "Use cppcheck's most expensive analysis (all checks, inconclusive, exhaustive value flow). Slower; use it when a defect is suspected and the default run was clean." },
       max_files: { type: "integer", description: "Cap on files analysed, default 400" },
     },
     additionalProperties: false,
@@ -792,6 +793,7 @@ const analyzeTool: Tool = {
       cwd: ctx.cwd,
       ...(Array.isArray(input.paths) ? { paths: input.paths.map(String) } : {}),
       ...(input.enable ? { enable: String(input.enable) } : {}),
+      ...(input.thorough !== undefined ? { thorough: Boolean(input.thorough) } : {}),
       ...(input.max_files !== undefined ? { maxFiles: Number(input.max_files) } : {}),
     });
 
