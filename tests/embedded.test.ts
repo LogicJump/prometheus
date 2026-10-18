@@ -16,6 +16,7 @@ import { classifyOutput, commandFor, flash, parseSize, validate } from "../src/e
 import { findArtifacts } from "../src/embedded/build.ts";
 import { miFields, miList, parseMiLine, parseStackFrames, parseStopReason, parseVariables, SERVER_PORTS, serverCommand } from "../src/embedded/debug.ts";
 import { findRegister, parseSvd, peripheralIndex, registerAddress } from "../src/embedded/svd.ts";
+import { parseClangTidyYaml, parseCppcheckXml, parseMemoryUsage, parseStackUsage } from "../src/embedded/analyze.ts";
 import { existsSync } from "node:fs";
 
 function scratch(prefix: string): string {
@@ -718,4 +719,78 @@ test("reading a real vendor SVD gives the right register addresses", { skip: !ha
   // The whole chip's index stays inside a context window.
   const index = peripheralIndex(device);
   assert.ok(index.length < 20_000, `index is ${index.length} chars, too big for the context`);
+});
+
+// ---- static analysis -------------------------------------------------------
+
+test("cppcheck XML becomes findings with code, CWE and supporting locations", () => {
+  const xml = `<?xml version="1.0"?>
+<results version="2"><cppcheck version="2.19.0"/><errors>
+  <error id="arrayIndexOutOfBounds" severity="error" msg="Array &apos;arr[4]&apos; accessed at index 10." cwe="788" file0="bad.c">
+    <location file="bad.c" line="5" column="6" info="Array index out of bounds"/>
+  </error>
+  <error id="nullPointerRedundantCheck" severity="warning" msg="Possible null pointer dereference: p." cwe="476" file0="bad.c">
+    <location file="bad.c" line="10" column="12" info="Null pointer dereference"/>
+    <location file="bad.c" line="9" column="7" info="Assuming the condition is not redundant"/>
+    <symbol>p</symbol>
+  </error>
+</results>`;
+  const findings = parseCppcheckXml(xml);
+  assert.equal(findings.length, 2);
+
+  const oob = findings[0];
+  assert.equal(oob.severity, "error");
+  assert.equal(oob.rule, "arrayIndexOutOfBounds");
+  assert.equal(oob.cwe, "788");
+  assert.equal(oob.line, 5);
+  // The entities in the analyser's own message are decoded.
+  assert.match(oob.message, /arr\[4\]/);
+
+  // The second location is supporting evidence, not a separate finding.
+  assert.equal(findings[1].notes?.length, 1);
+  assert.equal(findings[1].notes?.[0].line, 9);
+});
+
+test("cppcheck's style severity is advisory, not an error", () => {
+  const xml = `<results><errors>
+    <error id="unreadVariable" severity="style" msg="never used">
+      <location file="a.c" line="3" column="7"/>
+    </error>
+  </errors></results>`;
+  const [finding] = parseCppcheckXml(xml);
+  assert.equal(finding.severity, "note");
+});
+
+test("an empty or malformed analysis is empty, not a crash", () => {
+  assert.deepEqual(parseCppcheckXml(""), []);
+  assert.deepEqual(parseCppcheckXml("<results><errors></errors></results>"), []);
+  assert.deepEqual(parseCppcheckXml("not xml at all"), []);
+});
+
+test("clang-tidy YAML yields the checker name and a level", () => {
+  const yaml = `---\nMainSourceFile:  'src/main.cpp'\nDiagnostics:\n  - DiagnosticName:  'bugprone-use-after-move'\n    Message:         'std::move of the variable is used after'\n    Level:           Warning\n    BuildDirectory:  '/tmp/build'\n    FilePath:        'src/main.cpp'\n    FileOffset:      128\n`;
+  const findings = parseClangTidyYaml(yaml);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].analyzer, "clang-tidy");
+  assert.equal(findings[0].severity, "warning");
+  assert.match(findings[0].message, /used after/);
+  assert.equal(findings[0].file, "src/main.cpp");
+});
+
+test("linker memory usage separates used from total", () => {
+  const output = "Memory region         Used Size  Region Size  %age Used\n           FLASH:       12345 B        64 KB     18.83%\n             RAM:        4096 B       128 KB      3.13%";
+  const regions = parseMemoryUsage(output);
+  assert.equal(regions.length, 2);
+  assert.equal(regions[0].region, "FLASH");
+  assert.equal(regions[0].used, 12345);
+  assert.equal(regions[0].total, 64000);
+});
+
+test("stack usage marks a dynamic frame as a lower bound", () => {
+  const su = "src/main.c:12:5:main\t128\tstatic\nsrc/main.c:30:6:recurse\t64\tdynamic\nsrc/lib.c:4:7:helper\t24\tstatic";
+  const frames = parseStackUsage(su);
+  // Largest first: that is the one that risks the stack.
+  assert.equal(frames[0].function, "main");
+  assert.equal(frames[0].bytes, 128);
+  assert.equal(frames.find((frame) => frame.function === "recurse")?.kind, "dynamic");
 });

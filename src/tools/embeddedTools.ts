@@ -18,7 +18,7 @@
 
 import type { Tool, ToolContext, ToolResult } from "../types.ts";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { build } from "../embedded/build.ts";
 import { flash, type FlasherKind } from "../embedded/flash.ts";
@@ -27,6 +27,7 @@ import { listProbes, listTargets, matchTarget } from "../embedded/probe.ts";
 import { detectToolchains } from "../embedded/toolchain.ts";
 import { detectProject, buildCommand } from "../embedded/project.ts";
 import { findRegister, parseSvd, peripheralDetail } from "../embedded/svd.ts";
+import { analyze, parseStackUsage } from "../embedded/analyze.ts";
 import {
   MiSession,
   type MiRecord,
@@ -769,6 +770,76 @@ const registersTool: Tool = {
   },
 };
 
+// ---- embed_analyze ---------------------------------------------------------
+
+const analyzeTool: Tool = {
+  name: "embed_analyze",
+  description:
+    "Run static analysis (cppcheck, and clang-tidy when installed) over the firmware and return findings ranked by severity. Finds the bugs that compile cleanly and then fail on the board: out-of-bounds indices, null dereferences, uninitialised reads. Also reports flash/RAM headroom and worst-case stack depth when the build produced them. Use it after embed_build succeeds and before embedding_flash — a clean link is not a correct program.",
+  readonly: true,
+  parameters: {
+    type: "object",
+    properties: {
+      paths: { type: "array", items: { type: "string" }, description: "Files or directories to analyse, relative to the workspace root. Default: the whole project" },
+      enable: { type: "string", description: "cppcheck checks to enable, default `warning,style,performance,portability`" },
+      max_files: { type: "integer", description: "Cap on files analysed, default 400" },
+    },
+    additionalProperties: false,
+  },
+  summarize: (input) => (Array.isArray(input.paths) ? input.paths.join(" ") : "static analysis"),
+  async execute(input, ctx): Promise<ToolResult> {
+    const result = await analyze({
+      cwd: ctx.cwd,
+      ...(Array.isArray(input.paths) ? { paths: input.paths.map(String) } : {}),
+      ...(input.enable ? { enable: String(input.enable) } : {}),
+      ...(input.max_files !== undefined ? { maxFiles: Number(input.max_files) } : {}),
+    });
+
+    const lines = [result.summary];
+    // The `.su` files a `-fstack-usage` build leaves behind answer the question
+    // static analysis cannot: how much stack will this actually use.
+    const stack = worstStack(ctx.cwd);
+    if (stack.length > 0) {
+      lines.push("", "largest stack frames (from .su files):");
+      for (const frame of stack.slice(0, 8)) {
+        lines.push(`  ${frame.bytes} B  ${frame.function}${frame.kind === "dynamic" ? " (dynamic — a lower bound)" : ""}  ${frame.file}:${frame.line}`);
+      }
+    }
+
+    return {
+      ...(result.ok ? {} : { isError: true }),
+      content: lines.join("\n"),
+      display: `${result.findings.length} finding(s)`,
+    };
+  },
+};
+
+/** The biggest `.su` frames found anywhere in the build tree. */
+function worstStack(cwd: string): ReturnType<typeof parseStackUsage> {
+  const frames: ReturnType<typeof parseStackUsage> = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 4) return;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry);
+      try {
+        const stat = statSync(full);
+        if (stat.isDirectory()) walk(full, depth + 1);
+        else if (entry.endsWith(".su")) frames.push(...parseStackUsage(readFileSync(full, "utf8")));
+      } catch {
+        /* vanished */
+      }
+    }
+  };
+  walk(cwd, 0);
+  return frames.sort((a, b) => b.bytes - a.bytes);
+}
+
 export const embeddedTools: Tool[] = [
   buildTool,
   flashTool,
@@ -778,4 +849,5 @@ export const embeddedTools: Tool[] = [
   projectTool,
   debugTool,
   registersTool,
+  analyzeTool,
 ];

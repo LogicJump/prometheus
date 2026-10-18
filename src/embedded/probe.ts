@@ -42,6 +42,8 @@ export interface Target {
   source: ProbeKind;
   /** pyOCD's own origin for the target: builtin, a CMSIS pack, or cbuild-run. */
   packSource?: string;
+  /** The register-map file this target names, when the tool reports one. */
+  svdPath?: string;
 }
 
 export interface DiscoveryResult {
@@ -157,6 +159,39 @@ export async function listProbes(available: Partial<Record<ProbeKind, string>>):
  * most builtin targets — so the source is identified by value, not position,
  * and anything left over is taken as the family.
  */
+/**
+ * pyOCD's target table.
+ *
+ * `pyocd json --targets` is the machine interface and is preferred: it carries
+ * `svd_path`, which is the only cheap way to find the register map for a part.
+ * `pyocd list --targets` is the fallback for older pyOCD, and its space-aligned
+ * table has to be split on runs of spaces because a cell can contain one.
+ */
+export async function parsePyocdTargetsOutput(output: string): Promise<Target[]> {
+  const text = output.trim();
+  if (text.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text) as {
+        targets?: { name?: string; vendor?: string; part_number?: string; part_families?: string[]; source?: string; svd_path?: string }[];
+      };
+      return (parsed.targets ?? [])
+        .filter((entry) => entry.name)
+        .map((entry) => ({
+          name: String(entry.name),
+          vendor: String(entry.vendor ?? ""),
+          ...(entry.part_number && entry.part_number !== entry.name ? { part: entry.part_number } : {}),
+          ...(entry.part_families?.length ? { families: entry.part_families } : {}),
+          source: "pyocd" as const,
+          ...(entry.source ? { packSource: entry.source } : {}),
+          ...(entry.svd_path ? { svdPath: entry.svd_path } : {}),
+        }));
+    } catch {
+      /* fall through to the table parser */
+    }
+  }
+  return parsePyocdTargets(text);
+}
+
 export function parsePyocdTargets(output: string): Target[] {
   const SOURCES = new Set(["builtin", "pack", "cbuild-run"]);
   const targets: Target[] = [];
@@ -198,12 +233,19 @@ export async function listTargets(
   if (!available.pyocd) {
     return { targets: [], notes: ["pyocd: not installed, no target table available"], total: 0 };
   }
-  const result = await run(available.pyocd, ["list", "--targets", "-H"], 40000);
+  // The JSON subcommand is the machine interface; `list --targets -H` is the
+  // fallback for pyOCD versions that predate it.
+  let result = await run(available.pyocd, ["json", "--targets"], 40_000);
+  let fromJson = true;
+  if (!result.ok || !result.out.trim().startsWith("{")) {
+    result = await run(available.pyocd, ["list", "--targets", "-H"], 40_000);
+    fromJson = false;
+  }
   const text = result.out || result.err;
   if (!result.ok && !text) {
     return { targets: [], notes: ["pyocd: listing targets failed"], total: 0 };
   }
-  let targets = parsePyocdTargets(text);
+  let targets = await parsePyocdTargetsOutput(text);
   const total = targets.length;
 
   const filter = options.filter?.toLowerCase();
@@ -219,7 +261,7 @@ export async function listTargets(
 
   const limit = options.limit ?? 0;
   const notes: string[] = [
-    filter ? `pyocd: ${targets.length} of ${total} targets match "${options.filter}"` : `pyocd: ${total} targets`,
+    filter ? `pyocd${fromJson ? " (json)" : ""}: ${targets.length} of ${total} targets match "${options.filter}"` : `pyocd: ${total} targets`,
   ];
   if (limit > 0 && targets.length > limit) {
     targets = targets.slice(0, limit);
