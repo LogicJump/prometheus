@@ -1364,6 +1364,28 @@ mark.find-hit.current {
   clear: both;
 }
 
+/* A compaction seam: two rules with a quiet label between them. */
+.compact-marker {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 780px;
+  margin: 4px auto 24px;
+  padding: 0 28px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.compact-line {
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.compact-label {
+  white-space: nowrap;
+}
+
 /* Rewind is a quiet action: visible on hover, never competing with the text. */
 .turn.user {
   position: relative;
@@ -1791,6 +1813,12 @@ mark.find-hit.current {
 .composer-region {
   flex: 0 0 auto;
   padding: 0 28px 16px;
+}
+
+.pending-choices {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .pending-permission {
@@ -3214,6 +3242,45 @@ mark.find-hit.current {
   min-width: 0;
   overflow-y: auto;
   padding: 8px 18px 12px 0;
+}
+
+.rules-field {
+  align-items: flex-start;
+}
+
+.rules-list {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 128px;
+  overflow-y: auto;
+}
+
+.rules-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 11.5px;
+}
+
+.rules-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  color: var(--text-secondary);
+}
+
+.rules-empty {
+  font-size: 11.5px;
+  color: var(--text-faint);
 }
 
 .settings-panes .settings-section {

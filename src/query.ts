@@ -22,6 +22,7 @@
 
 import type { ChatMessage } from "./types.ts";
 import type { ApiTool, ChatClient } from "./llm.ts";
+import type { FallbackChatClient } from "./fallback.ts";
 import type { Config, Usage } from "./types.ts";
 import { compactWithModel, type CompactionLevel } from "./context.ts";
 import { classifyError, type ClassifiedError } from "./errors.ts";
@@ -34,7 +35,7 @@ export type QueryEvent =
   | { type: "thinking"; text: string }
   | { type: "usage"; usage: Usage }
   | { type: "retry"; attempt: number; delayMs: number; message: string }
-  | { type: "compacted"; removed: number; summary: string; before: number; after: number; level: CompactionLevel }
+  | { type: "compacted"; removed: number; summary: string; before: number; after: number; level: CompactionLevel; kept: number }
   | { type: "queued_delivered"; texts: string[] }
   | { type: "warning"; text: string }
   | { type: "turn_end"; reason: TurnEndReason }
@@ -46,7 +47,7 @@ export interface QueryOptions {
   /** Long-lived conversation. Compaction rewrites it in place. */
   messages: ChatMessage[];
   config: Config;
-  client: ChatClient;
+  client: ChatClient | FallbackChatClient;
   pipeline: ToolPipeline;
   /** Recomputed each request so tools added at runtime (MCP) are visible. */
   apiTools: () => ApiTool[];
@@ -131,6 +132,7 @@ export async function* query(options: QueryOptions): AsyncGenerator<QueryEvent, 
         before: compaction.before,
         after: compaction.after,
         level: compaction.level,
+        kept: compaction.messages.length,
       };
     }
 

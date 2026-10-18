@@ -1032,6 +1032,15 @@ function handleEvent(message) {
       fillSettings(message.settings);
       break;
 
+    case "rules": {
+      const current = $("setting-rules");
+      if (current) {
+        renderRules(message.rules ?? []);
+        api.send({ cmd: "getSettings" });
+      }
+      break;
+    }
+
     case "settings_saved":
       if (message.ok) {
         $("settings-note").textContent = t.settingsSaved;
@@ -1123,9 +1132,34 @@ function handleEvent(message) {
       scrollToBottom();
       break;
 
+    case "permission_choice": {
+      // Second-stage question after "always allow": remember all calls of a
+      // tool, or only this exact one.
+      state.pendingPermissionId = message.id;
+      pendingQuestion.textContent = t.rememberScope || message.question;
+      const choices = $("pending-choices");
+      choices.innerHTML = "";
+      for (const option of message.options ?? []) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "btn small";
+        button.textContent = (option.i18nKey && t[option.i18nKey]) || option.label;
+        button.addEventListener("click", () => answerPermission(option.value));
+        choices.appendChild(button);
+      }
+      choices.hidden = false;
+      pendingPermission.hidden = false;
+      pendingPermission.querySelectorAll("[data-permission]").forEach((button) => (button.hidden = true));
+      choices.querySelector("button")?.focus();
+      break;
+    }
+
     case "permission_request":
       state.pendingPermissionId = message.id;
       pendingQuestion.textContent = message.question;
+      $("pending-choices").hidden = true;
+      $("pending-choices").innerHTML = "";
+      pendingPermission.querySelectorAll("[data-permission]").forEach((button) => (button.hidden = false));
       pendingPermission.hidden = false;
       pendingPermission.querySelector('[data-permission="yes"]').focus();
       notifyIfAway(t.notifyNeedsInput, message.question);
@@ -1133,6 +1167,18 @@ function handleEvent(message) {
 
     case "notice":
       addNotice(message.level, message.text);
+      scrollToBottom();
+      break;
+
+    case "compacted":
+      // A visible seam in the transcript: earlier turns were summarised here.
+      addNode(
+        `<div class="compact-marker" title="${escapeHtml(t.compactedDetail(message.before, message.after))}">` +
+          `<span class="compact-line"></span>` +
+          `<span class="compact-label">${escapeHtml(t.compactedLabel(message.removed, message.level))}</span>` +
+          `<span class="compact-line"></span>` +
+          `</div>`,
+      );
       scrollToBottom();
       break;
 
@@ -1162,7 +1208,7 @@ function handleEvent(message) {
     case "session_loaded": {
       const target = scrollTarget();
       target
-        .querySelectorAll(".turn, .tool-row, .tool-output, .notice, .plan, .thinking, .subagent")
+        .querySelectorAll(".turn, .tool-row, .tool-output, .notice, .plan, .thinking, .subagent, .compact-marker")
         .forEach((node) => node.remove());
       state.currentAssistant = null;
       state.currentThinking = null;
@@ -2571,6 +2617,7 @@ function answerPermission(answer) {
   api.send({ cmd: "permission", id: state.pendingPermissionId, answer });
   state.pendingPermissionId = null;
   pendingPermission.hidden = true;
+  $("pending-choices").hidden = true;
   input.focus();
 }
 
@@ -2778,6 +2825,34 @@ function openSetup() {
 
 $("setup-button").addEventListener("click", openSetup);
 
+/** Saved approval rules with a remove action, newest last. */
+function renderRules(rules) {
+  const list = $("setting-rules");
+  list.innerHTML = "";
+  if (rules.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "rules-empty";
+    empty.textContent = t.rulesEmpty;
+    list.appendChild(empty);
+    return;
+  }
+  for (const rule of rules) {
+    const row = document.createElement("div");
+    row.className = "rules-row";
+    const label = document.createElement("span");
+    label.className = "rules-label";
+    label.textContent = `${rule.action === "deny" ? "✕" : "✓"} ${rule.tool}${rule.match ? ` · ${rule.match}` : ""}`;
+    label.title = `${rule.scope}${rule.cwd ? ` · ${rule.cwd}` : ""}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "link-button";
+    remove.textContent = t.rulesRemove;
+    remove.addEventListener("click", () => api.send({ cmd: "removeRule", id: rule.id }));
+    row.append(label, remove);
+    list.appendChild(row);
+  }
+}
+
 function fillSettings(s) {
   state.providers = s.providers || [];
   state.provider = s.provider || "custom";
@@ -2826,6 +2901,8 @@ function fillSettings(s) {
   $("setting-effort").value = s.effort;
   $("setting-max-tokens").value = s.maxTokens;
   $("setting-auto-approve").value = (s.autoApprove ?? []).join(", ");
+  $("setting-fallback").value = (s.fallbackModels ?? []).join(", ");
+  renderRules(s.rules ?? []);
   $("setting-sandbox").value = s.sandbox === "off" ? "off" : "enforce";
   $("setting-network").value = ["off", "proxy", "open"].includes(s.networkPolicy) ? s.networkPolicy : "off";
   state.sandbox = $("setting-sandbox").value;
@@ -2872,6 +2949,7 @@ function saveSettings() {
       effort: $("setting-effort").value,
       maxTokens: Number($("setting-max-tokens").value),
       autoApprove: $("setting-auto-approve").value,
+      fallbackModels: $("setting-fallback").value,
       sandbox: $("setting-sandbox").value,
       networkPolicy: $("setting-network").value,
       contextWindow: Number($("setting-context").value),

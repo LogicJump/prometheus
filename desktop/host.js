@@ -17,6 +17,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { loadConfig, ALLOWED_MODELS, isModelAllowed } from "../src/config.ts";
 import { ChatClient } from "../src/llm.ts";
+import { FallbackChatClient, buildFallbackClients } from "../src/fallback.ts";
 import { Agent } from "../src/agent.ts";
 import { Permissions } from "../src/permissions.ts";
 import { ALL_TOOLS } from "../src/tools/index.ts";
@@ -28,6 +29,7 @@ import { buildChange } from "../src/diff.ts";
 import { loadCheckpoints, restoreTo, restoreAfterMessage, clearCheckpoints, captureBefore } from "../src/checkpoints.ts";
 import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src/workspace.ts";
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
+import { loadRules, removeRule } from "../src/rules.ts";
 import { publicProviders, providerFor } from "../src/providers.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
@@ -110,6 +112,30 @@ async function refreshCatalog(force = false) {
   applyModelContext(config.model);
   emitState();
   send({ type: "models", models: pickerModels(), model: config.model, source: next.source, fetchedAt: next.fetchedAt });
+}
+
+/**
+ * Build the client for the current config: a primary plus the configured
+ * fallbacks. The agent only ever sees the wrapper.
+ */
+function makeClient() {
+  const primary = new ChatClient({
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    model: config.model,
+    maxTokens: config.maxTokens,
+    reasoningEffort: config.thinkingEffort,
+    timeoutMs: 300_000,
+  });
+  const ids = Array.isArray(config.fallbackModels) ? config.fallbackModels : [];
+  if (ids.length === 0) return primary;
+  return new FallbackChatClient({
+    primary,
+    fallbacks: () => buildFallbackClients(primary, ids),
+    onFallback: (from, to, reason) => {
+      send({ type: "notice", level: "warn", text: `model ${from} unavailable (${reason}); retried with ${to}` });
+    },
+  });
 }
 
 /** Per-session change set: prior content of every file the agent touched. */
@@ -268,6 +294,21 @@ class HostUi {
     send({ type: "permission_request", id, question });
     return await new Promise((resolve) => pendingPermissions.set(id, resolve));
   }
+  async ask(question, options) {
+    // The permission bar is still open in this flow, so reuse its answer channel
+    // with a distinct message shape the renderer renders as extra buttons.
+    const id = ++permissionSeq;
+    // Options travel with a stable value plus a localisation key; the renderer
+    // translates the key and falls back to the English label.
+    const withKeys = options.map((option) => ({
+      ...option,
+      i18nKey: option.value === "always-tool" ? "rememberTool" : option.value === "always-detail" ? "rememberDetail" : "",
+    }));
+    send({ type: "permission_choice", id, question, options: withKeys });
+    const answer = await new Promise((resolve) => pendingPermissions.set(id, resolve));
+    pendingPermissions.delete(id);
+    return answer;
+  }
   takeLineDirty() {
     return false;
   }
@@ -352,7 +393,12 @@ function createAgent(messages = []) {
   agent.onBeforeMutate = (name, input) => recordChange(name, input);
   // Compaction rewrote the history; persist the new generation immediately so
   // an interrupted turn cannot leave a stale transcript on disk.
-  agent.onCompacted = () => persist();
+  agent.onCompacted = (info) => {
+    persist();
+    // The transcript shows a marker at the point where context was compressed,
+    // so a long session never silently loses its earlier turns.
+    send({ type: "compacted", ...info });
+  };
   // Stream token accounting to the window as the turn runs, so the meter is
   // live instead of jumping only when the turn ends.
   agent.onQueryEvent = (event) => {
@@ -494,14 +540,7 @@ async function handle(cmd) {
         send({ type: "fatal", message: err.message });
         return;
       }
-      client = new ChatClient({
-        baseUrl: config.baseUrl,
-        apiKey: config.apiKey,
-        model: config.model,
-        maxTokens: config.maxTokens,
-        reasoningEffort: config.thinkingEffort,
-        timeoutMs: 300_000,
-      });
+      client = makeClient();
       createAgent([]);
       send({ type: "ready" });
       void emitGitStatus();
@@ -546,8 +585,17 @@ async function handle(cmd) {
           effort: config?.thinkingEffort ?? "auto",
           maxTokens: config?.maxTokens ?? 16000,
           autoApprove: config?.autoApprove ?? [],
+          fallbackModels: config?.fallbackModels ?? [],
           sandbox: config?.sandbox ?? "enforce",
           networkPolicy: config?.networkPolicy ?? "off",
+          rules: loadRules().map((rule) => ({
+            id: rule.id,
+            tool: rule.tool,
+            match: rule.match ?? "",
+            action: rule.action,
+            scope: rule.scope,
+            cwd: rule.cwd ?? "",
+          })),
           contextWindow: config?.contextWindow ?? 1_000_000,
           modelContext: config ? catalog.models.find((model) => model.id === config.model)?.contextLength ?? null : null,
           locale,
@@ -581,6 +629,10 @@ async function handle(cmd) {
       }
       if (patch.sandbox === "off" || patch.sandbox === "enforce") filePatch.sandbox = patch.sandbox;
       if (["off", "proxy", "open"].includes(patch.networkPolicy)) filePatch.networkPolicy = patch.networkPolicy;
+      if (typeof patch.fallbackModels === "string" || Array.isArray(patch.fallbackModels)) {
+        const list = Array.isArray(patch.fallbackModels) ? patch.fallbackModels : String(patch.fallbackModels).split(",");
+        filePatch.fallbackModels = list.map((model) => String(model).trim()).filter((model) => model && model !== String(patch.model ?? ""));
+      }
       if (typeof patch.autoApprove === "string" || Array.isArray(patch.autoApprove)) {
         const list = Array.isArray(patch.autoApprove) ? patch.autoApprove : String(patch.autoApprove).split(",");
         filePatch.autoApprove = list.map((name) => String(name).trim()).filter(Boolean);
@@ -595,19 +647,13 @@ async function handle(cmd) {
         }
         if (isLocale(patch.locale)) locale = patch.locale;
         config = loadConfig({ permissionMode: config.permissionMode });
-        client = new ChatClient({
-          baseUrl: config.baseUrl,
-          apiKey: config.apiKey,
-          model: config.model,
-          maxTokens: config.maxTokens,
-          reasoningEffort: config.thinkingEffort,
-          timeoutMs: 300_000,
-        });
+        client = makeClient();
         permissions.mode = config.permissionMode;
         agent.config.model = config.model;
         agent.config.maxTokens = config.maxTokens;
         agent.config.contextWindow = config.contextWindow;
         agent.config.autoApprove = config.autoApprove;
+        agent.config.fallbackModels = config.fallbackModels;
         agent.config.sandbox = config.sandbox;
         agent.config.networkPolicy = config.networkPolicy;
         agent.config.thinkingEffort = config.thinkingEffort;
@@ -764,14 +810,7 @@ async function handle(cmd) {
         sessionId = newSessionId();
         try {
           config = loadConfig({ permissionMode: config.permissionMode });
-          client = new ChatClient({
-            baseUrl: config.baseUrl,
-            apiKey: config.apiKey,
-            model: config.model,
-            maxTokens: config.maxTokens,
-            reasoningEffort: config.thinkingEffort,
-            timeoutMs: 300_000,
-          });
+          client = makeClient();
         } catch (err) {
           send({ type: "fatal", message: err.message });
           return;
@@ -817,6 +856,11 @@ async function handle(cmd) {
         send({ type: "notice", level: "error", text: err.message });
       }
       return;
+    case "removeRule": {
+      const removed = removeRule(String(cmd.id ?? ""));
+      send({ type: "rules", rules: loadRules(), removed });
+      return;
+    }
     case "getCheckpoints":
       send({ type: "checkpoints", ...loadCheckpoints(sessionId) });
       return;

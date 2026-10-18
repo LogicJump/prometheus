@@ -41,6 +41,7 @@ interface FileConfig {
   autoApprove?: string[];
   sandbox?: "off" | "enforce";
   networkPolicy?: "off" | "proxy" | "open";
+  fallbackModels?: string[];
 }
 
 function readJson(path: string): FileConfig {
@@ -120,6 +121,7 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
       validNetwork(process.env.PROMETHEUS_NETWORK_POLICY) ??
       file.networkPolicy ??
       "off",
+    fallbackModels: cli.fallbackModels ?? file.fallbackModels ?? [],
   };
 
   if (!config.apiKey) {

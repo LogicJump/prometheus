@@ -30,7 +30,17 @@ export const dictionaries = {
     noProject: "No project",
     newSessionIn: (name) => `New chat in ${name}`,
     clearSession: "Clear conversation",
+    rememberScope: "Remember this approval for…",
+    rememberTool: "Every call of this tool",
+    rememberDetail: "Only this exact call",
+    rulesTitle: "Saved approvals",
+    rulesEmpty: "No saved approvals yet.",
+    rulesRemove: "Remove",
+
     rewindHere: "Rewind to here",
+    compactedLabel: (removed, level) => `context compacted · ${removed} earlier message${removed === 1 ? "" : "s"} (${level})`,
+    compactedDetail: (before, after) => `About ${before} tokens summarized into ${after}`,
+
     rewindTitle: "Undo this turn and every turn after it, restoring the files it changed",
     rewindConfirm: "Rewind to this message? Later turns are dropped and the files they changed are restored.",
 
@@ -181,6 +191,8 @@ export const dictionaries = {
     settingsAutoApprove: "Auto-approve tools",
     settingsContext: "Context window",
     settingsSandbox: "Command isolation",
+    settingsFallback: "Fallback models",
+    settingsFallbackHint: "Tried in order when the active model is unavailable. Comma separated.",
     sandboxEnforce: "On",
     sandboxOff: "Off",
     settingsNetwork: "Command network",
@@ -274,7 +286,17 @@ export const dictionaries = {
     noProject: "无项目",
     newSessionIn: (name) => `在 ${name} 中新建对话`,
     clearSession: "清空对话",
+    rememberScope: "记住这次批准的范围…",
+    rememberTool: "该工具的所有调用",
+    rememberDetail: "仅限这一次调用",
+    rulesTitle: "已保存的批准",
+    rulesEmpty: "还没有保存的批准规则。",
+    rulesRemove: "删除",
+
     rewindHere: "回退到这里",
+    compactedLabel: (removed, level) => `上下文已压缩 · 早先 ${removed} 条消息（${level}）`,
+    compactedDetail: (before, after) => `约 ${before} tokens 被总结为 ${after}`,
+
     rewindTitle: "撤销这一轮及其之后的所有轮次，并恢复被改动的文件",
     rewindConfirm: "回退到这条消息？之后的对话会被删除，相关文件改动会恢复。",
 
@@ -425,6 +447,8 @@ export const dictionaries = {
     settingsAutoApprove: "自动批准的工具",
     settingsContext: "上下文窗口",
     settingsSandbox: "命令隔离",
+    settingsFallback: "备用模型",
+    settingsFallbackHint: "当前模型不可用时按顺序尝试，用逗号分隔。",
     sandboxEnforce: "开启",
     sandboxOff: "关闭",
     settingsNetwork: "命令网络",

@@ -6,6 +6,7 @@ import {
   listFilesTool,
   globTool,
   grepTool,
+  searchCodeTool,
 } from "./fileTools.ts";
 import { bashTool, todoTool } from "./shellTools.ts";
 import { saveMemory } from "../memory.ts";
@@ -38,22 +39,50 @@ const memoryTool: Tool = {
   },
 };
 
-const subagentTool: Tool = {
+export const subagentTool: Tool = {
   name: "delegate",
   description:
-    "Run an independent sub-task in a fresh context with its own tool access, and return only a final report. Use it for broad searches or self-contained work that would otherwise flood your context. The sub-agent cannot ask the user questions; give it a complete, self-contained prompt.",
+    "Run independent sub-tasks in fresh contexts with their own tool access, returning only final reports. Use `prompt` for one task, or `prompts` to run up to four independent tasks in parallel. Use it for broad searches or self-contained work that would otherwise flood your context. Sub-agents cannot ask the user questions; give each a complete, self-contained prompt.",
   readonly: false,
   parameters: {
     type: "object",
     properties: {
       prompt: { type: "string", description: "Self-contained task description, including what to return" },
+      prompts: {
+        type: "array",
+        description: "Several independent sub-tasks to run in parallel (max 4). Results come back in order.",
+        items: { type: "string" },
+        maxItems: 4,
+      },
     },
-    required: ["prompt"],
     additionalProperties: false,
   },
-  summarize: (input) => String(input.prompt ?? "").slice(0, 100),
+  summarize: (input) => {
+    const many = Array.isArray(input.prompts) ? input.prompts.length : 0;
+    if (many > 0) return `${many} sub-tasks in parallel`;
+    return String(input.prompt ?? "").slice(0, 100);
+  },
   async execute(input, ctx) {
-    const report = await ctx.runSubagent(String(input.prompt));
+    const prompts = Array.isArray(input.prompts) ? input.prompts.map(String).filter(Boolean).slice(0, 4) : [];
+    if (prompts.length > 0) {
+      if (!ctx.runSubagents) {
+        return { isError: true, content: "parallel sub-agents are not available in this session" };
+      }
+      const results = await ctx.runSubagents(prompts);
+      const sections = results.map((result, index) => {
+        const header = `## Sub-task ${index + 1}${result.ok ? "" : " (failed)"}`;
+        return `${header}\n${result.report}`;
+      });
+      const failed = results.filter((result) => !result.ok).length;
+      return {
+        content: sections.join("\n\n"),
+        display: failed ? `${failed}/${results.length} failed` : `${results.length} finished`,
+        isError: failed === results.length,
+      };
+    }
+    const single = String(input.prompt ?? "").trim();
+    if (!single) return { isError: true, content: "Provide a prompt or a prompts array." };
+    const report = await ctx.runSubagent(single);
     return { content: report, display: "sub-agent finished" };
   },
 };
@@ -61,6 +90,7 @@ const subagentTool: Tool = {
 /** Tools available to the sub-agent: no nested delegation. */
 export const SUBAGENT_TOOLS: Tool[] = [
   readFileTool,
+  searchCodeTool,
   writeFileTool,
   editFileTool,
   listFilesTool,
@@ -72,6 +102,7 @@ export const SUBAGENT_TOOLS: Tool[] = [
 
 export const ALL_TOOLS: Tool[] = [
   readFileTool,
+  searchCodeTool,
   writeFileTool,
   editFileTool,
   listFilesTool,

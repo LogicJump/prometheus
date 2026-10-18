@@ -6,6 +6,7 @@ import type { Config, PermissionManager, PermissionMode, Tool } from "./types.ts
 import type { TerminalUi } from "./ui.ts";
 import { CONFIG_HOME } from "./config.ts";
 import { classifyCommand, type SandboxPolicy } from "./sandbox.ts";
+import { matchRule, ruleFromChoice, rulesFor, type ApprovalRule } from "./rules.ts";
 
 
 export class Permissions implements PermissionManager {
@@ -13,6 +14,7 @@ export class Permissions implements PermissionManager {
   private readonly config: Config;
   private readonly ui: TerminalUi;
   private readonly always = new Set<string>();
+  private readonly rules: ApprovalRule[];
   private readonly logPath: string;
 
   constructor(config: Config, ui: TerminalUi) {
@@ -20,6 +22,7 @@ export class Permissions implements PermissionManager {
     this.ui = ui;
     this.mode = config.permissionMode;
     for (const name of config.autoApprove) this.always.add(name);
+    this.rules = rulesFor(process.cwd());
     mkdirSync(CONFIG_HOME, { recursive: true });
     this.logPath = join(CONFIG_HOME, "audit.log");
   }
@@ -44,6 +47,17 @@ export class Permissions implements PermissionManager {
         if (verdict.class === "confirm") return this.prompt(tool.name, `${summary} (${verdict.reason})`);
       }
       return this.allow(tool.name, summary);
+    }
+
+    // Saved rules apply to every mode below plan; a deny beats a prompt.
+    const rule = matchRule(this.rules, tool.name, summary);
+    if (rule) {
+      if (rule.action === "deny") {
+        this.audit(tool.name, summary, "denied by rule");
+        return { allowed: false, reason: `a saved rule denies ${tool.name} for "${summary}"` };
+      }
+      this.audit(tool.name, summary, "allowed by rule");
+      return { allowed: true };
     }
 
     if (this.always.has(tool.name)) return this.allow(tool.name, summary);

@@ -31,6 +31,8 @@ export interface PipelineDeps {
   onBeforeMutate?: ((toolName: string, input: Record<string, unknown>) => void) | null;
   /** Run a sub-task; only the top-level agent provides this. */
   runSubagent: (prompt: string) => Promise<string>;
+  /** Run several sub-tasks concurrently (optional; falls back to serial). */
+  runSubagents?: (prompts: string[]) => Promise<{ ok: boolean; report: string }[]>;
   /** Conversation length right now, recorded on each checkpoint for rewind. */
   messageIndex?: () => number;
   /** Skip permission prompts and hooks (sub-agents run under the parent's grant). */
@@ -149,6 +151,7 @@ export class ToolPipeline {
       ui,
       todo: this.deps.todos,
       runSubagent: this.deps.runSubagent,
+      ...(this.deps.runSubagents ? { runSubagents: this.deps.runSubagents } : {}),
     };
     let result: ToolResult;
     try {

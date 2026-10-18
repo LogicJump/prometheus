@@ -10,6 +10,7 @@
 import os from "node:os";
 import type { ChatMessage } from "./types.ts";
 import { ChatClient, type ApiTool } from "./llm.ts";
+import type { FallbackChatClient } from "./fallback.ts";
 import type { Config, TodoList, Tool, Usage, UserContentPart } from "./types.ts";
 import type { TerminalUi } from "./ui.ts";
 import { Permissions } from "./permissions.ts";
@@ -37,7 +38,11 @@ export class Agent {
   readonly config: Config;
   /** Not readonly: a sub-agent gets a proxy that folds its tool activity into the parent's view. */
   ui: TerminalUi;
-  readonly client: ChatClient;
+  /**
+   * The primary client. A `FallbackChatClient` has the same chat shape, so the
+   * loop and the summarizer use it without knowing whether a fallback exists.
+   */
+  readonly client: ChatClient | FallbackChatClient;
   readonly todos: TodoList = { items: [] };
   usage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
   /** Set by the host so file mutations can be checkpointed per session. */
@@ -47,7 +52,9 @@ export class Agent {
   /** Set by the host so a turn can stream to the renderer instead of a terminal. */
   onQueryEvent: ((event: QueryEvent) => void) | null = null;
   /** Called by the host so it can persist or count a compacted history. */
-  onCompacted: ((info: { removed: number; before: number; after: number; summary: string }) => void) | null = null;
+  onCompacted:
+    | ((info: { removed: number; before: number; after: number; summary: string; level: string; kept: number }) => void)
+    | null = null;
 
   /** Mutable so MCP tools can be added after startup. */
   private tools: Tool[];
@@ -61,7 +68,7 @@ export class Agent {
   constructor(
     config: Config,
     ui: TerminalUi,
-    client: ChatClient,
+    client: ChatClient | FallbackChatClient,
     tools: Tool[] = ALL_TOOLS,
     permissions: Permissions = new Permissions(config, ui),
     messages: ChatMessage[] = [],
@@ -200,6 +207,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         sessionId: this.sessionId,
         onBeforeMutate: this.onBeforeMutate,
         runSubagent: (prompt) => this.runSubagent(prompt, this.abortController?.signal ?? new AbortController().signal),
+        runSubagents: (prompts) => this.runSubagents(prompts, this.abortController?.signal ?? new AbortController().signal),
         messageIndex: () => this.messages.length,
         trusted: this.isSubagent,
         cwd: process.cwd(),
@@ -282,7 +290,14 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         break;
       case "compacted":
         ui.dim(`compacted (${event.level}) ${event.removed} earlier messages (~${event.before} -> ~${event.after} tokens)`);
-        this.onCompacted?.({ removed: event.removed, before: event.before, after: event.after, summary: event.summary });
+        this.onCompacted?.({
+          removed: event.removed,
+          before: event.before,
+          after: event.after,
+          summary: event.summary,
+          level: event.level,
+          kept: event.kept,
+        });
         break;
       case "queued_delivered":
         // The query loop already appended the user turns; echo them here.
@@ -304,10 +319,8 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     }
   }
 
-  private async runSubagent(prompt: string, signal: AbortSignal): Promise<string> {
-    if (this.isSubagent) throw new Error("sub-agents cannot spawn sub-agents");
-    this.ui.info("  ↳ sub-agent started");
-    this.ui.subagentStart?.(prompt);
+  /** Build one isolated child agent for a sub-task, with a proxied UI. */
+  private spawnSubagent(label: string): Agent {
     const child = new Agent(
       { ...this.config, maxTurns: Math.min(25, this.config.maxTurns) },
       this.ui,
@@ -322,13 +335,20 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     child.ui = new Proxy(parentUi, {
       get(target, property, receiver) {
         if (property === "toolStart") {
-          return (name: string, summary: string) => parentUi.subagentActivity?.("tool", `${name} ${summary}`);
+          return (name: string, summary: string) => parentUi.subagentActivity?.("tool", `${label}: ${name} ${summary}`);
         }
         return Reflect.get(target, property, receiver);
       },
     }) as TerminalUi;
     child.abortController = new AbortController();
-    // Propagate parent cancellation to the child.
+    return child;
+  }
+
+  private async runSubagent(prompt: string, signal: AbortSignal): Promise<string> {
+    if (this.isSubagent) throw new Error("sub-agents cannot spawn sub-agents");
+    this.ui.info("  ↳ sub-agent started");
+    this.ui.subagentStart?.(prompt);
+    const child = this.spawnSubagent("sub-agent");
     const onAbort = () => child.abort();
     signal.addEventListener("abort", onAbort, { once: true });
     try {
@@ -347,6 +367,49 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       signal.removeEventListener("abort", onAbort);
       child.abortController = null;
     }
+  }
+
+  /**
+   * Run independent sub-tasks concurrently. Each child has its own abort
+   * controller (so one failure does not cancel the others) and its own
+   * transcript; only the reports come back.
+   */
+  private async runSubagents(prompts: string[], signal: AbortSignal): Promise<{ ok: boolean; report: string }[]> {
+    if (this.isSubagent) throw new Error("sub-agents cannot spawn sub-agents");
+    this.ui.info(`  ↳ ${prompts.length} sub-agents started in parallel`);
+    const children = prompts.map((prompt, index) => {
+      this.ui.subagentStart?.(`[${index + 1}] ${prompt}`);
+      return { prompt, index, child: this.spawnSubagent(`#${index + 1}`) };
+    });
+    const onAbort = () => children.forEach(({ child }) => child.abort());
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    const results = await Promise.all(
+      children.map(async ({ prompt, index, child }) => {
+        try {
+          await child.run(prompt);
+          const text = [...child.messages].reverse().find((m) => m.role === "assistant" && m.content);
+          this.usage.inputTokens += child.usage.inputTokens;
+          this.usage.outputTokens += child.usage.outputTokens;
+          const report = typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
+          this.ui.subagentEnd?.(true, `#${index + 1} ${report.slice(0, 120)}`);
+          return { ok: true, report };
+        } catch (err) {
+          this.ui.subagentEnd?.(false, `#${index + 1} ${(err as Error).message}`);
+          return { ok: false, report: `sub-agent failed: ${(err as Error).message}` };
+        } finally {
+          child.abortController = null;
+        }
+      }),
+    );
+    signal.removeEventListener("abort", onAbort);
+    this.ui.info(`  ↳ ${results.filter((result) => result.ok).length}/${results.length} sub-agents finished`);
+    return results;
+  }
+
+  /** Test seam for the parallel path; the delegate tool uses the pipeline copy. */
+  async runSubagentsForTest(prompts: string[], signal: AbortSignal): Promise<{ ok: boolean; report: string }[]> {
+    return this.runSubagents(prompts, signal);
   }
 
   contextUsage(): { tokens: number; percent: number } {

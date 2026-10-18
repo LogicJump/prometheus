@@ -97,7 +97,7 @@ The runtime is six layers, each with one job:
 | Main loop | `src/query.ts` | One async-generator state machine: compact → request → stream → tools. Yields events; never touches a UI. |
 | Errors | `src/errors.ts` | Two-level classification: recoverable (retry with backoff) vs terminal (end the turn). |
 | Model access | `src/providers.ts` | Declarative provider registry over one OpenAI-compatible adapter. No protocol fallbacks, no OAuth. |
-| Context | `src/context.ts` | Three-level progressive compaction, all local. |
+| Context | `src/context.ts` | Three-level progressive compaction: trim locally, summarize with the session model, then clip. Falls back to the local summary on any failure. |
 | Tools | `src/tools/pipeline.ts` | Five-stage pipeline: resolve → guard → prepare → execute → settle. |
 | MCP | `src/mcp.ts` | stdio + Streamable HTTP transports, user/project scopes. |
 | Sessions | `src/sessions.ts` | Append-only JSONL, one generation file per compaction, legacy files migrate on write. |
@@ -209,19 +209,20 @@ turn.
 | --- | --- |
 | `read_file` | Numbered lines, with offset/limit and a binary-file guard |
 | `write_file` | Create or overwrite a file |
-| `edit_file` | Exact-match replacement; refuses ambiguous matches |
+| `edit_file` | Match ladder (exact → whitespace → indent → anchor), multi-edit and SEARCH/REPLACE patches, atomic per call |
 | `list_files` | Shallow tree view |
 | `glob` | Find files by pattern (`**/*.ts`, brace expansion) |
 | `grep` | Content search; uses ripgrep when installed |
-| `bash` | Shell commands with timeout and output cap |
+| `search_codebase` | Rank files by declarations and keywords from a cached workspace index |
+| `bash` | Shell commands with timeout, output cap, and the sandbox policy |
 | `todo_write` | Maintain the visible task plan |
 | `remember` | Persist a durable fact |
-| `delegate` | Run a sub-agent and return its report |
+| `delegate` | Run one sub-agent, or up to four in parallel with `prompts` |
 
 All file tools resolve paths and refuse anything outside the workspace (plus
-`allowedDirs` from config). Shell commands in `auto` mode still prompt when they
-match a destructive pattern (recursive `rm`, `git reset --hard`, `git push
---force`, piping downloads into a shell, and similar).
+`allowedDirs` from config). Shell commands are classified by `src/sandbox.ts`:
+destructive commands are denied, risky ones raise a confirmation, and the rest
+run. Permission choices can be saved as persistent rules.
 
 ## Design notes
 
@@ -232,9 +233,13 @@ loop.
 
 ```
 bin/prometheus.js    entry point, CLI parsing, one-shot vs REPL
-src/agent.ts         the loop, tool dispatch, sub-agents
+src/agent.ts         the loop, tool dispatch, sub-agents (parallel delegate)
 src/llm.ts           OpenAI-compatible streaming client
+src/fallback.ts      per-request model fallback for model-level failures
 src/permissions.ts   modes, approval prompts, path confinement, audit log
+src/rules.ts         persistent approval rules (glob, user/project scope)
+src/sandbox.ts       command classification, path confinement, env scrub
+src/codeIndex.ts     cached workspace index behind search_codebase
 src/context.ts       token estimate and compaction
 src/ui.ts            terminal rendering
 src/render.ts        markdown-to-terminal formatting

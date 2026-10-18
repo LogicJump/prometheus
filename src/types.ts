@@ -22,6 +22,8 @@ export interface Config {
   sandbox?: "off" | "enforce";
   /** Network access for commands: off rejects fetchers and injects a dead proxy. */
   networkPolicy?: "off" | "proxy" | "open";
+  /** Model ids tried in order when the active model is unavailable. */
+  fallbackModels?: string[];
 }
 
 export interface ToolCall {
@@ -62,6 +64,8 @@ export interface ToolContext {
   ui: Ui;
   todo: TodoList;
   runSubagent: (prompt: string) => Promise<string>;
+  /** Run several independent sub-tasks concurrently; results are in input order. */
+  runSubagents?: (prompts: string[]) => Promise<{ ok: boolean; report: string }[]>;
 }
 
 export interface Tool {
@@ -110,6 +114,8 @@ export interface Ui {
   subagentEnd?(ok: boolean, summary: string): void;
   /** True if the last streamed text ended mid-line. */
   takeLineDirty?(): boolean;
+  /** Inline question with extra answers; falls back to `confirm` when absent. */
+  ask?(question: string, options: { value: string; label: string }[]): Promise<string>;
 }
 
 export interface PermissionManager {

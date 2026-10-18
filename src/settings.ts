@@ -42,6 +42,7 @@ export interface EditableConfig {
   thinkingEffort?: string;
   maxTokens?: number;
   contextWindow?: number;
+  fallbackModels?: string[];
 }
 
 /** Merge the given fields into ~/.prometheus/config.json, preserving everything else. */

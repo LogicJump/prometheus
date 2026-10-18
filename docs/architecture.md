@@ -141,6 +141,48 @@ conversation, restores files, persists (a shorter conversation starts a new JSON
 generation), and re-renders the transcript. The transcript offers the action on
 user turns.
 
+## Persistent approval rules — `src/rules.ts`
+
+A permission choice can be remembered as a rule instead of a one-off. Rules are
+globs over `tool:detail` (`bash:git status*`, `write_file:src/**`), stored in
+`~/.prometheus/rules.json` (user scope) or `.prometheus/rules.json` (project
+scope). Evaluation is first-match-wins and happens before any prompt, so an
+allow rule runs silently and a deny rule refuses with its reason. Project rules
+only apply inside their own workspace; user rules apply everywhere.
+
+## Parallel sub-agents — `delegate`
+
+`delegate` accepts either `prompt` (one child) or `prompts` (up to four,
+`Promise.all`). Each child gets its own conversation, its own abort controller
+(one child failing does not cancel the others), and a read-mostly tool set.
+Results come back as labelled sections so the parent can merge them in one turn.
+
+## Workspace index — `src/codeIndex.ts`
+
+`search_codebase` ranks files before the agent starts grepping. The index
+extracts declarations (functions, classes, types, consts, plus Python/Go/Rust
+shapes) and keeps a token-frequency map per file; queries score path matches,
+symbol-name matches, and token overlap. It is a JSON file per workspace under
+`~/.prometheus/index/`, built on first search, sampled for staleness (40 files),
+and rebuilt when any sample changed. Deliberately not an embedding index: no
+daemon, no dependency, bounded to 4000 files and 400 KB per file.
+
+## Model fallback — `src/fallback.ts`
+
+`fallbackModels` in settings wraps the primary client. `shouldFallBack` decides
+per failure whether another model plausibly helps: 404 / 429 / 503 / 529, a 400
+that names the model, and connection errors. Auth and malformed-request
+failures never fall back — the next model would fail the same way. Fallbacks are
+per request and reuse the primary's endpoint and key with `reasoningEffort:
+auto`, so a model that rejects a concrete effort is not double-punished.
+
+## Compaction visibility
+
+`query()` emits `compacted` with `level` (`trim`, `summarize`, `aggressive`,
+`local-fallback`) and the kept message count. The desktop transcript draws a
+marker at that point in the conversation, so a shortened context is visible
+rather than silent.
+
 ## Wiring — `src/agent.ts` and `desktop/host.js`
 
 `Agent` owns the conversation, tools, permissions, hooks, sub-agents, and the

@@ -227,6 +227,32 @@ function collectEdits(input: Record<string, unknown>): EditSpec[] | string {
   return specs;
 }
 
+export const searchCodeTool: Tool = {
+  name: "search_codebase",
+  description:
+    "Find where something lives by meaning rather than exact text: ranks files by declared symbols (functions, classes, types) and keyword density. Start here for questions like 'where is X implemented', then read the file. Use grep for exact strings.",
+  readonly: true,
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "Words describing what you are looking for" },
+      limit: { type: "integer", description: "Maximum files to return (default 10)", minimum: 1, maximum: 30 },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  },
+  summarize: (input) => String(input.query ?? ""),
+  async execute(input, ctx): Promise<ToolResult> {
+    const { loadIndex, searchIndex, formatSearch } = await import("../codeIndex.ts");
+    const index = loadIndex(ctx.cwd);
+    const hits = searchIndex(index, String(input.query ?? ""), Math.min(30, Number(input.limit ?? 10)));
+    return {
+      content: formatSearch(hits, String(input.query ?? "")),
+      display: `${hits.length} file(s)`,
+    };
+  },
+};
+
 export const listFilesTool: Tool = {
   name: "list_files",
   description: "List files and directories under a path. Use to understand project layout before reading files.",

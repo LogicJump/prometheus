@@ -205,6 +205,7 @@
               <button class="btn btn-primary" data-permission="yes" data-i18n="allow">Allow</button>
               <button class="btn" data-permission="always" data-i18n="alwaysAllow">Always allow</button>
               <button class="btn btn-quiet" data-permission="no" data-i18n="deny">Deny</button>
+              <div class="pending-choices" id="pending-choices" hidden></div>
             </div>
           </div>
 
@@ -464,6 +465,14 @@
                 <option value="open" data-i18n="networkOpen">Allowed</option>
               </select>
             </label>
+            <label class="field">
+              <span data-i18n="settingsFallback">Fallback models</span>
+              <input id="setting-fallback" type="text" spellcheck="false" placeholder="deepseek-v4.1-flash, glm-5.3" />
+            </label>
+            <div class="field rules-field">
+              <span data-i18n="rulesTitle">Saved approvals</span>
+              <div class="rules-list" id="setting-rules"></div>
+            </div>
             <div class="settings-hint" data-i18n="sandboxHint">Classifies commands, keeps paths inside the workspace, and does not inherit secrets. It is a policy check, not an OS-level sandbox.</div>
           </section>
           <section class="settings-section" data-settings-pane="appearance" hidden>
