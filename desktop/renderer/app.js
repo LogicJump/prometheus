@@ -7,8 +7,8 @@ import { escapeHtml, renderMarkdown } from "./markdown.js";
 const savedLocale = localStorage.getItem("prometheus.locale");
 const savedTheme = localStorage.getItem("prometheus.theme");
 const savedDensity = localStorage.getItem("prometheus.density");
-const savedTab = localStorage.getItem("prometheus.sidebarTab");
 const savedWorkbench = localStorage.getItem("prometheus.workbench");
+const savedPane = localStorage.getItem("prometheus.pane");
 
 const api = window.prometheus;
 
@@ -32,7 +32,7 @@ const usageLabel = $("usage-label");
 const pendingPermission = $("pending-permission");
 const pendingQuestion = $("pending-question");
 const sessionList = $("session-list");
-const localeSwitch = $("locale-switch");
+
 const transcriptScroll = $("transcript-scroll");
 const workbench = $("workbench");
 const workbenchTabs = $("workbench-tabs");
@@ -40,11 +40,10 @@ const workbenchMeta = $("workbench-meta");
 const diffFilelist = $("diff-filelist");
 const diffRoot = $("diff-root");
 const fileRoot = $("file-root");
-const fileTree = $("file-tree");
+const fileTree = $("pane-tree");
 const changesList = $("changes-list");
 const changesSummary = $("changes-summary");
 const checkpointList = $("checkpoint-list");
-const sidebarTabs = $("sidebar-tabs");
 const terminalRoot = $("terminal-root");
 const terminalOutput = $("terminal-output");
 const terminalInput = $("terminal-input");
@@ -76,8 +75,9 @@ const state = {
   selectedFile: null,
   tree: [],
   pane: "diff",
-  sidebarTab: savedTab || "files",
+  cwd: "",
   workbenchOpen: savedWorkbench === "1",
+  pane: ["files", "diff", "history", "artifact", "terminal", "browser", "file"].includes(savedPane) ? savedPane : "diff",
   git: null,
   worktree: null,
   worktreeDiffText: "",
@@ -122,21 +122,17 @@ function applyLocale(locale, { announce = false } = {}) {
   sendButton.title = `${t.send} (Enter)`;
   stopButton.title = `${t.stop} (Esc)`;
   $("workspace-button").title = t.changeWorkspace;
-  $("sidebar-toggle").title = t.sessions;
   $("refresh-sessions").title = t.sessions;
   const search = $("session-search");
   search.placeholder = t.searchSessions;
   search.title = t.searchSessions;
   $("find-input").placeholder = t.findPlaceholder;
   $("check-update").textContent = t.checkUpdate;
-  $("theme-button").title = state.theme === "light" ? "Dark" : "Light";
   modelPicker.title = t.refreshModels;
   // applyLocale also runs during startup, before the voice state is declared.
   $("voice-button").title = $("voice-button").classList.contains("recording") ? t.voiceStop : t.voiceStart;
   if (state.sessions.length > 0) renderSessions(state.sessions);
-  localeSwitch.querySelectorAll("button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.locale === locale);
-  });
+  syncMenuControls();
   setStatus(state.statusKey);
   if (state.models.length > 0) renderModelMenu();
   if (announce) api.send({ cmd: "setLocale", locale });
@@ -159,7 +155,7 @@ const md = (source) => renderMarkdown(source, t.copy);
 /** The element that actually scrolls: the transcript, or its inner column when
  *  the workbench splits the pane. */
 function scrollTarget() {
-  return transcript.classList.contains("with-workbench") ? transcriptScroll : transcript;
+  return transcript;
 }
 
 function scrollToBottom(force = false) {
@@ -771,6 +767,8 @@ function handleEvent(message) {
       }
       workspacePath.textContent = message.cwd;
       workspacePath.title = message.cwd;
+      state.cwd = message.cwd;
+      renderTopbarLocation();
       updateMeter(message.context, message.usage);
       break;
 
@@ -789,6 +787,7 @@ function handleEvent(message) {
         state.selectedChange = message.files[0].path;
       }
       renderChangesPanel();
+      renderChangesBadge();
       if (state.pane === "diff" && !workbench.hidden) renderDiff();
       break;
 
@@ -1084,6 +1083,8 @@ function handleEvent(message) {
       }
       if (message.cwd) {
         workspacePath.textContent = message.cwd;
+        state.cwd = message.cwd;
+        renderTopbarLocation();
         workspacePath.title = message.cwd;
         api.send({ cmd: "getTree", path: "." });
       }
@@ -1141,10 +1142,12 @@ function handleEvent(message) {
 
 function openWorkbench(pane) {
   state.pane = pane ?? state.pane;
-  workbench.hidden = false;
+  // Use the attribute directly: a stale hidden="false" still matches
+  // [hidden]{display:none} and would keep the pane invisible.
+  workbench.removeAttribute("hidden");
   state.workbenchOpen = true;
   localStorage.setItem("prometheus.workbench", "1");
-  transcript.classList.add("with-workbench");
+  localStorage.setItem("prometheus.pane", state.pane);
   workbenchTabs.querySelectorAll("button").forEach((button) => {
     button.classList.toggle("active", button.dataset.pane === state.pane);
   });
@@ -1152,14 +1155,25 @@ function openWorkbench(pane) {
   const showTerminal = state.pane === "terminal";
   const showArtifact = state.pane === "artifact";
   const showBrowser = state.pane === "browser";
+  const showFiles = state.pane === "files";
+  const showHistory = state.pane === "history";
+  const showFile = state.pane === "file";
+  $("diff-pane").hidden = !showDiff;
   diffRoot.hidden = !showDiff;
   diffFilelist.hidden = !showDiff || state.changes.files.length === 0;
   $("diff-scope").hidden = !showDiff;
-  fileRoot.hidden = state.pane !== "file";
+  $("pane-tree").hidden = !showFiles;
+  $("changes-list").hidden = !showDiff;
+  $("history-root").hidden = !showHistory;
+  $("artifact-list-pane").hidden = !showArtifact || Boolean(state.selectedArtifact);
+  fileRoot.hidden = !showFile;
   terminalRoot.hidden = !showTerminal;
-  $("artifact-root").hidden = !showArtifact;
+  $("artifact-root").hidden = !showArtifact || !state.selectedArtifact;
   $("browser-root").hidden = !showBrowser;
   if (showDiff) renderDiff();
+  if (showFiles) api.send({ cmd: "getTree", path: "." });
+  if (showHistory) api.send({ cmd: "getCheckpoints" });
+  if (showArtifact) api.send({ cmd: "getArtifacts" });
   if (showTerminal) {
     openTerminal();
   }
@@ -1171,10 +1185,9 @@ function openWorkbench(pane) {
 }
 
 function closeWorkbench() {
-  workbench.hidden = true;
+  workbench.setAttribute("hidden", "");
   state.workbenchOpen = false;
   localStorage.setItem("prometheus.workbench", "0");
-  transcript.classList.remove("with-workbench");
   // The page view floats above the window, so it must be removed explicitly.
   void api.browserClose?.();
 }
@@ -1434,7 +1447,6 @@ function renderChangesPanel() {
       `<span class="change-path">${escapeHtml(file.path)}</span>` +
       `<span class="change-stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`;
     row.addEventListener("click", () => {
-      selectSidebarTab("changes");
       state.selectedChange = file.path;
       openWorkbench("diff");
       renderDiff();
@@ -1449,6 +1461,7 @@ function renderGitBar() {
   const bar = $("git-bar");
   const git = state.git;
   if (!git || !git.available) {
+    renderTopbarLocation();
     bar.hidden = false;
     $("git-branch-name").textContent = t.gitNotRepo;
     $("git-sync").textContent = "";
@@ -1456,6 +1469,7 @@ function renderGitBar() {
     return;
   }
   bar.hidden = false;
+  renderTopbarLocation();
   $("git-branch-name").textContent = git.branch || "HEAD";
   const sync = [];
   if (git.ahead > 0) sync.push(t.gitAhead(git.ahead));
@@ -1567,7 +1581,6 @@ function openFile(path) {
   openWorkbench("file");
   fileRoot.innerHTML = `<div class="diff-empty">…</div>`;
   api.send({ cmd: "getFile", path });
-  transcript.classList.add("with-workbench");
 }
 
 function renderFilePreview(file) {
@@ -1584,21 +1597,6 @@ function renderFilePreview(file) {
       return `<div class="file-line">${gutter}<span class="diff-text">${escapeHtml(line)}</span></div>`;
     })
     .join("")}</pre>`;
-}
-
-function selectSidebarTab(tab) {
-  state.sidebarTab = tab;
-  localStorage.setItem("prometheus.sidebarTab", tab);
-  sidebarTabs.querySelectorAll("button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.tab === tab);
-  });
-  document.querySelectorAll(".panel-view").forEach((view) => {
-    view.hidden = view.dataset.view !== tab;
-  });
-  if (tab === "files") api.send({ cmd: "getTree", path: "." });
-  if (tab === "changes") renderChangesPanel();
-  if (tab === "history") api.send({ cmd: "getCheckpoints" });
-  if (tab === "artifacts") api.send({ cmd: "getArtifacts" });
 }
 
 /* ---------- voice input ---------- */
@@ -1760,22 +1758,13 @@ function renderArtifacts() {
 
 /** Render one artifact in the right-hand workbench. */
 function renderArtifact(artifact) {
-  $("artifact-root").hidden = false;
   const tab = workbenchTabs.querySelector('[data-pane="artifact"]');
   if (tab) tab.hidden = false;
-  // Open the artifact's own tab without going through openWorkbench, which
-  // would render the session diff underneath it.
-  workbench.hidden = false;
-  transcript.classList.add("with-workbench");
-  state.pane = "artifact";
-  workbenchTabs.querySelectorAll("button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.pane === "artifact");
-  });
-  diffRoot.hidden = true;
-  fileRoot.hidden = true;
-  terminalRoot.hidden = true;
-  diffFilelist.hidden = true;
-  $("diff-scope").hidden = true;
+  // Open the artifact's own tab through the normal path so every other pane
+  // is hidden consistently.
+  state.selectedArtifact = artifact.path;
+  openWorkbench("artifact");
+  $("artifact-list-pane").hidden = true;
   const root = $("artifact-root");
   root.hidden = false;
   workbenchMeta.textContent = `${artifact.kind} · ${artifact.path}${artifact.truncated ? " · truncated" : ""}`;
@@ -1977,9 +1966,9 @@ function setDensity(density) {
 
 function setTheme(theme) {
   state.theme = theme;
+  syncMenuControls();
   document.documentElement.dataset.theme = theme;
   localStorage.setItem("prometheus.theme", theme);
-  $("theme-button").title = theme === "light" ? "Dark" : "Light";
 }
 
 /* ---------- composer ---------- */
@@ -2110,11 +2099,10 @@ document.addEventListener("keydown", (event) => {
     if (mode !== state.mode) api.send({ cmd: "setMode", mode });
   } else if (key === "d" && event.shiftKey) {
     event.preventDefault();
-    selectSidebarTab("changes");
     openWorkbench("diff");
   } else if (key === "e" && event.shiftKey) {
     event.preventDefault();
-    selectSidebarTab("files");
+    openWorkbench("files");
   } else if (key === "e") {
     event.preventDefault();
     const order = ["auto", "low", "medium", "high"];
@@ -2269,10 +2257,10 @@ function paletteEntries() {
     { label: t.exportSession, run: () => api.send({ cmd: "exportSession" }) },
     { label: t.sessionFork, run: () => api.send({ cmd: "forkSession" }) },
     { label: t.paneDiff, run: () => openWorkbench("diff") },
-    { label: t.tabFiles, run: () => selectSidebarTab("files") },
-    { label: t.tabChanges, run: () => selectSidebarTab("changes") },
-    { label: t.tabArtifacts, run: () => selectSidebarTab("artifacts") },
-    { label: t.tabHistory, run: () => selectSidebarTab("history") },
+    { label: t.tabFiles, run: () => openWorkbench("files") },
+    { label: t.tabChanges, run: () => openWorkbench("diff") },
+    { label: t.tabArtifacts, run: () => openWorkbench("artifact") },
+    { label: t.tabHistory, run: () => openWorkbench("history") },
     { label: t.paneTerminal, run: () => openWorkbench("terminal") },
     { label: t.paneBrowser, run: () => openWorkbench("browser") },
     { label: t.shortcutFind, run: openFind },
@@ -2406,13 +2394,6 @@ modelPicker.addEventListener("click", (event) => {
   else closeModelMenu();
 });
 
-localeSwitch.querySelectorAll("button").forEach((button) => {
-  button.addEventListener("click", () => {
-    const locale = button.dataset.locale;
-    if (locale !== state.locale) applyLocale(locale, { announce: true });
-  });
-});
-
 $("workspace-button").addEventListener("click", async () => {
   const dir = await api.pickDirectory();
   if (dir) api.send({ cmd: "setCwd", cwd: dir });
@@ -2463,15 +2444,48 @@ $("session-search").addEventListener("input", (event) => {
   renderSessions(state.sessions);
 });
 
+/** Collapse or expand the conversation sidebar; remembered across restarts. */
 function toggleSidebar() {
-  document.querySelector(".shell").classList.toggle("collapsed");
+  const collapsed = document.querySelector(".shell").classList.toggle("collapsed");
+  localStorage.setItem("prometheus.sidebarCollapsed", collapsed ? "1" : "0");
+}
+if (localStorage.getItem("prometheus.sidebarCollapsed") === "1") {
+  document.querySelector(".shell").classList.add("collapsed");
 }
 
-$("sidebar-toggle").addEventListener("click", toggleSidebar);
+$("topbar-sidebar-toggle").addEventListener("click", toggleSidebar);
 
-sidebarTabs.querySelectorAll("button").forEach((button) => {
-  button.addEventListener("click", () => selectSidebarTab(button.dataset.tab));
+/* ---------- top bar: workspace, changes, terminal ---------- */
+
+function renderTopbarLocation() {
+  const cwd = state.cwd ?? "";
+  const parts = cwd.split(/[/]/).filter(Boolean);
+  $("topbar-cwd-name").textContent = parts.length > 0 ? parts[parts.length - 1] : t.appName;
+  $("topbar-cwd").title = cwd || t.appName;
+  const branch = state.git?.available ? state.git.branch : "";
+  const branchNode = $("topbar-cwd-branch");
+  branchNode.hidden = !branch;
+  branchNode.textContent = branch ?? "";
+}
+
+function renderChangesBadge() {
+  const count = state.changes.files.length;
+  const badge = $("changes-badge");
+  badge.hidden = count === 0;
+  badge.textContent = String(count);
+  $("changes-button").title = count > 0 ? `${t.paneDiff} (${count})` : t.paneDiff;
+}
+
+$("topbar-cwd").addEventListener("click", () => $("workspace-button").click());
+$("changes-button").addEventListener("click", () => {
+  if (!workbench.hidden && state.pane === "diff") closeWorkbench();
+  else openWorkbench("diff");
 });
+$("terminal-button").addEventListener("click", () => {
+  if (!workbench.hidden && state.pane === "terminal") closeWorkbench();
+  else openWorkbench("terminal");
+});
+
 
 workbenchTabs.querySelectorAll("button").forEach((button) => {
   button.addEventListener("click", () => openWorkbench(button.dataset.pane));
@@ -2488,10 +2502,6 @@ $("diff-scope").querySelectorAll("button").forEach((button) => {
     state.selectedChange = null;
     renderDiff();
   });
-});
-
-$("theme-button").addEventListener("click", () => {
-  setTheme(state.theme === "light" ? "dark" : "light");
 });
 
 /* ---------- window controls ---------- */
@@ -2531,9 +2541,9 @@ function closeModal(dialog) {
   if (settingsDialog.hidden && shortcutsDialog.hidden) modalScrim.hidden = true;
 }
 
-function openSettings() {
+function openSettings(tab = "connection") {
   api.send({ cmd: "getSettings" });
-  selectSettingsTab("connection");
+  selectSettingsTab(tab);
   openModal(settingsDialog);
   // Land focus on the category rail, not the close button.
   document.querySelector("[data-settings-tab].active")?.focus();
@@ -2560,7 +2570,7 @@ $("settings-nav").addEventListener("click", (event) => {
 function openSetup() {
   $("models-hint").textContent = t.setupHint;
   $("models-hint").hidden = false;
-  openSettings();
+  openSettings("connection");
   setTimeout(() => $("setting-base-url").focus(), 60);
 }
 
@@ -2742,6 +2752,32 @@ async function exportSessionFile(markdown, filename) {
 
 const topbarMenu = $("topbar-menu");
 
+/** Reflect the current theme and language on the overflow menu controls. */
+function syncMenuControls() {
+  if (!document.getElementById("menu-theme")) return;
+  document.querySelectorAll("#menu-theme [data-theme-choice]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.themeChoice === state.theme);
+  });
+  document.querySelectorAll("#menu-locale [data-locale]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.locale === state.locale);
+  });
+}
+
+$("menu-theme").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-theme-choice]");
+  if (!button) return;
+  setTheme(button.dataset.themeChoice);
+  syncMenuControls();
+});
+
+$("menu-locale").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-locale]");
+  if (!button) return;
+  if (button.dataset.locale !== state.locale) applyLocale(button.dataset.locale, { announce: true });
+  syncMenuControls();
+});
+
+
 function setTopbarMenu(open) {
   topbarMenu.hidden = !open;
   $("more-button").setAttribute("aria-expanded", open ? "true" : "false");
@@ -2749,10 +2785,13 @@ function setTopbarMenu(open) {
 
 $("more-button").addEventListener("click", (event) => {
   event.stopPropagation();
-  setTopbarMenu(topbarMenu.hidden);
+  const open = topbarMenu.hidden;
+  setTopbarMenu(open);
+  if (open) syncMenuControls();
 });
 
 topbarMenu.addEventListener("click", (event) => {
+  if (event.target.closest(".menu-setting")) return;
   const row = event.target.closest(".menu-row");
   if (!row) return;
   setTopbarMenu(false);
@@ -2798,7 +2837,7 @@ setupVoice();
 void refreshVersion();
 api.send({ cmd: "listSessions" });
 api.send({ cmd: "listCommands" });
-if (state.sidebarTab !== "files") selectSidebarTab(state.sidebarTab);
+if (state.workbenchOpen) openWorkbench(state.pane);
 api.send({ cmd: "getTree", path: "." });
 api.send({ cmd: "setLocale", locale: state.locale });
 input.focus();
