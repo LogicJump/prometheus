@@ -15,6 +15,7 @@ import { execFile } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, delimiter } from "node:path";
 import { homedir } from "node:os";
+import { packBinDirs } from "../packs/registry.ts";
 
 export type ToolchainKind =
   | "gcc-arm"
@@ -56,7 +57,9 @@ export interface FoundTool {
   /** Why it is incomplete, when it is. */
   problem?: string;
   /** Where it came from, for the settings UI. */
-  source?: "path" | "install-root";
+  source?: "path" | "install-root" | "pack";
+  /** The pack that supplied it, when source is "pack". */
+  packId?: string;
 }
 
 export interface ToolchainReport {
@@ -73,8 +76,6 @@ interface Spec {
   names: string[];
   /** Arguments that print a version. */
   versionArgs: string[];
-  /** Optional extra directories (beyond PATH) to search. */
-  extraDirs?: () => string[];
 }
 
 /**
@@ -134,14 +135,6 @@ function unixDirs(): string[] {
   ].filter((dir) => existsSync(dir));
 }
 
-function extraSearchPaths(): string[] {
-  const fromEnv = (process.env.PROMETHEUS_TOOLCHAINS ?? "")
-    .split(delimiter)
-    .map((value) => value.trim())
-    .filter(Boolean);
-  return [...fromEnv, ...(process.platform === "win32" ? windowsDirs() : unixDirs())];
-}
-
 const SPECS: Spec[] = [
   { kind: "gcc-arm", names: ["arm-none-eabi-gcc", "arm-none-eabi-gcc.exe"], versionArgs: ["--version"] },
   { kind: "gcc-riscv", names: ["riscv64-unknown-elf-gcc", "riscv32-esp-elf-gcc"], versionArgs: ["--version"] },
@@ -168,22 +161,72 @@ const SPECS: Spec[] = [
   { kind: "clang-tidy", names: ["clang-tidy", "clang-tidy.exe"], versionArgs: ["--version"] },
 ];
 
-/** PATH first, then the extra directories; the first hit wins. */
-function locate(spec: Spec): { path: string; source: "path" | "install-root" } | null {
+/**
+ * Everything a search needs, built once.
+ *
+ * Previously each of the 23 specs called `extraSearchPaths()` itself, so the
+ * platform directory scans (`windowsDirs()` alone walks versioned install
+ * directories) ran 23 times per detection pass. Building the context once is
+ * the difference between a detection that takes 40 ms and one that takes a
+ * second on a machine with several toolchains installed.
+ */
+interface SearchContext {
+  pathDirs: string[];
+  /** `PROMETHEUS_TOOLCHAINS` entries first, then the platform install roots. */
+  explicitDirs: string[];
+  installRoots: string[];
+  /** Pack bin directories per toolchain kind. */
+  packDirs: Map<string, { dir: string; packId: string }[]>;
+}
+
+function buildSearchContext(): SearchContext {
   const pathDirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
-  for (const [dirs, source] of [[pathDirs, "path"], [extraSearchPaths(), "install-root"]] as const) {
+  const explicit = (process.env.PROMETHEUS_TOOLCHAINS ?? "")
+    .split(delimiter)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return {
+    pathDirs,
+    explicitDirs: explicit,
+    installRoots: process.platform === "win32" ? windowsDirs() : unixDirs(),
+    packDirs: packBinDirs(),
+  };
+}
+
+type FoundSource = "path" | "install-root" | "pack";
+
+/**
+ * Find one tool, respecting precedence.
+ *
+ * Order: an explicit `PROMETHEUS_TOOLCHAINS` entry, then a pack the app itself
+ * installed and validated, then a platform install root, then `PATH`. A pack
+ * outranks `PATH` because it is something the app checked; `PATH` is where the
+ * Homebrew compiler-with-no-libc hides.
+ */
+function locate(spec: Spec, context: SearchContext): { path: string; source: FoundSource; packId?: string } | null {
+  const tryDirs = (dirs: string[], source: FoundSource, packId?: string) => {
     for (const dir of dirs) {
       for (const name of spec.names) {
         const candidate = join(dir, name);
         try {
-          if (statSync(candidate).isFile()) return { path: candidate, source };
+          if (statSync(candidate).isFile()) return { path: candidate, source, ...(packId ? { packId } : {}) };
         } catch {
           /* not here */
         }
       }
     }
+    return null;
+  };
+
+  const explicit = tryDirs(context.explicitDirs, "install-root");
+  if (explicit) return explicit;
+
+  for (const pack of context.packDirs.get(spec.kind) ?? []) {
+    const hit = tryDirs([pack.dir], "pack", pack.packId);
+    if (hit) return hit;
   }
-  return null;
+
+  return tryDirs(context.installRoots, "install-root") ?? tryDirs(context.pathDirs, "path");
 }
 
 function firstLine(text: string): string {
@@ -240,20 +283,30 @@ async function checkArmCompleteness(gccPath: string): Promise<{ complete?: boole
  */
 export async function detectToolchains(refresh = false): Promise<ToolchainReport> {
   if (cached && !refresh) return cached;
-  const searchPaths = extraSearchPaths();
+  // Built once: the platform scans are the expensive part and every spec needs
+  // the same answer.
+  const context = buildSearchContext();
+  const searchPaths = [...context.explicitDirs, ...context.installRoots];
   const found: FoundTool[] = [];
   const missing: ToolchainKind[] = [];
 
   await Promise.all(
     SPECS.map(async (spec) => {
-      const located = locate(spec);
+      const located = locate(spec, context);
       if (!located) {
         missing.push(spec.kind);
         return;
       }
       const version = await runVersion(located.path, spec.versionArgs);
       const health = spec.kind === "gcc-arm" ? await checkArmCompleteness(located.path) : {};
-      found.push({ kind: spec.kind, path: located.path, version, source: located.source, ...health });
+      found.push({
+        kind: spec.kind,
+        path: located.path,
+        version,
+        source: located.source,
+        ...(located.packId ? { packId: located.packId } : {}),
+        ...health,
+      });
     }),
   );
 

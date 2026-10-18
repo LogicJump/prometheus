@@ -17,6 +17,7 @@
  */
 
 import type { Tool, ToolContext, ToolResult } from "../types.ts";
+import { toolEnv } from "../embedded/toolEnv.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
@@ -555,7 +556,7 @@ async function startServer(command: { program: string; args: string[]; readyPatt
   { ok: true; child: ChildProcess } | { ok: false; reason: string }
 > {
   return new Promise((resolve) => {
-    const child = spawn(command.program, command.args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command.program, command.args, { env: toolEnv(), windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let seen = "";
     const timer = setTimeout(() => {
       child.kill();

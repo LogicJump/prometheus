@@ -17,6 +17,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { toolEnv } from "./toolEnv.ts";
 
 export type ProbeKind = "pyocd" | "probe-rs" | "openocd" | "jlink" | "stlink" | "esptool" | "dfu";
 
@@ -61,7 +62,7 @@ export interface TargetResult {
 
 function run(program: string, args: string[], timeout = 20000): Promise<{ ok: boolean; out: string; err: string }> {
   return new Promise((resolve) => {
-    execFile(program, args, { timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(program, args, { env: toolEnv(), timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
       resolve({ ok: !error, out: String(stdout ?? ""), err: String(stderr ?? "") });
     });
   });

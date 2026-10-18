@@ -20,6 +20,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { toolEnv } from "./toolEnv.ts";
 
 export interface MiRecord {
   kind: "result" | "exec" | "status" | "notify" | "stream" | "console" | "log" | "target";
@@ -210,6 +211,7 @@ export class MiSession {
     this.remote = options.remote;
     this.elfPath = options.elf;
     this.child = spawn(options.gdb, ["-q", "-i=mi2", "--interpreter=mi2", options.elf], {
+      env: toolEnv(),
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });

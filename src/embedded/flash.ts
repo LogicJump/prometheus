@@ -22,6 +22,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { extname } from "node:path";
+import { toolEnv } from "./toolEnv.ts";
 
 export type FlasherKind = "pyocd" | "openocd" | "probe-rs" | "jlink" | "esptool" | "st-flash" | "dfu-util" | "avrdude";
 
@@ -77,7 +78,7 @@ function clip(text: string): string {
 
 function run(program: string, args: string[], timeout: number): Promise<{ code: number | null; out: string; err: string }> {
   return new Promise((resolve) => {
-    execFile(program, args, { timeout, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(program, args, { env: toolEnv(), timeout, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
       const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
       resolve({ code, out: String(stdout ?? ""), err: String(stderr ?? "") });
     });

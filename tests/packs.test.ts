@@ -352,3 +352,45 @@ test("pack bin directories are keyed by the toolchain kind they provide", async 
   // the payload prefix.
   assert.ok(forGcc[0].dir.endsWith(`payload${sep}bin`), `unexpected bin dir: ${forGcc[0].dir}`);
 });
+
+// ---- 环境注入 --------------------------------------------------------------
+
+import { prependPath, toolEnv } from "../src/embedded/toolEnv.ts";
+
+test("前置目录时不会在 Windows 上造出重复的 Path/PATH 键", () => {
+  const dirs = ["C:\packs\arm\payload\bin"];
+  // Windows 的系统环境用的是 `Path`。再写一个 `PATH` 会让环境里出现两个键，
+  // 读到哪个取决于枚举顺序 —— 这正是"有时能找到编译器有时找不到"的来源。
+  const env = prependPath({ Path: "C:\Windows\System32", FOO: "1" }, dirs);
+  const pathKeys = Object.keys(env).filter((key) => key.toUpperCase() === "PATH");
+  assert.equal(pathKeys.length, 1, `只能有一个 PATH 键，实际有 ${pathKeys.join(", ")}`);
+  assert.equal(env.Path, dirs[0] + ";" + "C:\Windows\System32");
+  assert.equal(env.PATH, undefined);
+});
+
+test("用小写 PATH 的环境只保留 PATH 这一个键", () => {
+  const env = prependPath({ PATH: "/usr/bin" }, ["/opt/pack/bin"]);
+  const keys = Object.keys(env).filter((key) => key.toUpperCase() === "PATH");
+  assert.equal(keys.length, 1);
+  const sep = process.platform === "win32" ? ";" : ":";
+  assert.equal(env[keys[0]], ["/opt/pack/bin", "/usr/bin"].join(sep));
+});
+
+test("已经在 PATH 里的目录会被提到前面而不是重复", () => {
+  const env = prependPath({ PATH: "/usr/bin:/opt/pack/bin" }, ["/opt/pack/bin"]);
+  const sep = process.platform === "win32" ? ";" : ":";
+  const parts = String(env.PATH).split(sep);
+  assert.equal(parts[0], "/opt/pack/bin", "pack 必须排在系统目录之前");
+  assert.equal(parts.filter((part) => part === "/opt/pack/bin").length, 1, "不能重复出现");
+});
+
+test("没有任何目录时不改动环境对象", () => {
+  const original = { PATH: "/usr/bin" };
+  assert.equal(prependPath(original, []), original);
+});
+
+test("toolEnv 不会修改 process.env", () => {
+  const before = process.env.PATH;
+  toolEnv();
+  assert.equal(process.env.PATH, before, "process.env 必须一个字都不变");
+});

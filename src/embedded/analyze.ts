@@ -18,6 +18,7 @@ import { cpus } from "node:os";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Diagnostic } from "./diagnostics.ts";
+import { toolEnv } from "./toolEnv.ts";
 
 export type AnalyzerKind = "cppcheck" | "clang-tidy";
 
@@ -223,7 +224,7 @@ function collectSources(root: string, paths: string[] | undefined, maxFiles: num
 
 function run(program: string, args: string[], cwd: string, timeout: number): Promise<{ code: number | null; out: string; err: string }> {
   return new Promise((resolve) => {
-    execFile(program, args, { cwd, timeout, windowsHide: true, maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(program, args, { cwd, env: toolEnv(), timeout, windowsHide: true, maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
       resolve({
         code: error ? (typeof error.code === "number" ? error.code : 1) : 0,
         out: String(stdout ?? ""),

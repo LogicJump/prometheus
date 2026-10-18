@@ -23,6 +23,7 @@ import { detectToolchains, tool } from "./toolchain.ts";
 import { buildCommand, type BuildCommand, type DetectedProject, detectProject } from "./project.ts";
 import { collapseCascades, parseDiagnostics, summarizeDiagnostics, type Diagnostic } from "./diagnostics.ts";
 import { parseSize, type MemoryUsage } from "./flash.ts";
+import { toolEnv } from "./toolEnv.ts";
 
 export interface BuildOptions {
   /** Build in the target's release configuration when the ecosystem has one. */
@@ -71,7 +72,7 @@ function run(program: string, args: string[], cwd: string, timeout: number): Pro
     execFile(
       program,
       args,
-      { cwd, timeout, windowsHide: true, maxBuffer: 32 * 1024 * 1024, env: process.env },
+      { cwd, timeout, windowsHide: true, maxBuffer: 32 * 1024 * 1024, env: toolEnv() },
       (error, stdout, stderr) => {
         const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
         resolve({ code, out: `${stdout ?? ""}\n${stderr ?? ""}` });
