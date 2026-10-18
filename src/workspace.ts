@@ -27,7 +27,7 @@ const SKIP = new Set([
 /** Build output from repeated packaging runs: release, release2, release15, … */
 function skipEntry(name: string): boolean {
   if (SKIP.has(name)) return true;
-  if (/^release\d+$/i.test(name)) return true;
+  if (/^release(\d+|-.*)?$/i.test(name)) return true;
   return name.startsWith(".DS_Store");
 }
 

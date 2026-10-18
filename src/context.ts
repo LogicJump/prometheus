@@ -9,6 +9,12 @@ export function estimateTokens(messages: ChatMessage[]): number {
   let total = 0;
   for (const message of messages) {
     if (typeof message.content === "string") total += message.content.length / 4;
+    else if (Array.isArray(message.content)) {
+      // An image costs roughly the same as a thousand words regardless of size.
+      for (const part of message.content) {
+        total += part.type === "text" ? part.text.length / 4 : 800;
+      }
+    }
     if (message.role === "assistant" && message.tool_calls) {
       for (const call of message.tool_calls) {
         total += call.function.name.length / 4 + call.function.arguments.length / 4 + 8;
@@ -75,9 +81,12 @@ function summarize(messages: ChatMessage[]): string {
   const requests: string[] = [];
 
   for (const message of messages) {
-    if (message.role === "user" && typeof message.content === "string" && !message.content.startsWith("[")) {
-      const text = message.content.replace(/\s+/g, " ").trim();
-      if (text) requests.push(text.slice(0, 160));
+    if (message.role === "user") {
+      const raw = typeof message.content === "string"
+        ? message.content
+        : message.content.filter((part) => part.type === "text").map((part) => part.text).join(" ");
+      const text = raw.replace(/\s+/g, " ").trim();
+      if (text && !text.startsWith("[") && !text.startsWith("attached image")) requests.push(text.slice(0, 160));
     }
     if (message.role === "assistant" && message.tool_calls) {
       for (const call of message.tool_calls) {

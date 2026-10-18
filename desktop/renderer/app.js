@@ -83,6 +83,7 @@ const state = {
   sessionQuery: "",
   showArchived: false,
   comments: [],
+  attachments: [],
   commands: [],
   diffScope: "session",
   currentSubagent: null,
@@ -192,11 +193,12 @@ function addNode(html) {
 
 /* ---------- transcript rendering ---------- */
 
-function addUserTurn(text) {
+function addUserTurn(text, imageCount = 0) {
   const queued = state.busy;
+  const images = imageCount > 0 ? `<span class="user-images">${t.imageCount(imageCount)}</span>` : "";
   const node = addNode(
     `<div class="turn user${queued ? " queued" : ""}">` +
-      `<div class="user-bubble">${escapeHtml(text)}${queued ? `<span class="queued-tag">${escapeHtml(t.queuedTag)}</span>` : ""}</div>` +
+      `<div class="user-bubble">${escapeHtml(text)}${images}${queued ? `<span class="queued-tag">${escapeHtml(t.queuedTag)}</span>` : ""}</div>` +
       `</div>`,
   );
   node.dataset.queued = queued ? "1" : "";
@@ -1047,7 +1049,7 @@ function handleEvent(message) {
       state.currentTool = null;
       state.lastToolNode = null;
       for (const item of message.messages || []) {
-        if (item.role === "user") addUserTurn(item.text);
+        if (item.role === "user") addUserTurn(item.text, item.images ?? 0);
         else if (item.role === "assistant") {
           const node = addNode(`<div class="turn assistant"><div class="markdown">${md(item.text)}</div></div>`);
           bindCodeCopy(node);
@@ -1966,11 +1968,14 @@ function autoSize() {
 
 function submit() {
   const text = input.value.trim();
-  if (!text) return;
+  const images = state.attachments.map((attachment) => attachment.url);
+  if (!text && images.length === 0) return;
   input.value = "";
   autoSize();
-  addUserTurn(text);
-  api.send({ cmd: "prompt", text });
+  addUserTurn(text || t.imageOnlyPrompt, images.length);
+  state.attachments = [];
+  renderAttachments();
+  api.send({ cmd: "prompt", text, images });
   input.focus();
 }
 
@@ -2101,6 +2106,69 @@ document.addEventListener("click", (event) => {
   if (!modelMenu.hidden && !event.target.closest(".model-control")) closeModelMenu();
 });
 
+
+
+/* ---------- pasted images ---------- */
+
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+
+function addAttachment(dataUrl, name) {
+  if (state.attachments.length >= 6) {
+    addNotice("warn", t.attachmentLimit);
+    return;
+  }
+  state.attachments.push({ url: dataUrl, name: name || "image" });
+  renderAttachments();
+}
+
+function renderAttachments() {
+  const strip = $("attachments");
+  strip.innerHTML = "";
+  strip.hidden = state.attachments.length === 0;
+  state.attachments.forEach((attachment, index) => {
+    const chip = document.createElement("div");
+    chip.className = "attachment";
+    chip.innerHTML =
+      `<img src="${attachment.url}" alt="${escapeHtml(attachment.name)}" />` +
+      `<button class="attachment-remove" title="${escapeHtml(t.attachmentRemove)}">×</button>`;
+    chip.querySelector(".attachment-remove").addEventListener("click", () => {
+      state.attachments.splice(index, 1);
+      renderAttachments();
+    });
+    strip.appendChild(chip);
+  });
+}
+
+/** Paste or drop an image into the composer. */
+function handleImageFiles(files) {
+  for (const file of files) {
+    if (!file.type.startsWith("image/")) continue;
+    if (file.size > MAX_IMAGE_BYTES) {
+      addNotice("warn", t.attachmentTooLarge);
+      continue;
+    }
+    const reader = new FileReader();
+    reader.onload = () => addAttachment(String(reader.result), file.name);
+    reader.readAsDataURL(file);
+  }
+}
+
+input.addEventListener("paste", (event) => {
+  const files = [...(event.clipboardData?.files ?? [])].filter((file) => file.type.startsWith("image/"));
+  if (files.length === 0) return;
+  event.preventDefault();
+  handleImageFiles(files);
+});
+
+document.addEventListener("drop", (event) => {
+  const files = [...(event.dataTransfer?.files ?? [])].filter((file) => file.type.startsWith("image/"));
+  if (files.length === 0) return;
+  event.preventDefault();
+  handleImageFiles(files);
+});
+document.addEventListener("dragover", (event) => {
+  if ([...(event.dataTransfer?.types ?? [])].includes("Files")) event.preventDefault();
+});
 
 /* ---------- command palette ---------- */
 

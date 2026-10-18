@@ -4,11 +4,11 @@
  * Ollama, vLLM, LM Studio, and any gateway exposing the same shape.
  */
 
-import type { Usage } from "./types.ts";
+import type { Usage, UserContentPart } from "./types.ts";
 
 export interface ChatCompletionMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content?: string | null;
+  content?: string | UserContentPart[] | null;
   tool_calls?: ApiToolCall[];
   tool_call_id?: string;
   name?: string;

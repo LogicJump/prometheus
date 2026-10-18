@@ -404,7 +404,7 @@ async function emitGitStatus() {
   return status;
 }
 
-async function runPrompt(text) {
+async function runPrompt(text, images) {
   if (running) {
     // A message typed mid-turn is queued and delivered at the next tool
     // boundary; the renderer already echoed it into the transcript.
@@ -418,7 +418,11 @@ async function runPrompt(text) {
   send({ type: "queued", count: 0 });
   send({ type: "run_start" });
   try {
-    await agent.run(text);
+    if (Array.isArray(images) && images.length > 0) {
+      await agent.runWithParts(text, images.map((url) => ({ type: "image_url", image_url: { url } })));
+    } else {
+      await agent.run(text);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (err?.name !== "AbortError") send({ type: "error", message });
@@ -572,7 +576,7 @@ async function handle(cmd) {
       // verbatim so a message starting with "/" is never swallowed.
       const expanded = expandSlash(cwd, String(cmd.text ?? ""));
       if (!expanded) {
-        void runPrompt(cmd.text);
+        void runPrompt(cmd.text, cmd.images);
         return;
       }
       send({ type: "command_expanded", name: expanded.command.name, prompt: expanded.prompt });
@@ -917,8 +921,14 @@ async function handle(cmd) {
 function publicMessages(messages) {
   const out = [];
   for (const message of messages) {
-    if (message.role === "user" && typeof message.content === "string") {
-      out.push({ role: "user", text: message.content });
+    if (message.role === "user") {
+      if (typeof message.content === "string") {
+        out.push({ role: "user", text: message.content });
+      } else if (Array.isArray(message.content)) {
+        const text = message.content.filter((part) => part.type === "text").map((part) => part.text).join(" ");
+        const images = message.content.filter((part) => part.type === "image_url").length;
+        out.push({ role: "user", text, images });
+      }
     } else if (message.role === "assistant") {
       if (typeof message.content === "string" && message.content.trim()) {
         out.push({ role: "assistant", text: message.content });

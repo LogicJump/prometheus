@@ -24,9 +24,20 @@ export interface ToolCall {
   function: { name: string; arguments: string };
 }
 
+/** A pasted image, stored as a data URL the endpoint can decode. */
+export interface ImagePart {
+  type: "image_url";
+  image_url: { url: string };
+}
+
+export type TextPart = { type: "text"; text: string };
+
+/** User turns may carry images alongside text for vision-capable models. */
+export type UserContentPart = TextPart | ImagePart;
+
 export type ChatMessage =
   | { role: "system"; content: string }
-  | { role: "user"; content: string }
+  | { role: "user"; content: string | UserContentPart[] }
   | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
   | { role: "tool"; tool_call_id: string; content: string };
 

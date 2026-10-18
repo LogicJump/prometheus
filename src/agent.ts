@@ -3,7 +3,7 @@
 import os from "node:os";
 import type { ChatMessage } from "./llm.ts";
 import { ChatClient, ApiError, type ApiTool } from "./llm.ts";
-import type { Config, TodoList, Tool, ToolContext, Usage } from "./types.ts";
+import type { Config, TodoList, Tool, ToolContext, Usage, UserContentPart } from "./types.ts";
 import type { TerminalUi } from "./ui.ts";
 import { Permissions } from "./permissions.ts";
 import { compact, estimateTokens } from "./context.ts";
@@ -144,6 +144,12 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   /** Add a user message without running the loop (used when restoring sessions). */
   pushUser(text: string): void {
     this.messages.push({ role: "user", content: text });
+  }
+
+  /** Queue a user turn that may carry images; `text` is the prompt. */
+  async runWithParts(text: string, parts: UserContentPart[]): Promise<void> {
+    this.messages.push({ role: "user", content: [{ type: "text", text }, ...parts] });
+    await this.loop();
   }
 
   /**
