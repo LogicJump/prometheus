@@ -82,6 +82,7 @@ const state = {
   queuedCount: 0,
   sessionQuery: "",
   showArchived: false,
+  comments: [],
   commands: [],
   diffScope: "session",
   currentSubagent: null,
@@ -1217,6 +1218,7 @@ function renderDiff() {
   const files = active.files;
   renderDiffFileList(files);
   diffRoot.innerHTML = "";
+  commentEditor = null;
   if (files.length === 0) {
     diffRoot.innerHTML = `<div class="diff-empty">${escapeHtml(t.noChanges)}</div>`;
     workbenchMeta.textContent = "";
@@ -1230,6 +1232,7 @@ function renderDiff() {
     diffRoot.innerHTML = `<div class="diff-empty">${escapeHtml(selected.skipped)}</div>`;
     return;
   }
+  renderCommentRows(selected.path);
   for (const hunk of selected.hunks) {
     const header = document.createElement("div");
     header.className = "diff-hunk-header";
@@ -1238,6 +1241,8 @@ function renderDiff() {
     for (const line of hunk.lines) {
       const row = document.createElement("div");
       row.className = `diff-line ${line.kind}`;
+      const lineNo = line.newNo ?? line.oldNo;
+      if (lineNo != null) row.dataset.line = String(lineNo);
       const marker = line.kind === "add" ? "+" : line.kind === "del" ? "−" : " ";
       const gutter = document.createElement("span");
       gutter.className = "diff-gutter";
@@ -1246,10 +1251,120 @@ function renderDiff() {
       text.className = "diff-text";
       text.textContent = `${marker} ${line.text}`;
       row.append(gutter, text);
+      if (lineNo != null && line.kind !== "del") {
+        // Clicking a line attaches a review comment to it.
+        row.title = t.commentHint;
+        row.addEventListener("click", (event) => openLineComment(event, selected.path, lineNo, line.text));
+      }
       diffRoot.appendChild(row);
     }
   }
 }
+
+/* ---------- inline review comments ---------- */
+
+let commentEditor = null;
+
+function openLineComment(event, path, line, text) {
+  if (event.target.closest(".line-comment, .comment-editor")) return;
+  closeCommentEditor();
+  const editor = document.createElement("div");
+  editor.className = "comment-editor";
+  editor.innerHTML =
+    `<div class="comment-context">${escapeHtml(path)}:${line}</div>` +
+    `<textarea rows="2" placeholder="${escapeHtml(t.commentPlaceholder)}"></textarea>` +
+    `<div class="comment-actions">` +
+    `<button class="btn small" data-cancel>${escapeHtml(t.cancel)}</button>` +
+    `<button class="btn btn-primary small" data-save>${escapeHtml(t.commentAdd)}</button>` +
+    `</div>`;
+  const row = event.currentTarget;
+  row.after(editor);
+  const area = editor.querySelector("textarea");
+  area.focus();
+  const save = () => {
+    const body = area.value.trim();
+    if (!body) return closeCommentEditor();
+    state.comments.push({ path, line, body, text: String(text ?? "").slice(0, 160) });
+    closeCommentEditor();
+    renderCommentsBar();
+    renderDiff();
+  };
+  editor.querySelector("[data-save]").addEventListener("click", save);
+  editor.querySelector("[data-cancel]").addEventListener("click", closeCommentEditor);
+  area.addEventListener("keydown", (keyEvent) => {
+    if (keyEvent.key === "Enter" && (keyEvent.metaKey || keyEvent.ctrlKey)) {
+      keyEvent.preventDefault();
+      save();
+    }
+    if (keyEvent.key === "Escape") {
+      keyEvent.stopPropagation();
+      closeCommentEditor();
+    }
+  });
+  commentEditor = editor;
+}
+
+function closeCommentEditor() {
+  if (commentEditor) {
+    commentEditor.remove();
+    commentEditor = null;
+  }
+}
+
+/** Comments on the current file, shown as sticky rows above the diff. */
+function renderCommentRows(path) {
+  const mine = state.comments.filter((comment) => comment.path === path);
+  for (const comment of mine) {
+    const row = document.createElement("div");
+    row.className = "line-comment";
+    row.innerHTML =
+      `<span class="line-comment-where">${escapeHtml(String(comment.line))}</span>` +
+      `<span class="line-comment-body">${escapeHtml(comment.body)}</span>` +
+      `<button class="line-comment-remove" title="${escapeHtml(t.commentRemove)}">×</button>`;
+    row.querySelector(".line-comment-remove").addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      state.comments = state.comments.filter((item) => item !== comment);
+      renderCommentsBar();
+      renderDiff();
+    });
+    diffRoot.appendChild(row);
+  }
+}
+
+/**
+ * Pending comments become one message: file, line, and the reviewer's note.
+ * Sending clears the list so the next review starts empty.
+ */
+function sendComments() {
+  if (state.comments.length === 0) return;
+  const lines = state.comments.map(
+    (comment) => `- ${comment.path}:${comment.line} — ${comment.body}${comment.text ? `\n  (line: ${comment.text})` : ""}`,
+  );
+  const message = `${t.commentMessageIntro}\n\n${lines.join("\n")}`;
+  const previous = input.value.trim();
+  input.value = previous ? `${previous}\n\n${message}` : message;
+  state.comments = [];
+  renderCommentsBar();
+  autoSize();
+  input.focus();
+  if (!workbench.hidden) closeWorkbench();
+}
+
+function renderCommentsBar() {
+  const bar = $("comments-bar");
+  if (!bar) return;
+  const count = state.comments.length;
+  bar.hidden = count === 0;
+  $("comments-count").textContent = t.commentCount(count);
+  $("comments-clear").hidden = count === 0;
+}
+
+$("comments-send").addEventListener("click", sendComments);
+$("comments-clear").addEventListener("click", () => {
+  state.comments = [];
+  renderCommentsBar();
+});
+
 
 function renderDiffFileList(files = state.changes.files) {
   diffFilelist.innerHTML = "";
