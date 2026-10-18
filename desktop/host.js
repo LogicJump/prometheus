@@ -45,7 +45,7 @@ import {
 import { readMemorySections, deleteMemory } from "../src/memory.ts";
 import { installPack } from "../src/packs/install.ts";
 import { listPacks, packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
-import { catalogFor, toInstallEntry } from "../src/packs/catalog.ts";
+import { catalogFor, isInstallable, toInstallEntry } from "../src/packs/catalog.ts";
 import { resetToolchainCache } from "../src/embedded/toolchain.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
@@ -681,7 +681,7 @@ async function handle(cmd) {
         cwd = canonicalCwd(cmd.cwd);
         process.chdir(cwd);
       }
-  if (isLocale(cmd.locale)) locale = cmd.locale;
+      if (isLocale(cmd.locale)) locale = cmd.locale;
       try {
         config = loadConfig({ permissionMode: cmd.mode });
       } catch (err) {
@@ -699,6 +699,21 @@ async function handle(cmd) {
         send({ type: "notice", level: "warn", text: `the previous run was interrupted (${interrupted.sessionId}); its files are in History` });
       }
       void refreshCatalog(false);
+      // 上次被强杀留下的半截事务不该一直占着几个 GB。清理是后台的，
+      // 而且只删够老的目录 —— 另开一个窗口正在装的包不受影响。
+      void pruneTmp()
+        .then((result) => {
+          if (result.removed.length > 0) {
+            send({
+              type: "notice",
+              level: "info",
+              text: `cleaned up ${result.removed.length} abandoned toolchain download(s), ${(result.bytes / 1048576).toFixed(0)} MB`,
+            });
+          }
+        })
+        .catch(() => {
+          /* 清理失败不影响任何事，下次再说 */
+        });
       return;
     }
     case "refreshModels":
@@ -759,7 +774,7 @@ async function handle(cmd) {
             version: entry.version,
             downloadBytes: entry.downloadBytes,
             provides: entry.provides,
-            installable: entry.sources.every((source) => /^[0-9a-f]{64}$/.test(source.sha256)),
+            installable: isInstallable(entry),
           })),
         });
       } catch (error) {
@@ -773,7 +788,7 @@ async function handle(cmd) {
         send({ type: "pack_error", id: cmd.id, message: "no such pack in the catalog" });
         return;
       }
-      if (!entry.sources.every((source) => /^[0-9a-f]{64}$/.test(source.sha256))) {
+      if (!isInstallable(entry)) {
         send({ type: "pack_error", id: cmd.id, message: "this pack has not been checksummed yet and cannot be installed" });
         return;
       }

@@ -19,16 +19,6 @@
     "target": ["nsis", "portable"],
     "artifactName": "Prometheus-${version}-${arch}.${ext}"
   },
-  "mac": {
-    "icon": "build/icon.png",
-    "target": ["dmg"],
-    "category": "public.app-category.developer-tools"
-  },
-  "linux": {
-    "icon": "build/icon.png",
-    "target": ["AppImage", "deb"],
-    "category": "Development"
-  },
   "nsis": {
     "oneClick": false,
     "allowToChangeInstallationDirectory": true

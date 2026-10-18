@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
 import { tmpdir } from "node:os";
-import { assertPackId, isInside, packDir, packsRoot, ROOT_ENV, ensureRoot, isOwnedRoot } from "../src/packs/paths.ts";
+import { assertPackId, isInside, packDir, packsRoot, ROOT_ENV, ensureRoot, isOwnedRoot, acquireRootLock } from "../src/packs/paths.ts";
 import { parseManifest, readManifest, resolvePayloadPath, writeManifest, type PackManifest } from "../src/packs/manifest.ts";
 import { planExtraction, validateMember, walkStats } from "../src/packs/archive.ts";
 
@@ -52,6 +52,57 @@ test("the root carries an ownership marker so prune never deletes a stranger's d
   assert.equal(isOwnedRoot(root), true);
   assert.ok(existsSync(join(root, "packs")));
   assert.ok(existsSync(join(root, "tmp")));
+});
+
+// ---- the install lock -----------------------------------------------------
+
+test("a second install into the same root is refused rather than raced", () => {
+  const root = scratch("prometheus-lock-");
+  const first = acquireRootLock(root, { id: "pack-a" });
+  try {
+    assert.throws(() => acquireRootLock(root, { id: "pack-b" }), /in use by another Prometheus install/);
+  } finally {
+    first.release();
+  }
+  // Released: the next one gets in.
+  const second = acquireRootLock(root, { id: "pack-c" });
+  second.release();
+});
+
+test("a lock left by a dead process is broken, so a crash does not block installs forever", () => {
+  const root = scratch("prometheus-lock-dead-");
+  ensureRoot(root);
+  // A pid that is certain not to exist: spawn nothing, use one past the max.
+  writeFileSync(join(root, ".lock"), JSON.stringify({ pid: 4294967295, startedAt: new Date().toISOString() }));
+  const lock = acquireRootLock(root);
+  lock.release();
+  assert.equal(existsSync(join(root, ".lock")), false);
+});
+
+test("a corrupt lock is broken rather than blocking forever", () => {
+  const root = scratch("prometheus-lock-corrupt-");
+  ensureRoot(root);
+  writeFileSync(join(root, ".lock"), "{ this is not json");
+  const lock = acquireRootLock(root);
+  lock.release();
+  assert.equal(existsSync(join(root, ".lock")), false);
+});
+
+test("a lock belonging to a live process is respected", () => {
+  const root = scratch("prometheus-lock-live-");
+  ensureRoot(root);
+  // The test runner's own pid is definitely alive, and `breakStaleLock`
+  // deliberately refuses to break our own record.
+  const lock = acquireRootLock(root);
+  try {
+    writeFileSync(join(root, ".lock"), JSON.stringify({ pid: process.ppid ?? process.pid, startedAt: new Date().toISOString() }));
+    assert.throws(() => acquireRootLock(root), /in use/);
+  } finally {
+    // The record now names another pid, so release() is a no-op by design;
+    // clear it so the scratch directory is clean.
+    assert.equal(existsSync(join(root, ".lock")), true);
+    lock.release();
+  }
 });
 
 // ---- manifest -------------------------------------------------------------
@@ -411,12 +462,23 @@ test("没有校验和的条目不会出现在可安装列表里", () => {
 test("目录按平台和架构过滤", () => {
   // 换一个平台就不该看到别的平台的包。
   const win = catalogFor("win32", "x64", { includeUnverified: true });
-  const linux = catalogFor("linux", "x64", { includeUnverified: true });
   for (const entry of win) assert.equal(entry.platform, "win32");
-  for (const entry of linux) assert.equal(entry.platform, "linux");
-  // arm64 的 macOS 包不该出现在 x64 上。
-  const darwinX64 = catalogFor("darwin", "x64", { includeUnverified: true });
-  assert.equal(darwinX64.length, 0);
+  // 产品目前只发 Windows，其它平台上目录应当是空的 —— 而不是列出装不上的
+  // 东西让用户去点。
+  assert.equal(catalogFor("linux", "x64", { includeUnverified: true }).length, 0);
+  assert.equal(catalogFor("darwin", "arm64", { includeUnverified: true }).length, 0);
+  // 同一个平台里换架构也一样。
+  assert.equal(catalogFor("win32", "arm64", { includeUnverified: true }).length, 0);
+});
+
+test("目录里的每个条目都是 Windows 的 arm-none-eabi 工具链", () => {
+  // 这条测试是产品范围的锚点：只做 Win 端时，目录里出现别的平台条目
+  // 一定是有意加的，而不是拷贝粘贴带进来的。
+  for (const entry of CATALOG) {
+    assert.equal(entry.platform, "win32", `${entry.id} 不是 Windows 条目`);
+    assert.equal(entry.arch, "x64", `${entry.id} 不是 x64 条目`);
+    assert.deepEqual(entry.provides, ["gcc-arm"], `${entry.id} 提供的东西变了`);
+  }
 });
 
 test("目录里每个条目本身是自洽的", () => {

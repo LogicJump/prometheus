@@ -13,7 +13,7 @@
  * so no admin rights and no `Program Files`.
  */
 
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize, resolve, sep } from "node:path";
 
@@ -136,5 +136,105 @@ export function isOwnedRoot(root: string): boolean {
     return statSync(join(root, "root.json")).isFile();
   } catch {
     return false;
+  }
+}
+
+export interface RootLock {
+  release(): void;
+}
+
+interface LockRecord {
+  pid: number;
+  startedAt: string;
+  id?: string;
+}
+
+/**
+ * Take the root-wide install lock.
+ *
+ * Two windows are two host processes, and both of them can reach
+ * `installPack`. Without this, two installs of the same pack would stage into
+ * different transaction directories and then race on the commit rename: one
+ * wins, the other gets EPERM after ten minutes of downloading, and the loser's
+ * staging copy is left behind. The lock turns that into a refusal that costs
+ * nothing.
+ *
+ * Staleness is decided by pid, not by age: a real install can take longer than
+ * any timeout worth writing down, but a dead pid is never coming back. A record
+ * whose pid belongs to a live process — including the caller's own — is not
+ * broken, because a hung host would otherwise block installs forever.
+ */
+export function acquireRootLock(root: string = packsRoot(), record: Omit<LockRecord, "pid" | "startedAt"> = {}): RootLock {
+  ensureRoot(root);
+  const path = join(root, ".lock");
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(path, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), ...record }, null, 2), {
+        flag: "wx",
+      });
+      return {
+        release() {
+          // Only remove the lock if it is still ours. Another holder may have
+          // replaced it after breaking a stale record, and deleting theirs would
+          // let a third process in.
+          try {
+            const current = JSON.parse(readFileSync(path, "utf8")) as LockRecord;
+            if (current.pid === process.pid) rmSync(path, { force: true });
+          } catch {
+            /* already gone, or unreadable — nothing to release */
+          }
+        },
+      };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+      if (attempt > 0 || !breakStaleLock(path)) {
+        throw new Error(
+          `${root} is in use by another Prometheus install. Close the other window, or remove ${path} if nothing is installing.`,
+        );
+      }
+    }
+  }
+
+  // Unreachable: the loop either returns a lock or throws.
+  throw new Error(`could not lock ${root}`);
+}
+
+/** Delete the lock file when its holder is gone. Returns true when it did. */
+function breakStaleLock(path: string): boolean {
+  let record: LockRecord;
+  try {
+    record = JSON.parse(readFileSync(path, "utf8")) as LockRecord;
+  } catch {
+    // An unreadable lock is half-written or corrupt; either way it is not a
+    // live holder, and leaving it would block installs until someone deletes it
+    // by hand.
+    try {
+      rmSync(path, { force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  if (typeof record.pid === "number" && record.pid !== process.pid && isRunning(record.pid)) return false;
+  if (record.pid === process.pid) return false; // our own earlier lock: a live hold
+  try {
+    rmSync(path, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether a pid exists. `process.kill(pid, 0)` is the portable probe. */
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means it exists but belongs to someone else.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }

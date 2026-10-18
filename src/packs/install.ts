@@ -29,7 +29,7 @@ import { join } from "node:path";
 import { downloadVerified } from "./download.ts";
 import { extractArchive, listArchive, planExtraction, tarBinary, treeHash, walkStats } from "./archive.ts";
 import { parseManifest, writeManifest, type PackManifest } from "./manifest.ts";
-import { assertPackId, ensureRoot, isOwnedRoot, packDir, packsRoot, tmpDir } from "./paths.ts";
+import { acquireRootLock, assertPackId, ensureRoot, isOwnedRoot, packDir, packsRoot, tmpDir } from "./paths.ts";
 
 export type PackPhase = "preflight" | "download" | "verify" | "extract" | "inspect" | "validate" | "commit";
 
@@ -240,18 +240,26 @@ export async function installPack(entry: CatalogEntry, options: InstallOptions =
     throw new InstallError(`${root} exists but is not a Prometheus toolchain directory; refusing to write into it`);
   }
 
+  // The lock covers everything from the first byte downloaded to the commit.
+  // It is deliberately taken after the checks that write nothing, so a refusal
+  // for a bad id or a full disk never has to wait for another window.
+  const lock = acquireRootLock(root, { id });
+
   // ---- transaction --------------------------------------------------------
-  const txn = mkdtempSync(join(tmpDir(root), "txn-"));
-  // The pack directory is `pack.json` + `NOTICE.md` + `payload/`. Extraction
-  // lands inside `payload` so the committed tree already has its final shape —
-  // a pack directory whose layout only becomes correct after a move is a pack
-  // that can be observed in the wrong state.
-  const payloadStage = join(txn, manifest.payload.root);
-  // tar 的 `-C` 要求目标目录已经存在；不建的话它会 chdir 失败，而错误信息
-  // 出现在下载和校验都成功之后 —— 那是最让人困惑的失败位置。
-  mkdirSync(payloadStage, { recursive: true });
+  // Created inside the `try` so a failure here still reaches `finally` and
+  // releases the lock. `txn` stays null until the directory exists.
+  let txn: string | null = null;
 
   try {
+    txn = mkdtempSync(join(tmpDir(root), "txn-"));
+    // The pack directory is `pack.json` + `NOTICE.md` + `payload/`. Extraction
+    // lands inside `payload` so the committed tree already has its final shape —
+    // a pack directory whose layout only becomes correct after a move is a pack
+    // that can be observed in the wrong state.
+    const payloadStage = join(txn, manifest.payload.root);
+    // tar 的 `-C` 要求目标目录已经存在；不建的话它会 chdir 失败，而错误信息
+    // 出现在下载和校验都成功之后 —— 那是最让人困惑的失败位置。
+    mkdirSync(payloadStage, { recursive: true });
     // Download every source; a composite pack (Zephyr) has more than one.
     const archives: { path: string; format: PackManifest["sources"][number]["archive"] }[] = [];
     for (const [index, source] of manifest.sources.entries()) {
@@ -339,10 +347,11 @@ export async function installPack(entry: CatalogEntry, options: InstallOptions =
     // is nothing to remove — deleting the destination would destroy the pack
     // that was just installed.
     try {
-      if (existsSync(txn)) rmSync(txn, { recursive: true, force: true });
+      if (txn && existsSync(txn)) rmSync(txn, { recursive: true, force: true });
     } catch {
       /* pruned later */
     }
+    lock.release();
   }
 }
 

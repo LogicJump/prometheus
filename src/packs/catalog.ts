@@ -93,64 +93,6 @@ export const CATALOG: CatalogEntryDef[] = [
     validation: { command: "bin/arm-none-eabi-gcc.exe", args: ["-dumpmachine"], expect: "^arm-none-eabi$" },
     priority: 10,
   },
-  {
-    id: "arm-gnu-15.3.rel2-linux-x64",
-    name: "Arm GNU Toolchain",
-    version: "15.3.rel2",
-    provider: "arm",
-    platform: "linux",
-    arch: "x64",
-    downloadBytes: 159_700_000,
-    unpackedBytes: 1_077_000_000,
-    sources: [
-      {
-        url: `${SRC}/15.3.rel2/arm-gnu-toolchain-15.3.rel2-x86_64-arm-none-eabi.tar.xz`,
-        archive: "tar.xz",
-        sha256: "",
-        bytes: 159_700_000,
-        hosts: ARM_HOSTS,
-      },
-    ],
-    license: ARM_LICENSE,
-    provides: ["gcc-arm"],
-    executables: [
-      { name: "arm-none-eabi-gcc", path: "bin/arm-none-eabi-gcc", toolchain: "gcc-arm" },
-      { name: "arm-none-eabi-gdb", path: "bin/arm-none-eabi-gdb", toolchain: "gcc-arm" },
-      { name: "arm-none-eabi-size", path: "bin/arm-none-eabi-size", toolchain: "gcc-arm" },
-    ],
-    env: { pathPrepend: ["payload/bin"], vars: {} },
-    validation: { command: "bin/arm-none-eabi-gcc", args: ["-dumpmachine"], expect: "^arm-none-eabi$" },
-    priority: 10,
-  },
-  {
-    id: "arm-gnu-15.3.rel2-darwin-arm64",
-    name: "Arm GNU Toolchain",
-    version: "15.3.rel2",
-    provider: "arm",
-    platform: "darwin",
-    arch: "arm64",
-    downloadBytes: 143_700_000,
-    unpackedBytes: 1_077_000_000,
-    sources: [
-      {
-        url: `${SRC}/15.3.rel2/arm-gnu-toolchain-15.3.rel2-darwin-arm64-arm-none-eabi.tar.xz`,
-        archive: "tar.xz",
-        sha256: "",
-        bytes: 143_700_000,
-        hosts: ARM_HOSTS,
-      },
-    ],
-    license: ARM_LICENSE,
-    provides: ["gcc-arm"],
-    executables: [
-      { name: "arm-none-eabi-gcc", path: "bin/arm-none-eabi-gcc", toolchain: "gcc-arm" },
-      { name: "arm-none-eabi-gdb", path: "bin/arm-none-eabi-gdb", toolchain: "gcc-arm" },
-      { name: "arm-none-eabi-size", path: "bin/arm-none-eabi-size", toolchain: "gcc-arm" },
-    ],
-    env: { pathPrepend: ["payload/bin"], vars: {} },
-    validation: { command: "bin/arm-none-eabi-gcc", args: ["-dumpmachine"], expect: "^arm-none-eabi$" },
-    priority: 10,
-  },
 ];
 
 /** 一个条目是否具备安装条件：有哈希才可能出现给用户。 */
@@ -158,7 +100,16 @@ export function isInstallable(entry: CatalogEntryDef): boolean {
   return entry.sources.length > 0 && entry.sources.every((source) => /^[0-9a-f]{64}$/.test(source.sha256));
 }
 
-/** 当前平台能装的条目。 */
+/**
+ * 可以装到这台机器上的条目。
+ *
+ * 只有 Windows 版本：这是产品的决定，不是疏忽。多一个平台就要多一套实测
+ * 过的哈希、多一次发布验证，而没验过的条目装到用户机器上只会以"解压成功
+ * 但跑不起来"的方式失败。等某个平台真的要发，再把它的条目连哈希一起加进来。
+ *
+ * 参数保留成显式的 platform/arch 是为了让测试能在任何一台机器上验证过滤
+ * 逻辑，而不是让运行时去猜。
+ */
 export function catalogFor(
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
