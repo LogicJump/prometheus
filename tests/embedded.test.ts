@@ -10,6 +10,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parseDiagnostics, sortDiagnostics, summarizeDiagnostics, collapseCascades } from "../src/embedded/diagnostics.ts";
 import { detectProject, buildCommand } from "../src/embedded/project.ts";
+import { matchTarget, parsePyocdTargets, pyocdProbes } from "../src/embedded/probe.ts";
+import { capture, parseLine } from "../src/embedded/serial.ts";
 
 function scratch(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -187,4 +189,151 @@ test("Keil and IAR are identified but produce no build command", () => {
   assert.equal(project.kind, "keil");
   // The agent should say "this is a Keil project", not try to run CMake.
   assert.equal(buildCommand(project, {}), null);
+});
+
+// ---- probes and targets ----------------------------------------------------
+
+const PYOCD_TARGETS = `  air001                    AirM2M                   Air001                          builtin  \r
+  nrf52840                  Nordic Semiconductor     NRF52840                                builtin  \r
+  stm32f412xe               STMicroelectronics       STM32F412xE                             builtin  \r
+  stm32f412xg               STMicroelectronics       STM32F412xG                             builtin  \r
+  my_board                  Acme                     ACME1234                 M33 Series     pack  \r
+`;
+
+test("the pyOCD target table parses by value, not by column position", () => {
+  const targets = parsePyocdTargets(PYOCD_TARGETS);
+  assert.equal(targets.length, 5);
+
+  const stm = targets.find((target) => target.name === "stm32f412xe");
+  assert.ok(stm);
+  assert.equal(stm.vendor, "STMicroelectronics");
+  assert.equal(stm.part, "STM32F412xE");
+  // The empty Families column must not swallow the Source column.
+  assert.equal(stm.packSource, "builtin");
+  assert.equal(stm.families, undefined);
+
+  // A pack target that does have a family keeps it.
+  const packed = targets.find((target) => target.name === "my_board");
+  assert.deepEqual(packed?.families, ["M33 Series"]);
+  assert.equal(packed?.packSource, "pack");
+});
+
+test("target matching prefers exact, ignores case, and reports ambiguity", () => {
+  const targets = parsePyocdTargets(PYOCD_TARGETS);
+
+  assert.equal(matchTarget(targets, "nrf52840").target?.name, "nrf52840");
+  assert.equal(matchTarget(targets, "STM32F412XE").target?.name, "stm32f412xe");
+
+  // Two parts share a prefix: report both rather than pick one.
+  const ambiguous = matchTarget(targets, "stm32f412");
+  assert.equal(ambiguous.target, undefined);
+  assert.deepEqual(ambiguous.candidates.map((target) => target.name).sort(), ["stm32f412xe", "stm32f412xg"]);
+
+  assert.deepEqual(matchTarget(targets, "").candidates, []);
+});
+
+test("pyOCD's empty-desk sentence is not mistaken for a probe", () => {
+  const probes = pyocdProbes("No available debug probes are connected\n");
+  assert.equal(probes.length, 0);
+});
+
+test("an attached probe yields name, serial and target", () => {
+  const probes = pyocdProbes("  0   STLink V2   0673FF515052887167234822   STM32F412RETx   \n");
+  assert.equal(probes.length, 1);
+  assert.equal(probes[0].kind, "pyocd");
+  assert.equal(probes[0].name, "STLink V2");
+  assert.equal(probes[0].serial, "0673FF515052887167234822");
+  assert.equal(probes[0].target, "STM32F412RETx");
+});
+
+// ---- serial ----------------------------------------------------------------
+
+test("the four console formats parse into level, tag and timestamp", () => {
+  const zephyr = parseLine("[00:00:01.234,567] <err> i2c_nrfx: NACK received");
+  assert.equal(zephyr.t, 1234);
+  assert.equal(zephyr.level, "error");
+  assert.equal(zephyr.tag, "i2c_nrfx");
+  assert.equal(zephyr.text, "NACK received");
+
+  const idf = parseLine("W (1734) wifi: retry limit reached");
+  assert.equal(idf.t, 1734);
+  assert.equal(idf.level, "warn");
+  assert.equal(idf.tag, "wifi");
+
+  const rtos = parseLine("[42] sensor: reading 512");
+  assert.equal(rtos.t, 42);
+  assert.equal(rtos.tag, "sensor");
+
+  // Plain printf is the common case and must survive untouched.
+  const plain = parseLine("hello from main");
+  assert.equal(plain.level, undefined);
+  assert.equal(plain.text, "hello from main");
+  assert.equal(plain.raw, "hello from main");
+});
+
+test("ANSI colour and CRLF are stripped before parsing", () => {
+  const line = parseLine("\x1b[0;31mE (5) boot: panic\x1b[0m\r");
+  assert.equal(line.level, "error");
+  assert.equal(line.text, "panic");
+});
+
+/** A port that replays a scripted set of chunks. */
+function fakePort(chunks: string[], onDone?: () => void) {
+  let listener: ((chunk: string) => void) | undefined;
+  return (_path: string, _baud: number) => ({
+    onData(fn: (chunk: string) => void) {
+      listener = fn;
+      setTimeout(() => {
+        for (const chunk of chunks) fn(chunk);
+        onDone?.();
+      }, 0);
+    },
+    close() {
+      listener = undefined;
+    },
+  });
+}
+
+test("capture stops at the pattern and returns the matching line", async () => {
+  const open = fakePort(["booting\nready\n", "listening\n", "more that never arrives\n"]);
+  const result = await capture(open, "COM7", { until: /listening/, timeoutMs: 500 });
+  assert.equal(result.timedOut, false);
+  assert.equal(result.matched?.text, "listening");
+  assert.deepEqual(result.lines.map((line) => line.text), ["booting", "ready", "listening"]);
+});
+
+test("capture times out cleanly on a silent device", async () => {
+  const open = fakePort([]);
+  const result = await capture(open, "COM7", { timeoutMs: 60 });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.lines.length, 0);
+});
+
+test("a line split across chunks is reassembled", async () => {
+  const open = fakePort(["partial li", "ne\nnext\n"]);
+  const result = await capture(open, "COM7", { timeoutMs: 100, maxLines: 2 });
+  assert.deepEqual(result.lines.map((line) => line.text), ["partial line", "next"]);
+});
+
+test("a flooding device is capped instead of filling the context", async () => {
+  const flood = Array.from({ length: 500 }, (_, index) => `line ${index}\n`).join("");
+  const open = fakePort([flood]);
+  const result = await capture(open, "COM7", { maxLines: 10, timeoutMs: 500 });
+  assert.equal(result.lines.length, 10);
+  assert.equal(result.timedOut, true);
+});
+
+test("skipUntil drops the boot banner", async () => {
+  const open = fakePort(["*** Booting Zephyr ***\ninit\n[00:00:00.100,000] <inf> app: started\n"]);
+  const result = await capture(open, "COM7", { skipUntil: /<inf>/, timeoutMs: 100, maxLines: 5 });
+  assert.equal(result.lines.length, 1);
+  assert.equal(result.lines[0].tag, "app");
+});
+
+test("a port that cannot be opened reports the reason, not a hang", async () => {
+  const result = await capture(() => {
+    throw new Error("Access denied");
+  }, "COM7", { timeoutMs: 100 });
+  assert.equal(result.lines.length, 0);
+  assert.match(result.errors.join(" "), /Access denied/);
 });
