@@ -350,8 +350,13 @@ function setBusy(busy) {
   state.busy = busy;
   stopButton.hidden = !busy;
   sendButton.disabled = busy;
-  setStatus(busy ? "statusWorking" : "statusReady");
+  // Finishing a turn must not paint "ready" over a stopped host or a config
+  // error that is still the actual state.
+  if (busy) setStatus("statusWorking");
+  else if (!BUSY_OVERRIDES.has(state.statusKey)) setStatus("statusReady");
 }
+
+const BUSY_OVERRIDES = new Set(["statusHostStopped", "statusConfigError", "statusError"]);
 
 function setStatus(key) {
   state.statusKey = key;
@@ -1085,6 +1090,14 @@ function handleEvent(message) {
     case "host_exit":
       setBusy(false);
       setStatus("statusHostStopped");
+      addNode(
+        `<div class="notice error">${escapeHtml(t.hostStopped)} ` +
+          `<button class="link-button" id="host-retry">${escapeHtml(t.hostRestart)}</button></div>`,
+      );
+      $("host-retry")?.addEventListener("click", () => {
+        $("host-retry")?.closest(".notice")?.remove();
+        api.restartHost();
+      });
       break;
 
     case "fatal":

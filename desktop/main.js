@@ -160,34 +160,47 @@ function startWindow() {
     });
   }
 
-  const host = spawn(process.execPath, [HOST], {
-    cwd: startCwd,
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-  });
-
   const sendToRenderer = (message) => {
     if (!win.isDestroyed()) win.webContents.send("host-event", message);
   };
 
-  createInterface({ input: host.stdout }).on("line", (line) => {
-    try {
-      sendToRenderer(JSON.parse(line));
-    } catch {
-      sendToRenderer({ type: "notice", level: "warn", text: line });
-    }
-  });
-  createInterface({ input: host.stderr }).on("line", (line) => {
-    sendToRenderer({ type: "notice", level: "error", text: line });
-  });
-  host.on("exit", (code) => {
-    sendToRenderer({ type: "host_exit", code });
-  });
+  let host = null;
+  let hostCwd = startCwd;
 
   const sendToHost = (payload) => {
-    if (host.stdin.writable) host.stdin.write(`${JSON.stringify(payload)}\n`);
+    if (!host) return;
+    if (host.stdin.writable) host.stdin.write(`${JSON.stringify(payload)}
+`);
   };
+
+  /**
+   * (Re)start the agent process. Called at launch and again from the renderer's
+   * retry button after a crash, so a host failure does not require closing the
+   * window or losing the workspace.
+   */
+  function startHost(cwd) {
+    hostCwd = cwd || hostCwd;
+    host = spawn(process.execPath, [HOST], {
+      cwd: hostCwd,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    createInterface({ input: host.stdout }).on("line", (line) => {
+      try {
+        sendToRenderer(JSON.parse(line));
+      } catch {
+        sendToRenderer({ type: "notice", level: "warn", text: line });
+      }
+    });
+    createInterface({ input: host.stderr }).on("line", (line) => {
+      sendToRenderer({ type: "notice", level: "error", text: line });
+    });
+    host.on("exit", (code) => {
+      sendToRenderer({ type: "host_exit", code });
+    });
+    sendToHost({ cmd: "init", cwd: hostCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
+  }
 
   // IPC is app-wide; route each window's commands to its own host. Without
   // this a second window would drive the first window's agent.
@@ -195,13 +208,27 @@ function startWindow() {
     if (!win.isDestroyed() && event.sender === win.webContents) sendToHost(payload);
   });
 
+  ipcMain.on("host-restart", (event) => {
+    if (win.isDestroyed() || event.sender !== win.webContents) return;
+    try {
+      host?.kill();
+    } catch {
+      /* already gone */
+    }
+    startHost(hostCwd);
+  });
+
   win.webContents.on("did-finish-load", () => {
-    sendToHost({ cmd: "init", cwd: startCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
     if (explicitWorkspace) rememberWorkspace(explicitWorkspace, true);
   });
   win.on("closed", () => {
-    host.kill();
+    try {
+      host?.kill();
+    } catch {
+      /* already gone */
+    }
   });
+  startHost(startCwd);
 
   return { win, sendToHost };
 }
