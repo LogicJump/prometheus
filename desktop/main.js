@@ -68,6 +68,21 @@ function initialWorkspace(explicitWorkspace) {
   return app.isPackaged ? homedir() : process.cwd();
 }
 
+/**
+ * The app's own version. app.getVersion() reports Electron's version when the
+ * packaged bundle carries no app package.json, so read ours first and keep the
+ * Electron answer only as a fallback.
+ */
+function appVersion() {
+  try {
+    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8"));
+    if (pkg?.name === "prometheus" && pkg.version) return String(pkg.version);
+  } catch {
+    /* fall through */
+  }
+  return app.getVersion();
+}
+
 function rememberWorkspace(cwd, explicit = false) {
   try {
     const file = join(app.getPath("userData"), "workspace.json");
@@ -115,11 +130,10 @@ function startWindow() {
     backgroundColor: "#0e0e10",
     title: "Prometheus",
     icon: join(here, "..", "build", "icon.png"),
+    // The renderer draws its own minimize / maximize / close buttons on
+    // Windows and Linux so they match the top bar and follow the app theme.
+    // macOS keeps its traffic lights.
     titleBarStyle: "hidden",
-    titleBarOverlay:
-      process.platform === "win32"
-        ? { color: "#0e0e10", symbolColor: "#9d9da6", height: 48 }
-        : undefined,
     trafficLightPosition: { x: 16, y: 16 },
     autoHideMenuBar: true,
     webPreferences: {
@@ -132,6 +146,12 @@ function startWindow() {
 
   win.once("ready-to-show", () => win.show());
   win.loadFile(join(here, "renderer", "index.html"));
+
+  const sendWindowState = () => {
+    if (!win.isDestroyed()) win.webContents.send("window-state", { maximized: win.isMaximized() });
+  };
+  win.on("maximize", sendWindowState);
+  win.on("unmaximize", sendWindowState);
 
   if (process.env.PROMETHEUS_SCREENSHOT) {
     win.webContents.once("did-finish-load", () => {
@@ -259,6 +279,23 @@ app.whenReady().then(() => {
     startWindow();
   });
 
+  // Custom caption buttons: the renderer owns their look, the main process
+  // owns the actual window state.
+  ipcMain.on("window-control", (event, action) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win) return;
+    if (action === "minimize") win.minimize();
+    else if (action === "maximize") {
+      if (win.isMaximized()) win.unmaximize();
+      else win.maximize();
+    } else if (action === "close") win.close();
+  });
+
+  ipcMain.handle("window-state", (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return { maximized: Boolean(win?.isMaximized()) };
+  });
+
   ipcMain.handle("pick-directory", async () => {
     const result = await dialog.showOpenDialog({ properties: ["openDirectory"] });
     return result.canceled ? null : result.filePaths[0];
@@ -308,7 +345,8 @@ app.whenReady().then(() => {
     return true;
   });
 
-  ipcMain.handle("app-version", async () => app.getVersion());
+
+  ipcMain.handle("app-version", async () => appVersion());
 
   /**
    * Update check against a JSON feed at PROMETHEUS_UPDATE_URL, shaped like a
@@ -326,10 +364,11 @@ app.whenReady().then(() => {
       if (!response.ok) return { status: "error", message: `HTTP ${response.status}` };
       const latest = await response.json();
       const tag = String(latest.tag_name ?? latest.version ?? "").replace(/^v/, "");
+      const current = appVersion();
       return {
-        status: compareVersions(tag, app.getVersion()) > 0 ? "available" : "current",
+        status: compareVersions(tag, current) > 0 ? "available" : "current",
         latest: tag,
-        current: app.getVersion(),
+        current,
         url: typeof latest.html_url === "string" ? latest.html_url : null,
       };
     } catch (err) {

@@ -62,7 +62,11 @@ Renderer -> host (`cmd`):
 | `terminalOpen` | - | Start the shell and replay scrollback |
 | `terminalRun` | `command` | Run one command line |
 | `terminalInterrupt` / `terminalRestart` / `terminalClose` | - | Control the shell |
-| `getSettings` / `saveSettings` | `settings` | Read or write configuration |
+| `getSettings` / `saveSettings` | `settings` | Read or write configuration; `settings.provider` selects a registry provider and fills its base URL |
+
+Window chrome (renderer -> main): `windowControl(minimize | maximize | close)`
+and `windowState()`, plus host-pushed `window-state` events so the maximize
+glyph can switch to "restore".
 
 Host -> renderer (`type`): `hello`, `ready`, `state`, `models`, `changes`,
 `checkpoints`, `tree`, `file`, `file_matches`, `settings`, `settings_saved`,
@@ -76,6 +80,12 @@ Host -> renderer (`type`): `hello`, `ready`, `state`, `models`, `changes`,
 
 - The host is a separate process so the TypeScript sources run natively under
   Node (no bundler) and a runaway tool cannot freeze the window.
+- The agent loop is a generator (`src/query.ts`) that yields events; `Agent`
+  translates them into UI calls and the host mirrors them onto the protocol.
+  See [../docs/architecture.md](../docs/architecture.md).
+- Windows and Linux draw their own minimize / maximize / close buttons
+  (`#window-controls`, class `custom-caption`) so the caption matches the top
+  bar and follows the app theme; macOS keeps its native traffic lights.
 - Permissions surface as an inline bar above the composer, not a modal, so the
   transcript stays readable while deciding.
 - Tool rows are quiet one-liners; full output is one click away on demand.

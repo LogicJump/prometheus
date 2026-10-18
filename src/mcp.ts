@@ -1,51 +1,56 @@
 /**
- * Minimal MCP (Model Context Protocol) client over stdio.
+ * MCP (Model Context Protocol) client with two transports and two scopes.
  *
- * One server process speaks newline-delimited JSON-RPC 2.0 on stdin/stdout:
- * `initialize`, `tools/list`, then `tools/call`. Only stdio servers are
- * supported; HTTP/SSE transports are a separate concern.
+ * Transports:
+ *   stdio   a child process speaking newline-delimited JSON-RPC on stdio
+ *           (the default; `command` + `args`)
+ *   http    a Streamable HTTP endpoint (the `url` form); each JSON-RPC
+ *           message is POSTed and the response is read from the body, with
+ *           an SSE response parsed when the server streams it
  *
- * Configure in ~/.prometheus/mcp.json (or <workspace>/.prometheus/mcp.json):
+ * Scopes:
+ *   user      ~/.prometheus/mcp.json                 available everywhere
+ *   project   <workspace>/.prometheus/mcp.json       this repository only
  *
- *   { "servers": { "files": { "command": "npx", "args": ["-y", "@scope/server"] } } }
+ * A project server with the same name overrides the user server. There is no
+ * OAuth flow: credentials are environment variables or headers in the config
+ * file, which keeps the trust boundary where the user put it.
  *
- * Tool names are prefixed with the server name (`files__read`) so two servers
- * can expose the same tool without colliding.
+ * Config:
+ *
+ *   { "servers": {
+ *       "files":  { "command": "npx", "args": ["-y", "@scope/server"] },
+ *       "remote": { "url": "https://mcp.example.com/mcp",
+ *                   "headers": { "Authorization": "Bearer ..." } },
+ *       "off":    { "command": "...", "disabled": true }
+ *   } }
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
 import type { Tool, ToolResult } from "./types.ts";
 
 export interface McpServerConfig {
-  command: string;
+  /** stdio: the executable to start. */
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
+  /** http: the Streamable HTTP endpoint. */
+  url?: string;
+  headers?: Record<string, string>;
   /** Skip loading this server without deleting its entry. */
   disabled?: boolean;
+  /** "stdio" or "http"; inferred from command/url when absent. */
+  type?: string;
 }
+
+export type McpScope = "user" | "project";
 
 export interface McpConfigFile {
   servers?: Record<string, McpServerConfig>;
-}
-
-export function readMcpConfig(cwd: string): Record<string, McpServerConfig> {
-  const merged: Record<string, McpServerConfig> = {};
-  for (const file of [join(CONFIG_HOME, "mcp.json"), join(cwd, ".prometheus", "mcp.json")]) {
-    if (!existsSync(file)) continue;
-    try {
-      const parsed = JSON.parse(readFileSync(file, "utf8")) as McpConfigFile;
-      for (const [name, server] of Object.entries(parsed.servers ?? {})) {
-        if (server && typeof server.command === "string") merged[name] = server;
-      }
-    } catch {
-      /* an unreadable config file should not stop the session */
-    }
-  }
-  return merged;
 }
 
 interface Pending {
@@ -54,16 +59,30 @@ interface Pending {
   timer: NodeJS.Timeout;
 }
 
-export class McpClient {
-  private readonly child;
+export interface McpClient {
+  initialize(): Promise<void>;
+  listTools(): Promise<{ name: string; description?: string; inputSchema?: Record<string, unknown> }[]>;
+  callTool(name: string, args: Record<string, unknown>): Promise<ToolResult>;
+  request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
+  dispose(): void;
+}
+
+function transportOf(config: McpServerConfig): "stdio" | "http" {
+  if (config.type === "http" || config.type === "sse") return "http";
+  if (config.type === "stdio") return "stdio";
+  return config.url ? "http" : "stdio";
+}
+
+export class StdioMcpClient implements McpClient {
+  private readonly child: ChildProcess;
   private readonly pending = new Map<number, Pending>();
   private nextId = 1;
   private buffer = "";
   private closed = false;
-  /** Set when the process could not be spawned at all. */
   private spawnError: Error | null = null;
 
   constructor(name: string, config: McpServerConfig) {
+    if (!config.command) throw new Error(`MCP server "${name}" has no command`);
     this.child = spawn(config.command, config.args ?? [], {
       cwd: config.cwd,
       env: { ...process.env, ...config.env },
@@ -73,27 +92,24 @@ export class McpClient {
       // must not have one, or the shell mangles the arguments.
       shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(config.command),
     });
-    this.child.stdout.setEncoding("utf8");
-    this.child.stdout.on("data", (chunk: string) => this.onData(chunk));
+    this.child.stdout?.setEncoding("utf8");
+    this.child.stdout?.on("data", (chunk: string) => this.onData(chunk));
     // Servers often log to stderr; keep it from filling the pipe.
-    this.child.stderr.on("data", () => {});
+    this.child.stderr?.on("data", () => {});
     this.child.on("error", (err) => {
       this.spawnError = err;
-      this.closed = true;
-      for (const [, pending] of this.pending) {
-        clearTimeout(pending.timer);
-        pending.reject(err);
-      }
-      this.pending.clear();
+      this.failAll(err);
     });
-    this.child.on("exit", () => {
-      this.closed = true;
-      for (const [, pending] of this.pending) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error(`MCP server "${name}" exited`));
-      }
-      this.pending.clear();
-    });
+    this.child.on("exit", () => this.failAll(new Error(`MCP server "${name}" exited`)));
+  }
+
+  private failAll(error: Error): void {
+    this.closed = true;
+    for (const [, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 
   private onData(chunk: string): void {
@@ -109,14 +125,18 @@ export class McpClient {
       } catch {
         continue;
       }
-      if (typeof message.id !== "number") continue;
-      const pending = this.pending.get(message.id);
-      if (!pending) continue;
-      this.pending.delete(message.id);
-      clearTimeout(pending.timer);
-      if (message.error) pending.reject(new Error(message.error.message ?? "MCP error"));
-      else pending.resolve(message.result);
+      this.settle(message);
     }
+  }
+
+  private settle(message: { id?: number; result?: unknown; error?: { message?: string } }): void {
+    if (typeof message.id !== "number") return;
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    this.pending.delete(message.id);
+    clearTimeout(pending.timer);
+    if (message.error) pending.reject(new Error(message.error.message ?? "MCP error"));
+    else pending.resolve(message.result);
   }
 
   request(method: string, params: unknown, timeoutMs = 20_000): Promise<unknown> {
@@ -129,13 +149,13 @@ export class McpClient {
         reject(new Error(`MCP request timed out: ${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      this.child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
   }
 
   notify(method: string, params: unknown): void {
     if (this.closed) return;
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+    this.child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
   }
 
   async initialize(): Promise<void> {
@@ -157,11 +177,7 @@ export class McpClient {
       content?: { type?: string; text?: string }[];
       isError?: boolean;
     };
-    const text = (result?.content ?? [])
-      .filter((part) => part?.type === "text" && typeof part.text === "string")
-      .map((part) => part.text)
-      .join("\n");
-    return { content: text || "(no output)", isError: Boolean(result?.isError) };
+    return toToolResult(result);
   }
 
   dispose(): void {
@@ -172,6 +188,166 @@ export class McpClient {
       /* already gone */
     }
   }
+}
+
+/** Streamable HTTP transport: POST each message, read JSON or SSE back. */
+export class HttpMcpClient implements McpClient {
+  private readonly url: string;
+  private readonly headers: Record<string, string>;
+  private nextId = 1;
+  private sessionId = "";
+
+  constructor(config: McpServerConfig) {
+    if (!config.url) throw new Error("MCP HTTP server has no url");
+    this.url = config.url;
+    this.headers = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...config.headers };
+  }
+
+  private requestHeaders(): Record<string, string> {
+    return this.sessionId ? { ...this.headers, "Mcp-Session-Id": this.sessionId } : { ...this.headers };
+  }
+
+  private async post(payload: unknown, timeoutMs: number): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(this.url, {
+        method: "POST",
+        headers: this.requestHeaders(),
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      const session = res.headers.get("mcp-session-id");
+      if (session) this.sessionId = session;
+      return res;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async request(method: string, params: unknown, timeoutMs = 20_000): Promise<unknown> {
+    const id = this.nextId++;
+    let res: Response;
+    try {
+      res = await this.post({ jsonrpc: "2.0", id, method, params }, timeoutMs);
+    } catch (err) {
+      throw new Error(`MCP HTTP request failed: ${(err as Error).message}`);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`MCP HTTP ${res.status}: ${text.slice(0, 300)}`);
+    }
+    if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+      return this.readSse(res, id);
+    }
+    const body = (await res.json()) as { result?: unknown; error?: { message?: string } };
+    if (body.error) throw new Error(body.error.message ?? "MCP error");
+    return body.result;
+  }
+
+  /** Read an SSE stream until the response with our id arrives. */
+  private async readSse(res: Response, id: number): Promise<unknown> {
+    if (!res.body) throw new Error("MCP SSE response has no body");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let split: number;
+        while ((split = buffer.indexOf("\n\n")) >= 0) {
+          const event = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          const data = event
+            .split("\n")
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trim())
+            .join("\n");
+          if (!data) continue;
+          let message: { id?: number; result?: unknown; error?: { message?: string } };
+          try {
+            message = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          if (message.id !== id) continue;
+          if (message.error) throw new Error(message.error.message ?? "MCP error");
+          return message.result;
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+    throw new Error("MCP SSE stream ended without a response");
+  }
+
+  notify(method: string, params: unknown): void {
+    // Notifications are fire-and-forget; failures are not actionable here.
+    void this.post({ jsonrpc: "2.0", method, params }, 10_000).catch(() => {});
+  }
+
+  async initialize(): Promise<void> {
+    await this.request("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "prometheus", version: "0.1.0" },
+    });
+    this.notify("notifications/initialized", {});
+  }
+
+  async listTools(): Promise<{ name: string; description?: string; inputSchema?: Record<string, unknown> }[]> {
+    const result = (await this.request("tools/list", {})) as { tools?: unknown[] };
+    return Array.isArray(result?.tools) ? (result.tools as never[]) : [];
+  }
+
+  async callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const result = (await this.request("tools/call", { name, arguments: args }, 120_000)) as {
+      content?: { type?: string; text?: string }[];
+      isError?: boolean;
+    };
+    return toToolResult(result);
+  }
+
+  dispose(): void {
+    /* nothing to close; the server owns the session */
+  }
+}
+
+function toToolResult(result: { content?: { type?: string; text?: string }[]; isError?: boolean }): ToolResult {
+  const text = (result?.content ?? [])
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n");
+  return { content: text || "(no output)", isError: Boolean(result?.isError) };
+}
+
+/** User scope first, then project scope (project overrides by name). */
+export function readMcpConfig(cwd: string): Record<string, McpServerConfig & { scope: McpScope }> {
+  const merged: Record<string, McpServerConfig & { scope: McpScope }> = {};
+  const scopes: [McpScope, string][] = [
+    ["user", join(CONFIG_HOME, "mcp.json")],
+    ["project", join(cwd, ".prometheus", "mcp.json")],
+  ];
+  for (const [scope, file] of scopes) {
+    if (!existsSync(file)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as McpConfigFile;
+      for (const [name, server] of Object.entries(parsed.servers ?? {})) {
+        if (!server) continue;
+        if (typeof server.command !== "string" && typeof server.url !== "string") continue;
+        merged[name] = { ...server, scope };
+      }
+    } catch {
+      /* an unreadable config file should not stop the session */
+    }
+  }
+  return merged;
+}
+
+export function createClient(name: string, config: McpServerConfig): McpClient {
+  return transportOf(config) === "http" ? new HttpMcpClient(config) : new StdioMcpClient(name, config);
 }
 
 export interface LoadedMcp {
@@ -193,7 +369,13 @@ export async function loadMcpTools(cwd: string, timeoutMs = 15_000): Promise<Loa
   await Promise.all(
     Object.entries(configs).map(async ([name, config]) => {
       if (config.disabled) return;
-      const client = new McpClient(name, config);
+      let client: McpClient;
+      try {
+        client = createClient(name, config);
+      } catch (err) {
+        errors.push((err as Error).message);
+        return;
+      }
       try {
         await withTimeout(client.initialize(), timeoutMs, `MCP server "${name}" did not initialize`);
         const listed = await withTimeout(client.listTools(), timeoutMs, `MCP server "${name}" did not list tools`);

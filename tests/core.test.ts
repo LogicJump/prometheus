@@ -7,7 +7,7 @@ import { globToRegExp } from "../src/tools/fsUtil.ts";
 import { ChatClient } from "../src/llm.ts";
 import { diffFile } from "../src/diff.ts";
 import { startFakeServer } from "./fakeServer.ts";
-import type { ChatMessage } from "../src/llm.ts";
+import type { ChatMessage } from "../src/types.ts";
 
 test("compaction keeps the system prompt and recent turns, and summarizes old ones", () => {
   const messages: ChatMessage[] = [{ role: "system", content: "system prompt" }];

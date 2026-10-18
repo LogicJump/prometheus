@@ -912,7 +912,52 @@ svg {
   padding: 0 14px;
   border-bottom: 1px solid var(--border);
   -webkit-app-region: drag;
-  padding-right: 168px;
+}
+
+.window-controls {
+  display: flex;
+  align-self: stretch;
+  margin: 0 -14px 0 4px;
+  -webkit-app-region: no-drag;
+}
+
+.window-button {
+  width: 46px;
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
+  border-radius: 0;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.window-button svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.4;
+}
+
+.window-button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.window-close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+
+.window-button .glyph-restore,
+.window-maximized .window-button .glyph-maximize {
+  display: none;
+}
+
+.window-maximized .window-button .glyph-restore {
+  display: block;
+}
+
+/* macOS traffic lights sit over the sidebar; keep the brand clear of them. */
+.platform-darwin .sidebar-head {
+  padding-left: 84px;
 }
 
 .topbar button {
@@ -923,6 +968,69 @@ svg {
   font-size: 13px;
   font-weight: 500;
   color: var(--text-secondary);
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+}
+
+.topbar-menu {
+  position: absolute;
+  top: 44px;
+  right: 12px;
+  z-index: 60;
+  min-width: 210px;
+  padding: 4px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.4);
+  animation: slide-up 120ms ease-out;
+}
+
+/* Inside a window with custom caption, keep the menu clear of the buttons. */
+.custom-caption .topbar-menu {
+  right: 102px;
+}
+
+.menu-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.menu-row svg {
+  width: 15px;
+  height: 15px;
+  color: var(--text-faint);
+}
+
+.menu-row:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.menu-row.danger {
+  color: var(--danger);
+}
+
+.menu-row.danger svg {
+  color: var(--danger);
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
 }
 
 .titlebar-spacer {
@@ -2790,6 +2898,60 @@ mark.find-hit.current {
   padding: 4px 16px 12px;
 }
 
+/* Settings: a narrow category rail on the left, one pane at a time on the
+   right. Four categories fit without scrolling; each pane does. */
+.settings-dialog {
+  width: min(760px, 94vw);
+}
+
+.settings-layout {
+  display: flex;
+  gap: 18px;
+  padding: 0;
+  overflow: hidden;
+  min-height: 320px;
+}
+
+.settings-nav {
+  flex: 0 0 168px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 10px;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.settings-nav-item {
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  text-align: left;
+  color: var(--text-secondary);
+}
+
+.settings-nav-item:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.settings-nav-item.active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.settings-panes {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 8px 18px 12px 0;
+}
+
+.settings-panes .settings-section {
+  border-bottom: none;
+  padding-top: 8px;
+}
+
 .settings-section {
   padding: 14px 0 6px;
   border-bottom: 1px solid var(--border);
@@ -2930,7 +3092,7 @@ mark.find-hit.current {
     gap: 8px;
   }
   .topbar {
-    padding-right: 152px;
+    gap: 6px;
   }
 }
 

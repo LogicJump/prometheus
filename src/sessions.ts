@@ -1,10 +1,36 @@
-/** Session persistence: one JSON file per session under ~/.prometheus/sessions. */
+/**
+ * Session persistence: one append-only, generation-per-file JSONL transcript.
+ *
+ * A session lives in `~/.prometheus/sessions/<id>/` as:
+ *
+ *   meta.json              title, flags, timestamps, model, workspace
+ *   messages.0001.jsonl    one JSON message per line, in order
+ *   messages.0002.jsonl    (only after a compaction split the history)
+ *
+ * Append-only is the contract: `appendMessages` writes only new records and
+ * never rewrites existing ones, so a crash mid-turn loses at most the last
+ * line, and two writers (desktop host, CLI) cannot corrupt each other's
+ * history. When compaction rewrites the conversation, the writer starts a new
+ * generation file instead of editing the old one: earlier generations stay on
+ * disk as an audit trail of what the model actually saw.
+ *
+ * Legacy single-file sessions (`<id>.json`) are still read and are migrated
+ * to the directory layout on first write.
+ */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { SESSIONS_DIR } from "./config.ts";
-import type { ChatMessage } from "./llm.ts";
+import type { ChatMessage } from "./types.ts";
 
 export interface SessionFile {
   id: string;
@@ -18,10 +44,41 @@ export interface SessionFile {
   title?: string;
   pinned?: boolean;
   archived?: boolean;
+  /** Highest generation on disk; internal, maintained by the writer. */
+  generation?: number;
 }
 
-function fileFor(id: string): string {
+export interface SessionMeta {
+  id: string;
+  cwd: string;
+  model: string;
+  baseUrl: string;
+  createdAt: string;
+  updatedAt: string;
+  title?: string;
+  pinned?: boolean;
+  archived?: boolean;
+  generation: number;
+  /** Message count at the time the meta was last written. */
+  messageCount: number;
+  /** Hash of the last stored message, so an append can verify its prefix in O(1). */
+  lastHash?: string;
+}
+
+function hashMessage(message: ChatMessage): string {
+  return createHash("sha1").update(JSON.stringify(message)).digest("hex").slice(0, 16);
+}
+
+function sessionDir(id: string): string {
+  return join(SESSIONS_DIR, id);
+}
+
+function legacyFile(id: string): string {
   return join(SESSIONS_DIR, `${id}.json`);
+}
+
+function generationFile(id: string, generation: number): string {
+  return join(sessionDir(id), `messages.${String(generation).padStart(4, "0")}.jsonl`);
 }
 
 export function newSessionId(): string {
@@ -30,17 +87,228 @@ export function newSessionId(): string {
   return `${stamp}-${rand}`;
 }
 
-export function saveSession(session: SessionFile): void {
-  mkdirSync(SESSIONS_DIR, { recursive: true });
-  session.updatedAt = new Date().toISOString();
-  writeFileSync(fileFor(session.id), JSON.stringify(session, null, 2), "utf8");
+function readMeta(id: string): SessionMeta | null {
+  try {
+    return JSON.parse(readFileSync(join(sessionDir(id), "meta.json"), "utf8")) as SessionMeta;
+  } catch {
+    return null;
+  }
 }
 
+function writeMeta(meta: SessionMeta): void {
+  mkdirSync(sessionDir(meta.id), { recursive: true });
+  writeFileSync(join(sessionDir(meta.id), "meta.json"), JSON.stringify(meta, null, 2), "utf8");
+}
+
+/** Generation files present for a session, ascending. */
+function generations(id: string): number[] {
+  const dir = sessionDir(id);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .map((file) => /^messages\.(\d+)\.jsonl$/.exec(file))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map((match) => Number(match[1]))
+    .sort((a, b) => a - b);
+}
+
+/** Parse one generation file; a truncated final line is skipped. */
+function readGeneration(id: string, generation: number): ChatMessage[] {
+  let text: string;
+  try {
+    text = readFileSync(generationFile(id, generation), "utf8");
+  } catch {
+    return [];
+  }
+  const out: ChatMessage[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed) as ChatMessage);
+    } catch {
+      /* a torn write from a crash - drop the partial record */
+    }
+  }
+  return out;
+}
+
+/**
+ * The conversation as stored: the newest generation is a full snapshot, so
+ * earlier generations are audit history, not part of the live transcript.
+ */
+export function loadMessages(id: string): ChatMessage[] {
+  const all = generations(id);
+  if (all.length === 0) return [];
+  return readGeneration(id, all[all.length - 1]);
+}
+
+/** Every generation's messages, oldest first, for inspection and tests. */
+export function loadAllGenerations(id: string): ChatMessage[][] {
+  return generations(id).map((generation) => readGeneration(id, generation));
+}
+
+/** Start a new generation (compaction rewrote the conversation). */
+function startGeneration(id: string, messages: ChatMessage[], meta: SessionMeta): number {
+  const next = meta.generation + 1;
+  mkdirSync(sessionDir(id), { recursive: true });
+  writeFileSync(generationFile(id, next), messages.map((message) => `${JSON.stringify(message)}\n`).join(""), "utf8");
+  meta.lastHash = messages.length > 0 ? hashMessage(messages[messages.length - 1]) : undefined;
+  return next;
+}
+
+/**
+ * Replace the stored conversation. Only called when compaction rewrote the
+ * window (or a caller explicitly wants a rewrite); appends are the norm.
+ */
+export function replaceMessages(id: string, messages: ChatMessage[]): void {
+  const meta = readMeta(id);
+  if (!meta) return;
+  meta.generation = startGeneration(id, messages, meta);
+  meta.messageCount = messages.length;
+  meta.updatedAt = new Date().toISOString();
+  writeMeta(meta);
+}
+
+/**
+ * Append new messages to the newest generation and refresh the meta.
+ * Returns the number of messages appended.
+ */
+export function appendMessages(id: string, messages: ChatMessage[]): number {
+  const meta = readMeta(id);
+  if (!meta || messages.length === 0) return 0;
+  mkdirSync(sessionDir(id), { recursive: true });
+  const payload = messages.map((message) => `${JSON.stringify(message)}\n`).join("");
+  appendFileSync(generationFile(id, meta.generation), payload, "utf8");
+  meta.messageCount += messages.length;
+  meta.lastHash = hashMessage(messages[messages.length - 1]);
+  meta.updatedAt = new Date().toISOString();
+  writeMeta(meta);
+  return messages.length;
+}
+
+/**
+ * Save a session. New sessions get a directory; existing ones append only the
+ * messages past `messageCount`, and a shorter conversation (compaction) starts
+ * a new generation.
+ */
+export function saveSession(session: SessionFile): void {
+  const now = new Date().toISOString();
+  session.updatedAt = now;
+  const existing = readMeta(session.id);
+
+  if (!existing) {
+    const createdAt = session.createdAt || now;
+    const meta: SessionMeta = {
+      id: session.id,
+      cwd: session.cwd,
+      model: session.model,
+      baseUrl: session.baseUrl,
+      createdAt,
+      updatedAt: now,
+      title: session.title,
+      pinned: session.pinned,
+      archived: session.archived,
+      generation: 1,
+      messageCount: session.messages.length,
+    };
+    mkdirSync(sessionDir(session.id), { recursive: true });
+    writeFileSync(
+      generationFile(session.id, 1),
+      session.messages.map((message) => `${JSON.stringify(message)}\n`).join(""),
+      "utf8",
+    );
+    if (session.messages.length > 0) meta.lastHash = hashMessage(session.messages[session.messages.length - 1]);
+    writeMeta(meta);
+    session.generation = 1;
+    // A migrated legacy file must not shadow the directory.
+    try {
+      rmSync(legacyFile(session.id), { force: true });
+    } catch {
+      /* best effort */
+    }
+    return;
+  }
+
+  const meta: SessionMeta = {
+    ...existing,
+    cwd: session.cwd ?? existing.cwd,
+    model: session.model ?? existing.model,
+    baseUrl: session.baseUrl ?? existing.baseUrl,
+    title: session.title !== undefined ? session.title : existing.title,
+    pinned: session.pinned !== undefined ? session.pinned : existing.pinned,
+    archived: session.archived !== undefined ? session.archived : existing.archived,
+    updatedAt: now,
+  };
+  const stored = loadMessages(session.id);
+  const identical = sameMessages(stored, session.messages);
+  if (identical) {
+    // Nothing changed; only the meta timestamp moves.
+  } else if (session.messages.length < stored.length) {
+    // The conversation shrank: compaction replaced it.
+    meta.generation = startGeneration(session.id, session.messages, meta);
+    meta.messageCount = session.messages.length;
+  } else {
+    // Append only the new tail. The stored prefix must be untouched; the
+    // meta's last-message hash catches a rewritten history in O(1), and a
+    // full compare is the fallback for sessions written before the hash.
+    const sameTail =
+      meta.lastHash && stored.length > 0
+        ? hashMessage(stored[stored.length - 1]) === meta.lastHash && sameMessages(stored, session.messages.slice(0, stored.length))
+        : sameMessages(stored, session.messages.slice(0, stored.length));
+    if (sameTail) {
+      const fresh = session.messages.slice(stored.length);
+      appendFileSync(
+        generationFile(session.id, meta.generation),
+        fresh.map((message) => `${JSON.stringify(message)}\n`).join(""),
+        "utf8",
+      );
+      meta.messageCount = session.messages.length;
+    } else {
+      meta.generation = startGeneration(session.id, session.messages, meta);
+      meta.messageCount = session.messages.length;
+    }
+  }
+  if (session.messages.length > 0) meta.lastHash = hashMessage(session.messages[session.messages.length - 1]);
+  writeMeta(meta);
+  session.generation = meta.generation;
+}
+
+function sameMessages(a: ChatMessage[], b: ChatMessage[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index++) {
+    if (JSON.stringify(a[index]) !== JSON.stringify(b[index])) return false;
+  }
+  return true;
+}
+
+/** Load a session by id or unique prefix. */
 export function loadSession(idOrPrefix: string): SessionFile | null {
   if (!existsSync(SESSIONS_DIR)) return null;
-  const files = readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".json"));
-  const exact = files.find((f) => f === `${idOrPrefix}.json`);
-  const match = exact ?? files.find((f) => f.startsWith(idOrPrefix));
+  const entries = readdirSync(SESSIONS_DIR);
+  const dirs = entries.filter((entry) => existsSync(join(SESSIONS_DIR, entry, "meta.json")));
+  const dir = dirs.find((entry) => entry === idOrPrefix) ?? dirs.find((entry) => entry.startsWith(idOrPrefix));
+  if (dir) {
+    const meta = readMeta(dir);
+    if (!meta) return null;
+    return {
+      id: meta.id,
+      cwd: meta.cwd,
+      model: meta.model,
+      baseUrl: meta.baseUrl,
+      createdAt: meta.createdAt,
+      updatedAt: meta.updatedAt,
+      messages: loadMessages(meta.id),
+      title: meta.title,
+      pinned: meta.pinned,
+      archived: meta.archived,
+      generation: meta.generation,
+    };
+  }
+
+  // Legacy single-file session.
+  const files = entries.filter((entry) => entry.endsWith(".json"));
+  const exact = files.find((file) => file === `${idOrPrefix}.json`);
+  const match = exact ?? files.find((file) => file.startsWith(idOrPrefix));
   if (!match) return null;
   try {
     return JSON.parse(readFileSync(join(SESSIONS_DIR, match), "utf8")) as SessionFile;
@@ -66,6 +334,16 @@ export function updateSessionFlags(
 ): SessionFile | null {
   const session = loadSession(id);
   if (!session) return null;
+  const meta = readMeta(session.id);
+  if (meta) {
+    if (patch.title !== undefined) meta.title = patch.title?.trim() || undefined;
+    if (patch.pinned !== undefined) meta.pinned = patch.pinned;
+    if (patch.archived !== undefined) meta.archived = patch.archived;
+    meta.updatedAt = new Date().toISOString();
+    writeMeta(meta);
+    return loadSession(session.id);
+  }
+  // Legacy file: keep the old shape for a session that was never migrated.
   if (patch.title !== undefined) session.title = patch.title?.trim() || undefined;
   if (patch.pinned !== undefined) session.pinned = patch.pinned;
   if (patch.archived !== undefined) session.archived = patch.archived;
@@ -77,28 +355,57 @@ export function deleteSessionFile(id: string): boolean {
   const session = loadSession(id);
   if (!session) return false;
   try {
-    rmSync(fileFor(session.id), { force: true });
+    rmSync(sessionDir(session.id), { recursive: true, force: true });
+    rmSync(legacyFile(session.id), { force: true });
     return true;
   } catch {
     return false;
   }
 }
 
+function firstUserText(messages: ChatMessage[]): string {
+  for (const message of messages) {
+    if (message.role !== "user") continue;
+    if (typeof message.content === "string") return message.content;
+    return message.content.filter((part) => part.type === "text").map((part) => part.text).join(" ");
+  }
+  return "";
+}
+
 export function listSessions(cwdOnly: boolean, includeArchived = false): SessionSummary[] {
   if (!existsSync(SESSIONS_DIR)) return [];
   const out: SessionSummary[] = [];
-  for (const file of readdirSync(SESSIONS_DIR).filter((f) => f.endsWith(".json"))) {
+
+  // Directory-based sessions read only meta.json plus the first generation
+  // (for the preview line), so listing stays fast with many sessions.
+  for (const entry of readdirSync(SESSIONS_DIR)) {
+    const meta = readMeta(entry);
+    if (!meta) continue;
+    if (cwdOnly && meta.cwd !== process.cwd()) continue;
+    if (meta.archived && !includeArchived) continue;
+    const preview = firstUserText(readGeneration(meta.id, 1)).replace(/\s+/g, " ").slice(0, 100);
+    out.push({
+      id: meta.id,
+      cwd: meta.cwd,
+      updatedAt: meta.updatedAt,
+      summary: preview || "(no messages)",
+      title: meta.title,
+      pinned: meta.pinned,
+      archived: meta.archived,
+    });
+  }
+
+  // Legacy single-file sessions.
+  for (const file of readdirSync(SESSIONS_DIR).filter((entry) => entry.endsWith(".json"))) {
     try {
       const session = JSON.parse(readFileSync(join(SESSIONS_DIR, file), "utf8")) as SessionFile;
       if (cwdOnly && session.cwd !== process.cwd()) continue;
       if (session.archived && !includeArchived) continue;
-      const firstUser = session.messages.find((m) => m.role === "user");
-      const summary = typeof firstUser?.content === "string" ? firstUser.content : "(no messages)";
       out.push({
         id: session.id,
         cwd: session.cwd,
         updatedAt: session.updatedAt,
-        summary: summary.replace(/\s+/g, " ").slice(0, 100),
+        summary: firstUserText(session.messages).replace(/\s+/g, " ").slice(0, 100) || "(no messages)",
         title: session.title,
         pinned: session.pinned,
         archived: session.archived,
@@ -107,6 +414,7 @@ export function listSessions(cwdOnly: boolean, includeArchived = false): Session
       /* skip unreadable sessions */
     }
   }
+
   // Pinned sessions stay on top; everything else by recency.
   return out.sort((a, b) => {
     if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;

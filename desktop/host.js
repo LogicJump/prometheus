@@ -28,6 +28,7 @@ import { buildChange } from "../src/diff.ts";
 import { loadCheckpoints, restoreTo, clearCheckpoints, captureBefore } from "../src/checkpoints.ts";
 import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src/workspace.ts";
 import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
+import { publicProviders, providerFor } from "../src/providers.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
@@ -337,6 +338,9 @@ function createAgent(messages = []) {
   agent = new Agent(config, ui, client, ALL_TOOLS, permissions, messages);
   agent.sessionId = sessionId;
   agent.onBeforeMutate = (name, input) => recordChange(name, input);
+  // Compaction rewrote the history; persist the new generation immediately so
+  // an interrupted turn cannot leave a stale transcript on disk.
+  agent.onCompacted = () => persist();
   resetChanges();
   sessionCreatedAt = new Date().toISOString();
   ui.setModelName(config.model);
@@ -515,6 +519,8 @@ async function handle(cmd) {
       send({
         type: "settings",
         settings: {
+          provider: config?.provider ?? providerFor(config?.baseUrl ?? "").id,
+          providers: publicProviders(),
           baseUrl: config?.baseUrl ?? "",
           apiKeyMasked: maskKey(config?.apiKey ?? ""),
           model: config?.model ?? "",
@@ -533,6 +539,15 @@ async function handle(cmd) {
     case "saveSettings": {
       const patch = cmd.settings ?? {};
       const filePatch = {};
+      // Switching provider swaps the base URL to the registry's endpoint unless
+      // the user also typed one; the key field stays whatever they entered.
+      if (typeof patch.provider === "string" && patch.provider.trim()) {
+        const provider = publicProviders().find((entry) => entry.id === patch.provider.trim());
+        if (provider) {
+          filePatch.provider = provider.id;
+          if (!(typeof patch.baseUrl === "string" && patch.baseUrl.trim())) filePatch.baseUrl = provider.baseUrl;
+        }
+      }
       if (typeof patch.baseUrl === "string" && patch.baseUrl.trim()) filePatch.baseUrl = patch.baseUrl.trim().replace(/\/+$/, "");
       // An unchanged masked key is left alone; a typed replacement is saved as-is.
       if (typeof patch.apiKey === "string" && patch.apiKey.trim() && !patch.apiKey.includes("•")) {

@@ -57,6 +57,7 @@ const state = {
   model: "",
   models: [],
   modelsSource: "",
+  providers: [],
   sessionId: "",
   sessions: [],
   locale: savedLocale === "zh" || savedLocale === "en" ? savedLocale : detectLocale(),
@@ -121,7 +122,6 @@ function applyLocale(locale, { announce = false } = {}) {
   sendButton.title = `${t.send} (Enter)`;
   stopButton.title = `${t.stop} (Esc)`;
   $("workspace-button").title = t.changeWorkspace;
-  $("clear-button").title = t.clearSession;
   $("sidebar-toggle").title = t.sessions;
   $("refresh-sessions").title = t.sessions;
   const search = $("session-search");
@@ -2068,6 +2068,10 @@ document.addEventListener("keydown", (event) => {
       closeModal(shortcutsDialog);
       return;
     }
+    if (!topbarMenu.hidden) {
+      setTopbarMenu(false);
+      return;
+    }
     if (!modelMenu.hidden) {
       closeModelMenu();
       return;
@@ -2419,7 +2423,7 @@ $("workspace-button").addEventListener("click", async () => {
 function renderWorktree() {
   const active = state.worktree;
   $("worktree-state").textContent = active ? active.branch : t.worktreeOff;
-  $("worktree-card").classList.toggle("active", Boolean(active));
+  $("worktree-button").classList.toggle("active", Boolean(active));
   $("worktree-actions-off").hidden = Boolean(active);
   $("worktree-actions-on").hidden = !active;
   $("worktree-copy").textContent = active ? `${t.worktreeActive} ${active.path}` : t.worktreeExplain;
@@ -2438,10 +2442,10 @@ $("worktree-discard").addEventListener("click", () => {
   if (confirm(t.worktreeDiscardConfirm)) api.send({ cmd: "worktreeDiscard" });
 });
 
-$("clear-button").addEventListener("click", () => {
+const clearConversation = () => {
   // Clearing keeps the session and its saved history; only the transcript goes.
   if (confirm(t.clearConfirm)) api.send({ cmd: "clearHistory" });
-});
+};
 $("new-session").addEventListener("click", () => api.send({ cmd: "newSession" }));
 $("refresh-sessions").addEventListener("click", () => {
   api.send({ cmd: "listSessions", includeArchived: state.showArchived });
@@ -2490,6 +2494,25 @@ $("theme-button").addEventListener("click", () => {
   setTheme(state.theme === "light" ? "dark" : "light");
 });
 
+/* ---------- window controls ---------- */
+
+// Windows and Linux draw their caption buttons in the renderer so they match
+// the top bar; macOS keeps its native traffic lights.
+const windowControls = $("window-controls");
+if (api.platform && api.platform !== "darwin") {
+  windowControls.hidden = false;
+  document.documentElement.classList.add("custom-caption");
+  windowControls.querySelectorAll("[data-window]").forEach((button) => {
+    button.addEventListener("click", () => api.windowControl(button.dataset.window));
+  });
+  const applyWindowState = ({ maximized }) => {
+    document.documentElement.classList.toggle("window-maximized", Boolean(maximized));
+    $("window-maximize").title = maximized ? "Restore" : "Maximize";
+  };
+  api.onWindowState?.(applyWindowState);
+  void api.windowState?.().then(applyWindowState);
+}
+
 /* ---------- settings dialog ---------- */
 
 const settingsDialog = $("settings-dialog");
@@ -2510,8 +2533,28 @@ function closeModal(dialog) {
 
 function openSettings() {
   api.send({ cmd: "getSettings" });
+  selectSettingsTab("connection");
   openModal(settingsDialog);
+  // Land focus on the category rail, not the close button.
+  document.querySelector("[data-settings-tab].active")?.focus();
 }
+
+function selectSettingsTab(tab) {
+  document.querySelectorAll("[data-settings-tab]").forEach((button) => {
+    const active = button.dataset.settingsTab === tab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.querySelectorAll("[data-settings-pane]").forEach((pane) => {
+    pane.hidden = pane.dataset.settingsPane !== tab;
+  });
+  state.settingsTab = tab;
+}
+
+$("settings-nav").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-settings-tab]");
+  if (button) selectSettingsTab(button.dataset.settingsTab);
+});
 
 /** First-run path: open Settings on the connection fields with a short prompt. */
 function openSetup() {
@@ -2524,6 +2567,30 @@ function openSetup() {
 $("setup-button").addEventListener("click", openSetup);
 
 function fillSettings(s) {
+  state.providers = s.providers || [];
+  state.provider = s.provider || "custom";
+  const providerSelect = $("setting-provider");
+  providerSelect.innerHTML = "";
+  for (const provider of s.providers || []) {
+    const option = document.createElement("option");
+    option.value = provider.id;
+    option.textContent = provider.configured ? provider.label : `${provider.label} · ${t.providerNoKey}`;
+    providerSelect.appendChild(option);
+  }
+  if (s.baseUrl && ![...providerSelect.options].some((option) => option.value === s.provider)) {
+    const custom = document.createElement("option");
+    custom.value = "custom";
+    custom.textContent = t.providerCustom;
+    providerSelect.appendChild(custom);
+  }
+  if (s.provider === "custom" && ![...providerSelect.options].some((option) => option.value === "custom")) {
+    const custom = document.createElement("option");
+    custom.value = "custom";
+    custom.textContent = t.providerCustom;
+    providerSelect.appendChild(custom);
+  }
+  providerSelect.value = s.provider || "custom";
+  providerSelect.dataset.last = providerSelect.value;
   $("setting-base-url").value = s.baseUrl || "";
   $("models-hint").hidden = true;
   $("setting-api-key").value = s.apiKeyMasked || "";
@@ -2569,10 +2636,18 @@ $("setting-api-key").addEventListener("focus", (event) => {
   }
 });
 
+// Choosing a provider fills in its base URL so the two controls stay coherent.
+$("setting-provider").addEventListener("change", (event) => {
+  const providers = state.providers ?? [];
+  const chosen = providers.find((provider) => provider.id === event.target.value);
+  if (chosen) $("setting-base-url").value = chosen.baseUrl;
+});
+
 function saveSettings() {
   api.send({
     cmd: "saveSettings",
     settings: {
+      provider: $("setting-provider").value,
       baseUrl: $("setting-base-url").value,
       apiKey: $("setting-api-key").value,
       model: $("setting-model").value,
@@ -2655,8 +2730,7 @@ function openShortcuts() {
   openModal(shortcutsDialog);
 }
 
-$("shortcuts-button").addEventListener("click", openShortcuts);
-$("new-window-button").addEventListener("click", () => api.newWindow());
+$("shortcuts-close").addEventListener("click", () => closeModal(shortcutsDialog));
 
 async function exportSessionFile(markdown, filename) {
   if (!api.saveFile) return;
@@ -2664,8 +2738,36 @@ async function exportSessionFile(markdown, filename) {
   if (result?.saved) addNotice("dim", `${t.exportSaved} ${result.path}`);
 }
 
-$("export-button").addEventListener("click", () => api.send({ cmd: "exportSession" }));
-$("shortcuts-close").addEventListener("click", () => closeModal(shortcutsDialog));
+/* ---------- top bar overflow menu ---------- */
+
+const topbarMenu = $("topbar-menu");
+
+function setTopbarMenu(open) {
+  topbarMenu.hidden = !open;
+  $("more-button").setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+$("more-button").addEventListener("click", (event) => {
+  event.stopPropagation();
+  setTopbarMenu(topbarMenu.hidden);
+});
+
+topbarMenu.addEventListener("click", (event) => {
+  const row = event.target.closest(".menu-row");
+  if (!row) return;
+  setTopbarMenu(false);
+  if (row.id === "menu-export") api.send({ cmd: "exportSession" });
+  else if (row.id === "menu-new-window") api.newWindow();
+  else if (row.id === "menu-shortcuts") openShortcuts();
+  else if (row.id === "menu-clear") clearConversation();
+});
+
+document.addEventListener("click", (event) => {
+  if (!topbarMenu.hidden && !event.target.closest("#topbar-menu") && !event.target.closest("#more-button")) {
+    setTopbarMenu(false);
+  }
+});
+
 modalScrim.addEventListener("click", () => {
   closeModal(settingsDialog);
   closeModal(shortcutsDialog);

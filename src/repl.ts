@@ -4,7 +4,7 @@ import * as readline from "node:readline";
 import { stdin, stdout } from "node:process";
 import { Agent } from "./agent.ts";
 import type { Config } from "./types.ts";
-import type { ChatMessage } from "./llm.ts";
+import type { ChatMessage } from "./types.ts";
 import { ChatClient } from "./llm.ts";
 import { TerminalUi } from "./ui.ts";
 import { ansi as style } from "./render.ts";
@@ -44,7 +44,7 @@ ${style.bold("Input")}
 
 export class Repl {
   private readonly ui = new TerminalUi();
-  private readonly rl: readline.Interface;
+  private readonly rl: ReturnType<typeof readline.createInterface>;
   private readonly client: ChatClient;
   private agent: Agent;
   private sessionId: string;

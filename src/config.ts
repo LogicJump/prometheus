@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Config, PermissionMode, ThinkingEffort } from "./types.ts";
+import { resolveProvider } from "./providers.ts";
 
 const HOME_DIR = join(homedir(), ".prometheus");
 export const CONFIG_HOME = HOME_DIR;
@@ -29,6 +30,7 @@ export function allowedModelError(model: string): string {
 interface FileConfig {
   baseUrl?: string;
   apiKey?: string;
+  provider?: string;
   model?: string;
   maxTokens?: number;
   permissionMode?: PermissionMode;
@@ -59,24 +61,20 @@ function validEffort(value: string | undefined): ThinkingEffort | undefined {
 
 export function loadConfig(cli: Partial<Config> = {}): Config {
   mkdirSync(HOME_DIR, { recursive: true });
-
   const global = readJson(join(HOME_DIR, "config.json"));
   const project = readJson(join(process.cwd(), ".prometheus", "config.json"));
   const file: FileConfig = { ...global, ...project };
 
-  const apiKey =
-    cli.apiKey ||
-    process.env.PROMETHEUS_API_KEY ||
-    process.env.OPENAI_API_KEY ||
-    file.apiKey ||
-    "";
-  const baseUrl = (
-    cli.baseUrl ||
-    process.env.PROMETHEUS_BASE_URL ||
-    process.env.OPENAI_BASE_URL ||
-    file.baseUrl ||
-    "https://api.openai.com/v1"
-  ).replace(/\/+$/, "");
+  // The provider registry turns a provider id into its base URL and key
+  // environment variables; an explicit base URL still wins so existing
+  // configs and custom gateways keep working unchanged.
+  const providerId = cli.provider ?? process.env.PROMETHEUS_PROVIDER ?? file.provider;
+  const claimedKey = cli.apiKey || process.env.PROMETHEUS_API_KEY || process.env.OPENAI_API_KEY || file.apiKey || "";
+  const configuredBaseUrl =
+    cli.baseUrl || process.env.PROMETHEUS_BASE_URL || process.env.OPENAI_BASE_URL || file.baseUrl || undefined;
+  const provider = resolveProvider(providerId, configuredBaseUrl, claimedKey);
+  const apiKey = claimedKey || provider.apiKey;
+  const baseUrl = provider.baseUrl;
   const model = cli.model || process.env.PROMETHEUS_MODEL || file.model || DEFAULT_MODEL;
   if (!isModelAllowed(model)) {
     throw new Error(`${allowedModelError(model)} Set PROMETHEUS_MODELS to change the allowlist.`);
@@ -85,6 +83,7 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
   const config: Config = {
     baseUrl,
     apiKey,
+    provider: provider.provider.id,
     model,
     maxTokens: cli.maxTokens ?? file.maxTokens ?? 16000,
     permissionMode:
@@ -104,8 +103,11 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
   };
 
   if (!config.apiKey) {
+    const envHint = provider.provider.apiKeyEnv?.length
+      ? ` Set ${provider.provider.apiKeyEnv.join(" or ")}`
+      : " Set an API key environment variable";
     throw new Error(
-      "No API key found. Set OPENAI_API_KEY (or PROMETHEUS_API_KEY), or add \"apiKey\" to ~/.prometheus/config.json.",
+      `No API key found for ${provider.provider.label}.${envHint}, or add "apiKey" to ~/.prometheus/config.json.`,
     );
   }
   return config;

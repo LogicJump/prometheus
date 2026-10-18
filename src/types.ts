@@ -6,6 +6,8 @@ export type ThinkingEffort = "auto" | "low" | "medium" | "high";
 export interface Config {
   baseUrl: string;
   apiKey: string;
+  /** Provider id from the registry (openai, deepseek, custom, ...). */
+  provider?: string;
   model: string;
   maxTokens: number;
   permissionMode: PermissionMode;

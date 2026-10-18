@@ -142,20 +142,45 @@
             <span class="status-dot" id="status-dot"></span>
             <span class="status-text" id="status-text" data-i18n="statusStarting">starting</span>
           </div>
-          <button class="icon-button" id="export-button" title="Export conversation">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" /></svg>
-          </button>
-          <button class="icon-button" id="new-window-button" title="New window">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="7" width="12" height="12" rx="2" /><path d="M8.5 7V5.5A1.5 1.5 0 0 1 10 4h8.5A1.5 1.5 0 0 1 20 5.5V14a1.5 1.5 0 0 1-1.5 1.5H17" /></svg>
-          </button>
-          <button class="icon-button" id="shortcuts-button" title="Keyboard shortcuts">            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2.5" /><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M7 14h10" /></svg>
-          </button>
-          <button class="icon-button" id="settings-button" title="Settings">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" /></svg>
-          </button>
-          <button class="icon-button" id="clear-button" title="Clear conversation">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12" /></svg>
-          </button>
+          <div class="topbar-actions">
+            <button class="icon-button" id="more-button" title="More" aria-haspopup="menu" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.2" fill="currentColor" /><circle cx="12" cy="12" r="1.2" fill="currentColor" /><circle cx="18" cy="12" r="1.2" fill="currentColor" /></svg>
+            </button>
+            <button class="icon-button" id="settings-button" title="Settings">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" /></svg>
+            </button>
+          </div>
+          <div class="topbar-menu" id="topbar-menu" role="menu" hidden>
+            <button class="menu-row" id="menu-export" role="menuitem">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" /></svg>
+              <span data-i18n="menuExport">Export conversation</span>
+            </button>
+            <button class="menu-row" id="menu-new-window" role="menuitem">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="7" width="12" height="12" rx="2" /><path d="M8.5 7V5.5A1.5 1.5 0 0 1 10 4h8.5A1.5 1.5 0 0 1 20 5.5V14a1.5 1.5 0 0 1-1.5 1.5H17" /></svg>
+              <span data-i18n="menuNewWindow">New window</span>
+            </button>
+            <button class="menu-row" id="menu-shortcuts" role="menuitem">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2.5" /><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M7 14h10" /></svg>
+              <span data-i18n="menuShortcuts">Keyboard shortcuts</span>
+            </button>
+            <div class="menu-separator"></div>
+            <button class="menu-row danger" id="menu-clear" role="menuitem">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12" /></svg>
+              <span data-i18n="clearSession">Clear conversation</span>
+            </button>
+          </div>
+          <div class="window-controls" id="window-controls" hidden>
+            <button class="window-button" data-window="minimize" title="Minimize">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" /></svg>
+            </button>
+            <button class="window-button" data-window="maximize" id="window-maximize" title="Maximize">
+              <svg class="glyph-maximize" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="1" /></svg>
+              <svg class="glyph-restore" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 8.5V6.6c0-.6.4-1 1-1h8c.6 0 1 .4 1 1v8c0 .6-.4 1-1 1h-1.9" /><rect x="5.5" y="8.5" width="10" height="10" rx="1" /></svg>
+            </button>
+            <button class="window-button window-close" data-window="close" title="Close">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7 7 17" /></svg>
+            </button>
+          </div>
         </header>
 
         <main class="transcript" id="transcript" aria-live="polite">
@@ -335,9 +360,19 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
           </button>
         </header>
-        <div class="dialog-body">
-          <section class="settings-section">
-            <h3 data-i18n="settingsConnection">Connection</h3>
+        <div class="dialog-body settings-layout">
+          <nav class="settings-nav" id="settings-nav" role="tablist" aria-orientation="vertical">
+            <button type="button" class="settings-nav-item active" data-settings-tab="connection" role="tab" data-i18n="settingsConnection">Connection</button>
+            <button type="button" class="settings-nav-item" data-settings-tab="defaults" role="tab" data-i18n="settingsDefaults">Defaults</button>
+            <button type="button" class="settings-nav-item" data-settings-tab="appearance" role="tab" data-i18n="settingsAppearance">Appearance</button>
+            <button type="button" class="settings-nav-item" data-settings-tab="about" role="tab" data-i18n="settingsAbout">About</button>
+          </nav>
+          <div class="settings-panes">
+          <section class="settings-section" data-settings-pane="connection">
+            <label class="field">
+              <span data-i18n="settingsProvider">Provider</span>
+              <select id="setting-provider"></select>
+            </label>
             <label class="field">
               <span data-i18n="settingsBaseUrl">Base URL</span>
               <input id="setting-base-url" type="text" spellcheck="false" />
@@ -352,8 +387,7 @@
             </label>
             <div class="settings-hint" id="models-hint"></div>
           </section>
-          <section class="settings-section">
-            <h3 data-i18n="settingsDefaults">Defaults</h3>
+          <section class="settings-section" data-settings-pane="defaults" hidden>
             <label class="field">
               <span data-i18n="settingsMode">Permission mode</span>
               <select id="setting-mode">
@@ -384,8 +418,7 @@
               <input id="setting-context" type="number" min="8000" max="4000000" step="1000" />
             </label>
           </section>
-          <section class="settings-section">
-            <h3 data-i18n="settingsAppearance">Appearance</h3>
+          <section class="settings-section" data-settings-pane="appearance" hidden>
             <label class="field">
               <span data-i18n="language">Language</span>
               <select id="setting-locale">
@@ -409,14 +442,14 @@
               </select>
             </label>
           </section>
-          <section class="settings-section">
-            <h3 data-i18n="settingsAbout">About</h3>
+          <section class="settings-section" data-settings-pane="about" hidden>
             <div class="about-row">
               <span class="about-version">Prometheus <span id="about-version">0.1.0</span></span>
               <button type="button" class="btn small" id="check-update" data-i18n="checkUpdate">Check for updates</button>
             </div>
             <div class="settings-hint" id="update-note"></div>
           </section>
+          </div>
         </div>
         <footer class="dialog-foot">
           <span class="settings-note" id="settings-note"></span>

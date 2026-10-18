@@ -34,12 +34,14 @@ export function writeUiSettings(patch: UiSettings): void {
 }
 
 export interface EditableConfig {
+  provider?: string;
   baseUrl?: string;
   apiKey?: string;
   model?: string;
   permissionMode?: string;
   thinkingEffort?: string;
   maxTokens?: number;
+  contextWindow?: number;
 }
 
 /** Merge the given fields into ~/.prometheus/config.json, preserving everything else. */

@@ -11,6 +11,13 @@ contextBridge.exposeInMainWorld("prometheus", {
   },
   pickDirectory: () => ipcRenderer.invoke("pick-directory"),
   newWindow: () => ipcRenderer.send("new-window"),
+  windowControl: (action) => ipcRenderer.send("window-control", action),
+  windowState: () => ipcRenderer.invoke("window-state"),
+  onWindowState: (handler) => {
+    const listener = (_event, message) => handler(message);
+    ipcRenderer.on("window-state", listener);
+    return () => ipcRenderer.removeListener("window-state", listener);
+  },
   restartHost: () => ipcRenderer.send("host-restart"),
   saveFile: (suggestedName, content) => ipcRenderer.invoke("save-file", { suggestedName, content }),
   browserOpen: (url) => ipcRenderer.invoke("browser-open", url),

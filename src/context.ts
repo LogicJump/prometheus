@@ -1,8 +1,28 @@
-/** Context compaction: summarize older turns locally when the window fills up. */
+/** Context compaction: three progressive levels, all local (no extra model call). */
 
-import type { ChatMessage } from "../llm.ts";
+import type { ChatMessage } from "./types.ts";
 
-const KEEP_RECENT_MESSAGES = 8;
+/**
+ * Compaction runs in three escalating levels and stops as soon as the
+ * conversation fits:
+ *
+ *   1. trim        drop the oldest complete turns, keep a generous recent
+ *                  window. Nothing is lost except the oldest transcript;
+ *                  recent tool results stay intact.
+ *   2. summarize   replace everything before the recent window with a
+ *                  deterministic recap (requests, files, commands) plus the
+ *                  most recent messages.
+ *   3. aggressive  for conversations whose recent tool output alone overflows
+ *                  the window: shrink the window further and clip oversized
+ *                  tool payloads. This is the last resort before the request
+ *                  would be rejected.
+ */
+
+const BUDGET_RATIO = 0.75;
+const TRIM_KEEP = 24;
+const SUMMARIZE_KEEP = 8;
+const AGGRESSIVE_KEEP = 4;
+const CLIP_CHARS = 4_000;
 
 /** Rough token estimate: ~4 characters per token, plus overhead per message. */
 export function estimateTokens(messages: ChatMessage[]): number {
@@ -25,53 +45,99 @@ export function estimateTokens(messages: ChatMessage[]): number {
   return Math.ceil(total);
 }
 
+export type CompactionLevel = "trim" | "summarize" | "aggressive";
+
 export interface CompactionResult {
   messages: ChatMessage[];
   removed: number;
   summary: string;
+  level: CompactionLevel;
+  before: number;
+  after: number;
 }
 
-/**
- * Build a deterministic local summary of old turns (no extra model call), then
- * keep a synthetic recap message plus the most recent messages. Compaction
- * points are aligned to turn boundaries: a `tool` message is never separated
- * from the assistant turn that requested it.
- */
+/** Compact when over budget; returns null when the conversation already fits. */
 export function compact(messages: ChatMessage[], contextWindow: number): CompactionResult | null {
-  const budget = Math.floor(contextWindow * 0.75);
-  return compactAt(messages, budget, Math.max(1, messages.length - KEEP_RECENT_MESSAGES));
+  return compactAt(messages, Math.floor(contextWindow * BUDGET_RATIO));
 }
 
-/** Force a compaction regardless of the size, keeping the most recent messages. */
+/** Force a compaction regardless of size (the /compact command). */
 export function compactForce(messages: ChatMessage[]): ChatMessage[] {
-  const result = compactAt(messages, 0, Math.max(1, messages.length - KEEP_RECENT_MESSAGES));
+  const result = compactAt(messages, 0);
   return result?.messages ?? messages;
 }
 
-function compactAt(messages: ChatMessage[], budget: number, keepRecent: number): CompactionResult | null {
-  if (estimateTokens(messages) <= budget) return null;
+function compactAt(messages: ChatMessage[], budget: number): CompactionResult | null {
+  const before = estimateTokens(messages);
+  if (before <= budget) return null;
 
   const system = messages[0]?.role === "system" ? messages[0] : undefined;
   const rest = system ? messages.slice(1) : messages;
   if (rest.length <= 2) return null;
 
-  // Walk back from the end keeping a recent window, then snap to a user boundary.
-  let split = Math.max(1, Math.min(rest.length - 2, keepRecent));
-  while (split > 0 && rest[split].role !== "user") split--;
-  if (split <= 0) split = Math.max(1, rest.length - 2);
+  // 1. trim
+  const trimSplit = splitPoint(rest, TRIM_KEEP);
+  if (trimSplit > 0) {
+    // Keep the first kept message a user turn so the conversation stays valid.
+    const candidate: ChatMessage[] = system ? [system, ...rest.slice(trimSplit)] : rest.slice(trimSplit);
+    if (estimateTokens(candidate) <= budget) {
+      return result(candidate, trimSplit, "trim", "(oldest turns trimmed)", before);
+    }
+  }
 
-  const old = rest.slice(0, split);
-  const recent = rest.slice(split);
+  // 2. summarize
+  const summarizeSplit = splitPoint(rest, SUMMARIZE_KEEP);
+  const old = rest.slice(0, summarizeSplit);
+  const recent = rest.slice(summarizeSplit);
   const summary = summarize(old);
+  const recap = recapMessage(summary);
+  const summarized: ChatMessage[] = system ? [system, recap, ...recent] : [recap, ...recent];
+  if (estimateTokens(summarized) <= budget || budget === 0) {
+    return result(summarized, old.length, "summarize", summary, before);
+  }
 
-  const recap: ChatMessage = {
+  // 3. aggressive - the recent window itself is too large
+  const aggressiveSplit = splitPoint(recent, AGGRESSIVE_KEEP);
+  const clipped = recent.slice(aggressiveSplit).map(clipMessage);
+  const aggressive: ChatMessage[] = system ? [system, recapMessage(summary), ...clipped] : [recapMessage(summary), ...clipped];
+  return result(aggressive, old.length + aggressiveSplit, "aggressive", summary, before);
+}
+
+function result(
+  messages: ChatMessage[],
+  removed: number,
+  level: CompactionLevel,
+  summary: string,
+  before: number,
+): CompactionResult {
+  return { messages, removed, level, summary, before, after: estimateTokens(messages) };
+}
+
+/**
+ * Index in `messages` where the kept window starts, snapped forward to a user
+ * boundary so a tool result is never separated from its assistant turn.
+ */
+function splitPoint(messages: ChatMessage[], keep: number): number {
+  let split = Math.max(0, messages.length - keep);
+  while (split < messages.length && messages[split].role !== "user") split++;
+  return split >= messages.length ? Math.max(0, messages.length - 2) : split;
+}
+
+function recapMessage(summary: string): ChatMessage {
+  return {
     role: "user",
     content:
       `[Earlier context was compacted to save space. Recap of what happened:\n${summary}\n]\n\n` +
       `Continue from here. Do not repeat completed work; re-read files if you need their current contents.`,
   };
-  const next: ChatMessage[] = system ? [system, recap, ...recent] : [recap, ...recent];
-  return { messages: next, removed: old.length, summary };
+}
+
+function clipMessage(message: ChatMessage): ChatMessage {
+  if (message.role !== "tool" || typeof message.content !== "string" || message.content.length <= CLIP_CHARS) {
+    return message;
+  }
+  const omitted = message.content.length - CLIP_CHARS;
+  return { ...message, content: `${message.content.slice(0, CLIP_CHARS)}\n[… ${omitted} characters clipped by compaction]` };
 }
 
 function summarize(messages: ChatMessage[]): string {

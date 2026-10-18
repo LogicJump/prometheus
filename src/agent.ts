@@ -1,19 +1,25 @@
-/** The agent loop: streaming response, tool execution, permissions, compaction, sub-agents. */
+/**
+ * The Agent: session state plus the turn lifecycle.
+ *
+ * The loop itself lives in query.ts as a generator; this class owns the
+ * conversation, the tools, permissions, hooks, sub-agents, and the translation
+ * of loop events into UI calls. Keeping that split means the loop can be
+ * tested without a UI and the UI can be swapped (terminal vs desktop host).
+ */
 
 import os from "node:os";
-import type { ChatMessage } from "./llm.ts";
-import { ChatClient, ApiError, type ApiTool } from "./llm.ts";
-import type { Config, TodoList, Tool, ToolContext, Usage, UserContentPart } from "./types.ts";
+import type { ChatMessage } from "./types.ts";
+import { ChatClient, type ApiTool } from "./llm.ts";
+import type { Config, TodoList, Tool, Usage, UserContentPart } from "./types.ts";
 import type { TerminalUi } from "./ui.ts";
 import { Permissions } from "./permissions.ts";
-import { compact, estimateTokens } from "./context.ts";
+import { estimateTokens } from "./context.ts";
 import { loadMemory } from "./memory.ts";
 import { SUBAGENT_TOOLS, ALL_TOOLS } from "./tools/index.ts";
 import { loadProjectInstructions } from "./instructions.ts";
-import { captureBefore } from "./checkpoints.ts";
 import { loadHooks, hooksFor, runHooks, type Hook } from "./hooks.ts";
-
-const MAX_RETRIES = 3;
+import { ToolPipeline } from "./tools/pipeline.ts";
+import { query, type QueryEvent } from "./query.ts";
 
 function toApiTools(tools: Tool[]): ApiTool[] {
   return tools.map((tool) => ({
@@ -38,6 +44,11 @@ export class Agent {
   sessionId = "";
   /** Called before a mutating tool runs; used to snapshot file state for diffs. */
   onBeforeMutate: ((toolName: string, input: Record<string, unknown>) => void) | null = null;
+  /** Set by the host so a turn can stream to the renderer instead of a terminal. */
+  onQueryEvent: ((event: QueryEvent) => void) | null = null;
+  /** Called by the host so it can persist or count a compacted history. */
+  onCompacted: ((info: { removed: number; before: number; after: number; summary: string }) => void) | null = null;
+
   /** Mutable so MCP tools can be added after startup. */
   private tools: Tool[];
   /** Hooks loaded at construction (PreToolUse can veto a tool). */
@@ -45,7 +56,6 @@ export class Agent {
   private readonly permissions: Permissions;
   private readonly isSubagent: boolean;
   private abortController: AbortController | null = null;
-  private lastCompaction = "";
   private readonly queued: string[] = [];
 
   constructor(
@@ -172,196 +182,98 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     return this.queued.length;
   }
 
-  /** Move queued messages into the conversation; returns how many were taken. */
-  private drainQueue(): number {
-    if (this.queued.length === 0) return 0;
-    const taken = this.queued.splice(0);
-    for (const text of taken) {
-      this.messages.push({ role: "user", content: text });
-      this.ui.echoUser?.(text);
-    }
-    return taken.length;
-  }
-
   /** Stream one assistant turn and execute any tool calls until the model stops. */
   async run(text: string): Promise<void> {
     this.pushUser(text);
     await this.loop();
   }
 
+  private buildPipeline(): ToolPipeline {
+    return new ToolPipeline(
+      () => this.tools,
+      {
+        config: this.config,
+        ui: this.ui,
+        permissions: this.permissions,
+        todos: this.todos,
+        hooks: this.hooks,
+        sessionId: this.sessionId,
+        onBeforeMutate: this.onBeforeMutate,
+        runSubagent: (prompt) => this.runSubagent(prompt, this.abortController?.signal ?? new AbortController().signal),
+        trusted: this.isSubagent,
+        cwd: process.cwd(),
+      },
+    );
+  }
+
   private async loop(): Promise<void> {
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
-    const apiTools = toApiTools(this.tools);
-    let turns = 0;
+    this.ui.spinnerStart("waiting for model");
 
     try {
-      while (turns++ < this.config.maxTurns) {
-        if (signal.aborted) break;
+      const events = query({
+        messages: this.messages,
+        config: this.config,
+        client: this.client,
+        pipeline: this.buildPipeline(),
+        apiTools: () => toApiTools(this.tools),
+        signal,
+        drainQueue: () => this.queued.splice(0),
+        maxRetries: 3,
+      });
 
-        this.maybeCompact();
-        this.ui.spinnerStart("waiting for model");
-
-        let result;
-        for (let attempt = 1; ; attempt++) {
-          try {
-            result = await this.client.chat(
-              this.messages,
-              apiTools,
-              (delta) => {
-                this.ui.spinnerStop();
-                this.ui.assistantText(delta);
-              },
-              (delta) => {
-                this.ui.spinnerStop();
-                this.ui.thinking(delta);
-              },
-              signal,
-            );
-            break;
-          } catch (err) {
-            this.ui.spinnerStop();
-            if (signal.aborted) return;
-            if (err instanceof ApiError && err.retryable && attempt < MAX_RETRIES) {
-              const delay = 800 * 2 ** (attempt - 1);
-              this.ui.warn(`${err.message} - retrying in ${delay / 1000}s (${attempt}/${MAX_RETRIES - 1})`);
-              await sleep(delay, signal);
-              continue;
-            }
-            throw err;
-          }
-        }
-
-        this.ui.spinnerStop();
-        this.ui.assistantEnd();
-        this.ui.thinkingEnd();
-        this.usage.inputTokens += result.usage.inputTokens;
-        this.usage.outputTokens += result.usage.outputTokens;
-        this.usage.cachedTokens += result.usage.cachedTokens;
-
-        const assistant: ChatMessage = {
-          role: "assistant",
-          content: result.content || null,
-          ...(result.toolCalls.length ? { tool_calls: result.toolCalls } : {}),
-        };
-        this.messages.push(assistant);
-
-        if (result.toolCalls.length === 0) {
-          if (result.finishReason === "length") {
-            this.ui.warn("Response hit the max_tokens limit. Ask for a smaller step or raise maxTokens.");
-          }
-          return;
-        }
-
-        for (const call of result.toolCalls) {
-          if (signal.aborted) break;
-          const output = await this.executeTool(call.function.name, call.function.arguments, signal);
-          this.messages.push({ role: "tool", tool_call_id: call.id, content: output.content });
-        }
-        if (signal.aborted) return;
-        // Text the user typed mid-turn joins the conversation before the model
-        // asks for its next step.
-        this.drainQueue();
+      for await (const event of events) {
+        this.onQueryEvent?.(event);
+        this.dispatch(event);
       }
-      if (!this.isSubagent) this.ui.warn(`Stopped after ${this.config.maxTurns} turns. Send another message to continue.`);
     } finally {
       this.ui.spinnerStop();
       this.ui.assistantEnd();
+      this.ui.thinkingEnd();
       this.abortController = null;
     }
   }
 
-  private async executeTool(name: string, rawArgs: string, signal: AbortSignal): Promise<{ content: string }> {
-    const tool = this.tools.find((t) => t.name === name);
-    if (!tool) {
-      this.ui.error(`Unknown tool: ${name}`);
-      return { content: `Error: unknown tool "${name}". Available tools: ${this.tools.map((t) => t.name).join(", ")}` };
-    }
-
-    let input: Record<string, unknown>;
-    try {
-      input = rawArgs.trim() ? (JSON.parse(rawArgs) as Record<string, unknown>) : {};
-    } catch (err) {
-      this.ui.error(`Invalid JSON for ${name}`);
-      return {
-        content: `Error: arguments were not valid JSON (${(err as Error).message}). Re-issue the call with valid JSON.`,
-      };
-    }
-
-    const summary = safeSummarize(tool, input);
-    this.ui.toolStart(name, summary);
-
-    let allowed = true;
-    if (!this.isSubagent) {
-      try {
-        const verdict = await this.permissions.check(tool, input);
-        if (!verdict.allowed) {
-          this.ui.toolEnd(name, false, verdict.reason ?? "denied");
-          return { content: `Error: ${verdict.reason ?? "permission denied"}. Do not retry; adjust your approach.` };
+  /** Translate a loop event into the terminal UI calls. */
+  private dispatch(event: QueryEvent): void {
+    const ui = this.ui;
+    switch (event.type) {
+      case "assistant_start":
+        ui.spinnerStop();
+        break;
+      case "assistant_text":
+        ui.assistantText(event.text);
+        break;
+      case "thinking":
+        ui.spinnerStop();
+        ui.thinking(event.text);
+        break;
+      case "retry":
+        ui.spinnerStop();
+        ui.warn(`${event.message} - retrying in ${event.delayMs / 1000}s (attempt ${event.attempt + 1})`);
+        break;
+      case "compacted":
+        ui.dim(`compacted (${event.level}) ${event.removed} earlier messages (~${event.before} -> ~${event.after} tokens)`);
+        this.onCompacted?.({ removed: event.removed, before: event.before, after: event.after, summary: event.summary });
+        break;
+      case "queued_delivered":
+        // The query loop already appended the user turns; echo them here.
+        for (const text of event.texts) ui.echoUser?.(text);
+        break;
+      case "warning":
+        ui.warn(event.text);
+        break;
+      case "error":
+        if (event.error.cause instanceof Error && (event.error.cause as Error).name !== "AbortError") {
+          ui.error(event.error.message);
         }
-      } catch (err) {
-        allowed = false;
-        this.ui.toolEnd(name, false, (err as Error).message);
-        return { content: `Error: permission check failed: ${(err as Error).message}` };
-      }
-    }
-    void allowed;
-
-    // Snapshot mutating file tools before they run so the session can be rewound.
-    if (this.sessionId && (name === "write_file" || name === "edit_file") && typeof input.path === "string") {
-      try {
-        captureBefore(this.sessionId, name, process.cwd(), input.path);
-      } catch {
-        /* checkpointing must never block a tool */
-      }
-    }
-    try {
-      this.onBeforeMutate?.(name, input);
-    } catch {
-      /* diff snapshots must never block a tool */
-    }
-
-    // User hooks run before the permission check so a guard script can veto a
-    // tool even in auto mode.
-    const preHooks = hooksFor(this.hooks, "PreToolUse", name);
-    if (preHooks.length > 0) {
-      const results = await runHooks(preHooks, "PreToolUse", { tool: name, input }, process.cwd());
-      const blocked = results.find((result) => result.blocked);
-      if (blocked) {
-        const reason = blocked.output || `hook exited with code ${blocked.code}`;
-        this.ui.toolEnd(name, false, `blocked by hook: ${reason.slice(0, 120)}`);
-        return { content: `Error: a PreToolUse hook blocked this call: ${reason}` };
-      }
-      const noise = results.map((result) => result.output).filter(Boolean).join("\n");
-      if (noise) this.ui.toolOutput?.(name, noise);
-    }
-
-    const ctx: ToolContext = {
-      cwd: process.cwd(),
-      signal,
-      config: this.config,
-      permissions: this.permissions,
-      ui: this.ui,
-      todo: this.todos,
-      runSubagent: (prompt) => this.runSubagent(prompt, signal),
-    };
-
-    try {
-      const result = await tool.execute(input, ctx);
-      this.ui.toolEnd(name, !result.isError, result.display ?? "");
-      this.ui.toolOutput?.(name, result.content);
-      const postHooks = hooksFor(this.hooks, "PostToolUse", name);
-      if (postHooks.length > 0) {
-        const results = await runHooks(postHooks, "PostToolUse", { tool: name, input, output: result.content }, process.cwd());
-        const noise = results.map((entry) => entry.output).filter(Boolean).join("\n");
-        if (noise) this.ui.toolOutput?.(name, noise);
-      }
-      return { content: result.isError ? `Error: ${result.content}` : result.content };
-    } catch (err) {
-      const message = (err as Error).message ?? String(err);
-      this.ui.toolEnd(name, false, message.slice(0, 160));
-      this.ui.toolOutput?.(name, message);
-      return { content: `Error: ${message}` };
+        break;
+      case "usage":
+        this.usage = event.usage;
+        break;
+      default:
+        break;
     }
   }
 
@@ -410,35 +322,8 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     }
   }
 
-  private maybeCompact(): void {
-    const before = estimateTokens(this.messages);
-    const result = compact(this.messages, this.config.contextWindow);
-    if (!result) return;
-    this.messages = result.messages;
-    this.lastCompaction = result.summary;
-    this.ui.dim(`compacted ${result.removed} earlier messages (~${before} tokens) to stay within the context window`);
-  }
-
   contextUsage(): { tokens: number; percent: number } {
     const tokens = estimateTokens(this.messages);
     return { tokens, percent: Math.min(100, Math.round((tokens / this.config.contextWindow) * 100)) };
   }
-}
-
-function safeSummarize(tool: Tool, input: Record<string, unknown>): string {
-  try {
-    return tool.summarize(input) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener("abort", () => {
-      clearTimeout(timer);
-      resolve();
-    }, { once: true });
-  });
 }

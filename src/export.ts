@@ -9,7 +9,7 @@
 import { existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
-import type { ChatMessage } from "./llm.ts";
+import type { ChatMessage } from "./types.ts";
 import type { SessionFile } from "./sessions.ts";
 
 const SUMMARY_LIMIT = 160;

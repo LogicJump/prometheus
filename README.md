@@ -53,10 +53,11 @@ Prometheus.exe D:\code\my-project
 - **Three permission modes.** `ask` confirms every mutating tool, `auto` runs
   them but still prompts for destructive shell commands, `plan` only allows
   read-only tools so you can investigate before changing anything.
-- **Context that survives long sessions.** A deterministic compaction pass
-  replaces old turns with a recap of requests, files touched, and commands run.
-- **Sessions.** Every conversation is saved to `~/.prometheus/sessions/` and can
-  be resumed with `-r <id>`.
+- **Context that survives long sessions.** Three progressive compaction levels
+  (trim oldest turns, then a deterministic recap, then clipping oversized tool
+  output) keep a conversation inside the window without an extra model call.
+- **Sessions.** Every conversation is saved as an append-only JSONL transcript
+  under `~/.prometheus/sessions/<id>/` and can be resumed with `-r <id>`.
 - **Sub-agents.** The `delegate` tool runs a self-contained task in a fresh
   context and returns only the report, keeping the main conversation lean.
 - **Memory.** The `remember` tool persists durable facts about you and the
@@ -67,12 +68,36 @@ Prometheus.exe D:\code\my-project
   `~/.prometheus/audit.log`.
 - **Custom commands.** Markdown files in `.prometheus/commands/` become slash
   commands in the composer (see `.prometheus/commands/review.md`).
-- **MCP servers.** Stdio servers listed in `~/.prometheus/mcp.json` or
-  `<workspace>/.prometheus/mcp.json` contribute their tools to the agent:
+- **MCP servers.** Stdio and Streamable HTTP servers listed in
+  `~/.prometheus/mcp.json` (user scope) or `<workspace>/.prometheus/mcp.json`
+  (project scope, overrides by name) contribute their tools to the agent:
 
   ```json
-  { "servers": { "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] } } }
+  {
+    "servers": {
+      "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] },
+      "remote": { "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer ..." } }
+    }
+  }
   ```
+
+## Architecture
+
+The runtime is six layers, each with one job:
+
+| Layer | Module | What it owns |
+| --- | --- | --- |
+| Main loop | `src/query.ts` | One async-generator state machine: compact → request → stream → tools. Yields events; never touches a UI. |
+| Errors | `src/errors.ts` | Two-level classification: recoverable (retry with backoff) vs terminal (end the turn). |
+| Model access | `src/providers.ts` | Declarative provider registry over one OpenAI-compatible adapter. No protocol fallbacks, no OAuth. |
+| Context | `src/context.ts` | Three-level progressive compaction, all local. |
+| Tools | `src/tools/pipeline.ts` | Five-stage pipeline: resolve → guard → prepare → execute → settle. |
+| MCP | `src/mcp.ts` | stdio + Streamable HTTP transports, user/project scopes. |
+| Sessions | `src/sessions.ts` | Append-only JSONL, one generation file per compaction, legacy files migrate on write. |
+
+`src/agent.ts` wires those together with the conversation, permissions, hooks,
+sub-agents, and the terminal UI. `desktop/host.js` drives the same `Agent`
+through the desktop event protocol.
 
 ## Requirements
 
@@ -106,13 +131,28 @@ Put the endpoint and key in `~/.prometheus/config.json`:
 }
 ```
 
-Environment variables override the file: `PROMETHEUS_BASE_URL`,
-`PROMETHEUS_API_KEY` (or `OPENAI_API_KEY`), `PROMETHEUS_MODEL`. A project can
-override settings in `.prometheus/config.json`.
+Or name a provider from the registry and let it supply the base URL:
 
-This deployment is allowlisted to the models named in `ALLOWED_MODELS`
-(`src/config.ts`): `glm-5.3-flash` and `deepseek-v4.1-flash` by default. Change
-`PROMETHEUS_MODELS` to widen the list.
+```json
+{ "provider": "deepseek", "apiKey": "sk-...", "model": "deepseek-chat" }
+```
+
+Built-in providers live in `src/providers.ts` (OpenAI, DeepSeek, Moonshot,
+Qwen, Ollama, OpenRouter). Add your own in `~/.prometheus/providers.json`:
+
+```json
+{ "providers": [{ "id": "company", "label": "Company gateway", "baseUrl": "https://ai.example.com/v1", "apiKeyEnv": ["COMPANY_AI_KEY"] }] }
+```
+
+Environment variables override the file: `PROMETHEUS_BASE_URL`,
+`PROMETHEUS_API_KEY` (or `OPENAI_API_KEY`), `PROMETHEUS_MODEL`,
+`PROMETHEUS_PROVIDER`. A project can override settings in
+`.prometheus/config.json`.
+
+The model picker offers whatever the endpoint advertises on `GET /models`, and
+auto-discovery is cached for an hour (`~/.prometheus/models-cache.json`). Set
+`PROMETHEUS_MODELS=glm-5.3-flash,deepseek-v4.1-flash` to restrict the list to
+those ids.
 
 `~/.prometheus/` supports a few more files:
 

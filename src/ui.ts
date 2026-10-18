@@ -28,8 +28,9 @@ export class TerminalUi implements Ui {
     this.out = out;
   }
 
-  attachReadline(rl: readline.Interface): void {
-    this.rl = rl;
+  /** The REPL builds a callback-style readline interface; only prompt redraws are needed here. */
+  attachReadline(rl: unknown): void {
+    this.rl = rl as readline.Interface;
     this.interactive = true;
   }
 
@@ -154,8 +155,24 @@ export class TerminalUi implements Ui {
     }
   }
 
-  toolStart(name: string, summary: string): void {
+  /** A sub-agent's lifecycle, drawn as an indented group in the transcript. */
+  subagentStart(prompt: string): void {
     this.assistantEnd();
+    this.thinkingEnd();
+    this.spinnerStop();
+    this.out.write(`\r\n${style.gray("  ┌ sub-agent")} ${style.dim(prompt.split("\n")[0].slice(0, 80))}\r\n`);
+  }
+
+  subagentActivity(_kind: "tool" | "text", text: string): void {
+    this.out.write(`${style.gray("  │")} ${style.dim(text)}\r\n`);
+  }
+
+  subagentEnd(ok: boolean, summary: string): void {
+    const mark = ok ? style.green("done") : style.red("failed");
+    this.out.write(`${style.gray("  └")} ${mark} ${style.dim(summary)}\r\n`);
+  }
+
+  toolStart(name: string, summary: string): void {    this.assistantEnd();
     this.thinkingEnd();
     this.spinnerStop();
     this.out.write(`\r\n` + `${style.cyan("⏺")} ${style.bold(name)}${summary ? ` ${style.dim(summary)}` : ""}\r\n`);
