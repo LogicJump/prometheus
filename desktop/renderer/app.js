@@ -3,6 +3,7 @@
 import { detectLocale, getDict } from "./i18n.js";
 import { escapeHtml, renderMarkdown } from "./markdown.js";
 import { createSettings } from "./settings.js";
+import { icon, setIcon } from "./icons.js";
 
 /** Saved preferences are restored here; the host gets them on init. */
 const savedLocale = localStorage.getItem("prometheus.locale");
@@ -120,15 +121,19 @@ function applyLocale(locale, { announce = false } = {}) {
     const value = t[node.dataset.i18nTitle];
     if (typeof value === "string") node.title = value;
   });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((node) => {
+    const value = t[node.dataset.i18nPlaceholder];
+    if (typeof value === "string") node.placeholder = value;
+  });
   input.placeholder = t.placeholder;
   terminalInput.placeholder = terminalInput.disabled ? t.terminalExited : t.terminalPlaceholder;
   $("terminal-restart").textContent = t.terminalRestart;
   const terminalTab = workbenchTabs.querySelector('[data-pane="terminal"]');
   if (terminalTab) terminalTab.textContent = t.paneTerminal;
-  sendButton.title = `${t.send} (Enter)`;
-  stopButton.title = `${t.stop} (Esc)`;
-  $("topbar-cwd").title = t.changeWorkspace;
-  $("refresh-sessions").title = t.sessions;
+  sendButton.title = t.sendTitle;
+  stopButton.title = t.stopTitle;
+  $("topbar-cwd").title = t.changeFolderTitle;
+  $("refresh-sessions").title = t.refresh;
   const search = $("session-search");
   search.placeholder = t.searchSessions;
   search.title = t.searchSessions;
@@ -310,12 +315,23 @@ function toolGroup() {
   return addNode(`<div class="tool-group"></div>`);
 }
 
+/** One icon per kind of work, so a glance down the column reads as a rhythm. */
+function toolGlyph(name) {
+  if (name === "bash") return "terminal";
+  if (name === "delegate") return "corner-up-right";
+  if (name === "todo_write") return "list-check";
+  if (name === "remember") return "book";
+  if (name === "write_file" || name === "edit_file") return "edit";
+  if (name === "search_codebase" || name === "grep") return "search";
+  if (name === "glob" || name === "list_files") return "folder";
+  return "file";
+}
+
 function addToolRow(name, summary) {
-  const glyph = name === "bash" ? "›" : ["read_file", "list_files", "grep", "glob", "search_codebase"].includes(name) ? "◦" : "✦";
   const row = document.createElement("div");
   row.className = "tool-row running";
   row.innerHTML =
-    `<span class="tool-glyph">${glyph}</span>` +
+    `<span class="tool-glyph">${icon(toolGlyph(name))}</span>` +
     `<span class="tool-name">${escapeHtml(toolLabel(name))}</span>` +
     `<span class="tool-summary">${escapeHtml(summary || "")}</span>` +
     `<button class="tool-expand" hidden>${escapeHtml(t.details)}</button>`;
@@ -418,7 +434,7 @@ function renderPlan(items) {
       items
         .map(
           (item) =>
-            `<div class="plan-item ${item.status}"><span class="box">${item.status === "completed" ? "✓" : ""}</span>` +
+            `<div class="plan-item ${item.status}"><span class="box">${item.status === "completed" ? icon("check") : ""}</span>` +
             `<span class="label">${escapeHtml(item.content)}</span></div>`,
         )
         .join("") +
@@ -978,7 +994,7 @@ function handleEvent(message) {
     case "subagent_start": {
       const node = addNode(
         `<div class="subagent running">` +
-          `<div class="subagent-head"><span class="subagent-glyph">↳</span>` +
+          `<div class="subagent-head"><span class="subagent-glyph">${icon("corner-down-right")}</span>` +
           `<span class="subagent-title">${escapeHtml(t.subagentLabel)}</span>` +
           `<span class="subagent-count"></span></div>` +
           `<div class="subagent-prompt">${escapeHtml(message.prompt ?? "")}</div>` +
@@ -996,7 +1012,7 @@ function handleEvent(message) {
       const list = sub.node.querySelector(".subagent-activities");
       const line = document.createElement("div");
       line.className = "subagent-line";
-      line.textContent = `${message.kind === "tool" ? "›" : "·"} ${message.text}`;
+      line.innerHTML = `${icon(message.kind === "tool" ? "chevron-right" : "dot", "inline")}<span>${escapeHtml(message.text)}</span>`;
       list.appendChild(line);
       while (list.children.length > 40) list.removeChild(list.firstElementChild);
       sub.node.querySelector(".subagent-count").textContent = String(sub.count);
@@ -1177,7 +1193,7 @@ function handleEvent(message) {
         const summaryEl = row.querySelector(".tool-summary");
         if (message.summary) summaryEl.textContent = message.summary;
         if (!message.ok) summaryEl.style.color = "var(--danger)";
-        row.querySelector(".tool-glyph").textContent = message.ok ? "✓" : "✕";
+        setIcon(row.querySelector(".tool-glyph svg"), message.ok ? "check" : "x");
         // An edit's result is a diff size: make it read like one.
         if (message.ok && message.name === "edit_file") {
           const parts = String(message.summary).match(/\+(\d+)\s+-(\d+)/);
@@ -1299,7 +1315,7 @@ function handleEvent(message) {
           const row = document.createElement("div");
           row.className = "tool-row done";
           row.innerHTML =
-            `<span class="tool-glyph">✓</span>` +
+            `<span class="tool-glyph">${icon(toolGlyph(item.name))}</span>` +
             `<span class="tool-name">${escapeHtml(toolLabel(item.name))}</span>` +
             `<span class="tool-summary">${escapeHtml(item.summary || "")}</span>`;
           toolGroup().appendChild(row);
@@ -1597,7 +1613,7 @@ function renderCommentRows(path) {
     row.innerHTML =
       `<span class="line-comment-where">${escapeHtml(String(comment.line))}</span>` +
       `<span class="line-comment-body">${escapeHtml(comment.body)}</span>` +
-      `<button class="line-comment-remove" title="${escapeHtml(t.commentRemove)}">×</button>`;
+      `<button class="line-comment-remove" title="${escapeHtml(t.commentRemove)}">${icon("x")}</button>`;
     row.querySelector(".line-comment-remove").addEventListener("click", (clickEvent) => {
       clickEvent.stopPropagation();
       state.comments = state.comments.filter((item) => item !== comment);
@@ -1664,9 +1680,11 @@ function renderChangesPanel() {
   renderGitBar();
   changesList.innerHTML = "";
   const { files, additions, deletions } = state.changes;
+  // The diff pane already carries the empty state; repeating it here stacked
+  // the same sentence twice in one column.
   changesSummary.innerHTML = files.length
     ? `${files.length} file${files.length === 1 ? "" : "s"} · <span class="add">+${additions}</span> <span class="del">−${deletions}</span>`
-    : escapeHtml(t.noChanges);
+    : "";
   for (const file of files) {
     const row = document.createElement("button");
     row.className = "change-row";
@@ -1777,7 +1795,7 @@ function treeRow(node) {
   const row = document.createElement("button");
   row.className = "tree-row";
   row.innerHTML =
-    `<span class="twisty">${node.type === "dir" ? "▸" : ""}</span>` +
+    `<span class="twisty">${node.type === "dir" ? icon("chevron-right") : ""}</span>` +
     `<span class="tree-name">${escapeHtml(node.name)}</span>`;
   row.title = node.path;
   row.addEventListener("click", () => {
@@ -1788,13 +1806,13 @@ function treeRow(node) {
     const existing = row.nextElementSibling;
     if (existing && existing.classList.contains("tree-children")) {
       existing.hidden = !existing.hidden;
-      row.querySelector(".twisty").textContent = existing.hidden ? "▸" : "▾";
+      setIcon(row.querySelector(".twisty svg"), existing.hidden ? "chevron-right" : "chevron-down");
       return;
     }
     const container = document.createElement("div");
     container.className = "tree-children";
     row.after(container);
-    row.querySelector(".twisty").textContent = "▾";
+    setIcon(row.querySelector(".twisty svg"), "chevron-down");
     api.send({ cmd: "getTree", path: node.path });
     pendingTreeTarget = container;
   });
@@ -2173,7 +2191,7 @@ function renderSessions(sessions) {
     name.title = displayPath.get(cwd) || cwd || t.noProject;
     const twisty = document.createElement("span");
     twisty.className = "session-group-twisty";
-    twisty.textContent = open ? "▾" : "▸";
+    twisty.innerHTML = icon(open ? "chevron-down" : "chevron-right");
     // New chat inside this project, without leaving the current conversation.
     const add = document.createElement("span");
     add.className = "session-group-add";
@@ -2209,7 +2227,7 @@ function renderSessions(sessions) {
       // The timestamp is reference, not navigation: it appears on hover and
       // gives the row back its second line of height.
       button.innerHTML =
-        (session.pinned ? `<span class="session-pin" title="${escapeHtml(t.sessionPinned)}">◆</span>` : "") +
+        (session.pinned ? `<span class="session-pin" title="${escapeHtml(t.sessionPinned)}">${icon("pin")}</span>` : "") +
         `<div class="session-title">${escapeHtml(title)}</div>` +
         `<span class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</span>`;
       button.title = `${title}\n${relativeDate(session.updatedAt)}\n${session.cwd}`;
@@ -2493,7 +2511,7 @@ function renderAttachments() {
     chip.className = "attachment";
     chip.innerHTML =
       `<img src="${attachment.url}" alt="${escapeHtml(attachment.name)}" />` +
-      `<button class="attachment-remove" title="${escapeHtml(t.attachmentRemove)}">×</button>`;
+      `<button class="attachment-remove" title="${escapeHtml(t.attachmentRemove)}">${icon("x")}</button>`;
     chip.querySelector(".attachment-remove").addEventListener("click", () => {
       state.attachments.splice(index, 1);
       renderAttachments();

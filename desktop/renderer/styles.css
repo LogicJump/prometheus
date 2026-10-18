@@ -1,51 +1,103 @@
-/* Prometheus desktop theme: quiet surfaces, one warm accent, type-led hierarchy. */
+/* Prometheus desktop theme.
+ *
+ * A graphite base with one cool accent. The palette is deliberately not the
+ * warm-cream-plus-terracotta default: the product is a terminal-adjacent tool,
+ * and the surface should read like a workbench, not a document. Colour carries
+ * meaning only — accent for the active thing, amber for a warning, red for a
+ * failure — so nothing competes with the code on screen.
+ *
+ * Every size, radius, and duration used by the app comes from this block.
+ * Literal values below are the only place they are allowed to appear.
+ */
 
 :root {
   color-scheme: dark;
-  --bg: #0e0e10;
-  --sidebar: #131315;
-  --surface: #1a1a1d;
-  --surface-raised: #1f1f23;
-  --surface-hover: #26262b;
-  --border: #26262b;
-  --border-strong: #35353c;
-  --text: #ececee;
-  --text-secondary: #9d9da6;
-  --text-faint: #6a6a73;
-  --accent: #d97757;
-  --accent-soft: rgba(217, 119, 87, 0.14);
-  --accent-text: #f0a184;
-  --success: #7fb98b;
-  --warn: #d9b26b;
-  --danger: #d9705e;
+
+  /* surfaces, darkest to lightest */
+  --bg: #0c0d10;
+  --sidebar: #101216;
+  --surface: #15181d;
+  --surface-raised: #1b1f25;
+  --surface-hover: #22272f;
+  --border: #232830;
+  --border-strong: #333a45;
+
+  /* type */
+  --text: #e6e9ef;
+  --text-secondary: #9aa3b2;
+  --text-faint: #6b7484;
+
+  /* one accent, one warning, one failure */
+  --accent: #4c9df0;
+  --accent-hover: #6cb0f5;
+  --accent-soft: rgba(76, 157, 240, 0.14);
+  --accent-text: #8dc0f7;
+  --success: #4fb286;
+  --warn: #d6a244;
+  --danger: #e06a5e;
+  --danger-soft: rgba(224, 106, 94, 0.13);
+  --success-soft: rgba(79, 178, 134, 0.14);
+  --add-bg: rgba(79, 178, 134, 0.13);
+  --del-bg: rgba(224, 106, 94, 0.12);
+  --mark-bg: rgba(214, 162, 68, 0.3);
+  --on-accent: #ffffff;
+  --scrim: rgba(0, 0, 0, 0.55);
+
+  /* radii: three steps, no more */
   --radius-sm: 6px;
   --radius: 10px;
-  --radius-lg: 16px;
+  --radius-lg: 14px;
+
+  /* type scale */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 17px;
+  --text-xl: 22px;
+
+  /* motion */
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+  --fast: 110ms;
+  --normal: 170ms;
+
   --mono: "SF Mono", "Cascadia Code", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-  --sans: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --shadow-composer: 0 8px 32px rgba(0, 0, 0, 0.35);
-  --sidebar-width: 260px;
+  --sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --shadow-composer: 0 10px 34px rgba(0, 0, 0, 0.42);
+  --shadow-popover: 0 14px 40px rgba(0, 0, 0, 0.5);
+  --sidebar-width: 264px;
+  --reading-width: 780px;
+  --font-scale: 1;
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #faf9f7;
-  --sidebar: #f0eeeb;
-  --surface: #f4f2ef;
+  --bg: #ffffff;
+  --sidebar: #f6f7f9;
+  --surface: #f2f4f7;
   --surface-raised: #ffffff;
-  --surface-hover: #e9e6e2;
-  --border: #e2dfda;
-  --border-strong: #cfcac3;
-  --text: #1d1c1b;
-  --text-secondary: #6c6a67;
-  --text-faint: #9a9793;
-  --accent: #c4613f;
-  --accent-soft: rgba(196, 97, 63, 0.12);
-  --accent-text: #a94e30;
-  --success: #3f7d4f;
-  --warn: #96722a;
-  --danger: #b04432;
-  --shadow-composer: 0 6px 24px rgba(30, 25, 20, 0.08);
+  --surface-hover: #e9edf2;
+  --border: #e3e7ed;
+  --border-strong: #cdd4de;
+  --text: #171b21;
+  --text-secondary: #5b6472;
+  --text-faint: #8b95a4;
+  --accent: #1f6feb;
+  --accent-hover: #1858bd;
+  --accent-soft: rgba(31, 111, 235, 0.1);
+  --accent-text: #17539f;
+  --success: #1f7a52;
+  --warn: #8a6415;
+  --danger: #b8382c;
+  --danger-soft: rgba(184, 56, 44, 0.08);
+  --success-soft: rgba(31, 122, 82, 0.1);
+  --add-bg: rgba(31, 122, 82, 0.1);
+  --del-bg: rgba(184, 56, 44, 0.08);
+  --mark-bg: rgba(214, 162, 68, 0.28);
+  --on-accent: #ffffff;
+  --scrim: rgba(16, 20, 27, 0.4);
+  --shadow-composer: 0 8px 26px rgba(20, 26, 36, 0.09);
+  --shadow-popover: 0 12px 34px rgba(20, 26, 36, 0.14);
 }
 
 * {
@@ -66,7 +118,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
-  font-size: 14px;
+  font-size: var(--text-md);
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
@@ -88,15 +140,30 @@ textarea:focus-visible,
   outline-offset: 2px;
 }
 
+/* One icon language: 16px on a 24 grid, 1.75 stroke, round joins. The sprite
+   symbols inherit these, so a glyph cannot drift from the set by accident. */
 svg {
   width: 16px;
   height: 16px;
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.7;
+  stroke-width: 1.75;
   stroke-linecap: round;
   stroke-linejoin: round;
   flex: 0 0 auto;
+}
+
+.icon {
+  display: block;
+}
+
+.icon.inline {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  vertical-align: -2px;
+  margin-right: 5px;
+  color: var(--text-faint);
 }
 
 /* ---------- shell ---------- */
@@ -148,15 +215,14 @@ svg {
 }
 
 .mark {
-  width: 19px;
-  height: 19px;
-  fill: var(--accent);
-  stroke: none;
+  width: 22px;
+  height: 22px;
+  color: var(--accent);
   flex: 0 0 auto;
 }
 
 .wordmark {
-  font-size: 13.5px;
+  font-size: var(--text-base);
   font-weight: 600;
   letter-spacing: -0.01em;
 }
@@ -174,7 +240,7 @@ svg {
   padding: 8px 10px;
   border-radius: var(--radius);
   border: 1px solid var(--border-strong);
-  font-size: 13px;
+  font-size: var(--text-base);
   color: var(--text);
   transition: background 120ms ease, border-color 120ms ease;
 }
@@ -194,7 +260,7 @@ svg {
   align-items: center;
   justify-content: space-between;
   padding: 4px 8px 6px;
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   letter-spacing: 0.02em;
 }
@@ -218,8 +284,8 @@ svg {
   gap: 6px;
   width: 100%;
   padding: 3px 6px;
-  border-radius: 4px;
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   text-align: left;
 }
@@ -230,10 +296,15 @@ svg {
 }
 
 .tree-row .twisty {
-  width: 10px;
-  font-size: 9px;
+  display: flex;
+  width: 14px;
   color: var(--text-faint);
   flex: 0 0 auto;
+}
+
+.tree-row .twisty .icon {
+  width: 13px;
+  height: 13px;
 }
 
 .tree-row .tree-icon {
@@ -259,8 +330,8 @@ svg {
   gap: 6px;
   width: 100%;
   padding: 5px 6px;
-  border-radius: 4px;
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   text-align: left;
 }
@@ -282,7 +353,7 @@ svg {
 
 .change-stat {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   flex: 0 0 auto;
 }
 
@@ -304,7 +375,7 @@ svg {
 
 .changes-summary {
   padding: 4px 6px 8px;
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   font-family: var(--mono);
 }
@@ -315,8 +386,8 @@ svg {
   gap: 6px;
   width: 100%;
   padding: 5px 6px;
-  border-radius: 4px;
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   text-align: left;
 }
@@ -328,7 +399,7 @@ svg {
 
 .checkpoint-time {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   flex: 0 0 auto;
 }
@@ -344,9 +415,9 @@ svg {
   width: 100%;
   padding: 6px;
   margin-bottom: 6px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -386,13 +457,13 @@ svg {
   padding: 2px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
 }
 
 .workbench-tabs button {
   padding: 4px 9px;
-  border-radius: 5px;
-  font-size: 11.5px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   white-space: nowrap;
 }
@@ -405,7 +476,7 @@ svg {
 .workbench-meta {
   flex: 1;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -418,14 +489,14 @@ svg {
   padding: 2px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   flex: 0 0 auto;
 }
 
 .diff-scope button {
   padding: 2px 8px;
-  border-radius: 5px;
-  font-size: 11px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
   color: var(--text-faint);
   white-space: nowrap;
 }
@@ -485,7 +556,7 @@ svg {
   overflow: auto;
   min-width: 0;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.55;
 }
 
@@ -503,7 +574,7 @@ svg {
   padding: 10px 12px;
   overflow: auto;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   color: var(--text);
   white-space: pre-wrap;
@@ -522,7 +593,7 @@ svg {
 
 .terminal-prompt {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   max-width: 40%;
   overflow: hidden;
@@ -540,7 +611,7 @@ svg {
   outline: none;
   color: var(--text);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   padding: 4px 0;
 }
 
@@ -558,7 +629,7 @@ svg {
   background: var(--surface);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
-  font-size: 11px;
+  font-size: var(--text-xs);
   position: sticky;
   top: 0;
 }
@@ -576,7 +647,7 @@ svg {
   color: var(--text-faint);
   user-select: none;
   white-space: pre;
-  font-size: 11px;
+  font-size: var(--text-xs);
   line-height: 19px;
 }
 
@@ -589,7 +660,7 @@ svg {
 }
 
 .diff-line.add {
-  background: rgba(63, 162, 102, 0.13);
+  background: var(--add-bg);
 }
 
 .diff-line.add .diff-text {
@@ -597,20 +668,20 @@ svg {
 }
 
 .diff-line.del {
-  background: rgba(184, 0, 73, 0.13);
+  background: var(--del-bg);
 }
 
 .diff-line.del .diff-text {
   color: var(--text-secondary);
   text-decoration: line-through;
-  text-decoration-color: rgba(217, 112, 94, 0.55);
+  text-decoration-color: var(--danger);
 }
 
 .raw-diff {
   margin: 0;
   padding: 12px 14px;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
@@ -620,7 +691,7 @@ svg {
   padding: 24px;
   color: var(--text-faint);
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: var(--text-base);
   text-align: center;
 }
 
@@ -633,7 +704,7 @@ svg {
   padding: 6px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
 
@@ -642,7 +713,7 @@ svg {
   padding: 8px 0;
   white-space: pre;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.55;
 }
 
@@ -664,22 +735,25 @@ svg {
 
 .session-list::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   border: 2px solid var(--sidebar);
 }
 
 .session-group {
   padding: 10px 8px 4px;
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
 
 .session-pin {
-  float: right;
+  display: flex;
   color: var(--accent);
-  font-size: 9px;
-  line-height: 1.6;
+}
+
+.session-pin .icon {
+  width: 12px;
+  height: 12px;
 }
 
 .session-item.pinned .session-title {
@@ -693,8 +767,8 @@ svg {
   padding: 4px;
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-popover);
   display: flex;
   flex-direction: column;
 }
@@ -704,8 +778,8 @@ svg {
   width: 100%;
   text-align: left;
   padding: 6px 9px;
-  border-radius: 5px;
-  font-size: 12.5px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -724,13 +798,21 @@ svg {
 
 .session-item {
   display: flex;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
+  gap: 8px;
   width: 100%;
-  padding: 6px 9px;
+  padding: 7px 9px;
   border-radius: var(--radius-sm);
   text-align: left;
   position: relative;
+}
+
+.session-item:hover {
+  background: var(--surface);
+}
+
+.session-item.active {
+  background: var(--surface-hover);
 }
 
 .session-search {
@@ -748,9 +830,7 @@ svg {
   width: 13px;
   height: 13px;
   flex: 0 0 13px;
-  fill: none;
-  stroke: var(--text-faint);
-  stroke-width: 1.7;
+  color: var(--text-faint);
 }
 
 .session-search input {
@@ -761,7 +841,7 @@ svg {
   background: transparent;
   color: var(--text);
   font-family: var(--sans);
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 
 .session-search input::placeholder {
@@ -783,7 +863,7 @@ svg {
   margin-top: 6px;
   padding: 5px 7px;
   border-radius: var(--radius-sm);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   font-weight: 500;
   color: var(--text-secondary);
   text-align: left;
@@ -799,10 +879,15 @@ svg {
 }
 
 .session-group-twisty {
-  width: 10px;
-  flex: 0 0 10px;
-  font-size: 9px;
+  display: flex;
+  width: 14px;
+  flex: 0 0 14px;
   color: var(--text-faint);
+}
+
+.session-group-twisty .icon {
+  width: 13px;
+  height: 13px;
 }
 
 .session-group-name {
@@ -826,7 +911,7 @@ svg {
 
 .session-group-count {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   opacity: 0.75;
 }
@@ -839,10 +924,10 @@ svg {
 .session-group-add {
   width: 18px;
   height: 18px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   display: none;
   place-items: center;
-  font-size: 14px;
+  font-size: var(--text-md);
   line-height: 1;
   color: var(--text-secondary);
 }
@@ -872,11 +957,32 @@ svg {
 }
 
 .session-title {
-  font-size: 12.5px;
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-base);
   color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-item.active .session-title {
+  color: var(--text);
+}
+
+/* The timestamp is reference, not navigation: it fades in on hover instead
+   of taking a second line in every row. */
+.session-meta {
+  flex: 0 0 auto;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  opacity: 0;
+  transition: opacity var(--fast) var(--ease);
+}
+
+.session-item:hover .session-meta,
+.session-item.active .session-meta {
+  opacity: 1;
 }
 
 .session-item.active .session-title {
@@ -889,7 +995,7 @@ svg {
   top: 50%;
   transform: translateY(-50%);
   padding-left: 12px;
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   font-family: var(--mono);
   background: linear-gradient(to right, transparent, var(--sidebar) 12px);
@@ -909,7 +1015,7 @@ svg {
 
 .sidebar-empty {
   padding: 8px;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
 
@@ -929,13 +1035,13 @@ svg {
   gap: 2px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
 }
 
 .locale-switch button {
   padding: 2px 8px;
-  border-radius: 5px;
-  font-size: 11px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
@@ -1010,7 +1116,7 @@ svg {
 
 .window-close:hover {
   background: #c42b1c;
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .window-button .glyph-restore,
@@ -1032,7 +1138,7 @@ svg {
 }
 
 .topbar-title {
-  font-size: 13px;
+  font-size: var(--text-base);
   font-weight: 500;
   color: var(--text-secondary);
 }
@@ -1053,7 +1159,7 @@ svg {
 }
 
 .topbar-cwd-name {
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   font-weight: 500;
   color: var(--text);
   white-space: nowrap;
@@ -1068,7 +1174,7 @@ svg {
   border-radius: 999px;
   border: 1px solid var(--border);
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   white-space: nowrap;
 }
@@ -1080,10 +1186,10 @@ svg {
   min-width: 14px;
   height: 14px;
   padding: 0 4px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   background: var(--accent);
-  color: #fff;
-  font-size: 9.5px;
+  color: var(--on-accent);
+  font-size: var(--text-xs);
   line-height: 14px;
   text-align: center;
   font-family: var(--mono);
@@ -1110,7 +1216,7 @@ svg {
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-popover);
   animation: slide-up 120ms ease-out;
 }
 
@@ -1125,8 +1231,8 @@ svg {
   gap: 10px;
   width: 100%;
   padding: 7px 9px;
-  border-radius: 6px;
-  font-size: 12.5px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   text-align: left;
 }
@@ -1162,7 +1268,7 @@ svg {
   justify-content: space-between;
   gap: 12px;
   padding: 5px 9px 6px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -1176,13 +1282,13 @@ svg {
   gap: 2px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 
 .menu-segmented button {
   padding: 2px 7px;
-  border-radius: 4px;
-  font-size: 11px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
   color: var(--text-secondary);
 }
 
@@ -1203,7 +1309,7 @@ svg {
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -1278,8 +1384,8 @@ svg {
   width: min(520px, calc(100% - 32px));
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
-  border-radius: 9px;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-popover);
 }
 
 .find-bar input {
@@ -1290,25 +1396,25 @@ svg {
   outline: none;
   color: var(--text);
   font-family: var(--sans);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
 }
 
 .find-count {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   white-space: nowrap;
 }
 
 mark.find-hit {
-  background: rgba(232, 160, 90, 0.32);
+  background: var(--mark-bg);
   color: inherit;
   border-radius: 2px;
 }
 
 mark.find-hit.current {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 
@@ -1318,18 +1424,13 @@ mark.find-hit.current {
 
 .transcript::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   border: 3px solid var(--bg);
 }
 
 /* Conversation width and body size are user preferences (Settings > Appearance).
    The column and every fixed-width block move together so a wide window does
    not leave tool output stranded in a narrow strip. */
-:root {
-  --reading-width: 780px;
-  --font-scale: 1;
-}
-
 :root[data-width="narrow"] {
   --reading-width: 620px;
 }
@@ -1369,7 +1470,7 @@ mark.find-hit.current {
   display: inline-block;
   max-width: 78%;
   padding: 8px 13px;
-  border-radius: 14px;
+  border-radius: var(--radius-lg);
   border-top-right-radius: 4px;
   background: var(--surface);
   border: 1px solid transparent;
@@ -1387,7 +1488,7 @@ mark.find-hit.current {
   max-width: var(--reading-width);
   margin: 4px auto 24px;
   padding: 0 28px;
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
 
@@ -1411,10 +1512,10 @@ mark.find-hit.current {
   top: 2px;
   right: 28px;
   padding: 2px 7px;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--surface-raised);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   opacity: 0;
   transition: opacity 120ms ease;
@@ -1450,7 +1551,7 @@ mark.find-hit.current {
 .markdown h1,
 .markdown h2,
 .markdown h3 {
-  font-size: 15px;
+  font-size: var(--text-md);
   font-weight: 600;
   margin: 20px 0 8px;
   letter-spacing: -0.01em;
@@ -1474,11 +1575,11 @@ mark.find-hit.current {
 
 .markdown code {
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   background: var(--surface-raised);
   border: 1px solid var(--border);
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
 }
 
 .markdown pre {
@@ -1495,16 +1596,16 @@ mark.find-hit.current {
   justify-content: space-between;
   padding: 6px 12px;
   border-bottom: 1px solid var(--border);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   font-family: var(--mono);
 }
 
 .code-copy {
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
 }
 
 .code-copy:hover {
@@ -1519,7 +1620,7 @@ mark.find-hit.current {
   border: none;
   overflow-x: auto;
   line-height: 1.55;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
 }
 
 .markdown blockquote {
@@ -1532,7 +1633,7 @@ mark.find-hit.current {
 .markdown table {
   border-collapse: collapse;
   margin: 0 0 14px;
-  font-size: 13px;
+  font-size: var(--text-base);
 }
 
 .markdown th,
@@ -1592,8 +1693,8 @@ mark.find-hit.current {
   gap: 8px;
   padding: 3px 8px;
   margin-left: -8px;
-  border-radius: 6px;
-  font-size: 12.5px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   min-height: 22px;
   animation: tool-in 160ms ease-out;
@@ -1607,12 +1708,17 @@ mark.find-hit.current {
 }
 
 .tool-glyph {
+  display: flex;
   flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
   color: var(--text-faint);
-  width: 12px;
-  text-align: center;
-  font-family: var(--mono);
-  font-size: 11px;
+}
+
+.tool-glyph .icon {
+  width: 14px;
+  height: 14px;
 }
 
 .tool-row.running .tool-glyph {
@@ -1639,7 +1745,7 @@ mark.find-hit.current {
 }
 
 .tool-name {
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   flex: 0 0 auto;
 }
@@ -1654,7 +1760,7 @@ mark.find-hit.current {
 
 .tool-summary {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1677,10 +1783,10 @@ mark.find-hit.current {
 .tool-expand {
   flex: 0 0 auto;
   margin-left: auto;
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   opacity: 0;
   transition: opacity 120ms ease;
 }
@@ -1699,7 +1805,7 @@ mark.find-hit.current {
   margin: 2px 0 8px;
   padding: 0 0 0 22px;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.55;
   color: var(--text-secondary);
   white-space: pre-wrap;
@@ -1713,7 +1819,7 @@ mark.find-hit.current {
   max-width: var(--reading-width);
   margin: 0 auto 10px;
   padding: 0 28px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   font-style: italic;
   display: flex;
@@ -1744,7 +1850,7 @@ mark.find-hit.current {
 :root[data-view="verbose"] .thinking-label {
   display: block;
   margin-bottom: 2px;
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   font-style: italic;
 }
@@ -1773,7 +1879,7 @@ mark.find-hit.current {
 }
 
 .plan-title {
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   margin-bottom: 8px;
   letter-spacing: 0.02em;
@@ -1783,7 +1889,7 @@ mark.find-hit.current {
   display: flex;
   gap: 9px;
   align-items: baseline;
-  font-size: 13px;
+  font-size: var(--text-base);
   padding: 3px 0;
 }
 
@@ -1796,8 +1902,13 @@ mark.find-hit.current {
   transform: translateY(1px);
   display: grid;
   place-items: center;
-  font-size: 9px;
-  color: var(--bg);
+  color: var(--on-accent);
+}
+
+.plan-item .box .icon {
+  width: 10px;
+  height: 10px;
+  stroke-width: 3;
 }
 
 .plan-item.in_progress .box {
@@ -1819,7 +1930,7 @@ mark.find-hit.current {
   max-width: var(--reading-width);
   margin: 0 auto 12px;
   padding: 0 28px;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   /* The flex row is for icon + text variants; plain notices wrap as prose so a
      sentence and its trailing action button stay on one line. */
   display: block;
@@ -1849,15 +1960,14 @@ mark.find-hit.current {
 }
 
 .empty-mark {
-  width: 34px;
-  height: 34px;
-  fill: var(--accent);
-  stroke: none;
-  margin-bottom: 16px;
+  width: 40px;
+  height: 40px;
+  color: var(--accent);
+  margin-bottom: 18px;
 }
 
 .empty-state h1 {
-  font-size: 25px;
+  font-size: var(--text-xl);
   font-weight: 500;
   letter-spacing: -0.025em;
   margin: 0 0 8px;
@@ -1865,7 +1975,7 @@ mark.find-hit.current {
 
 .empty-state p {
   color: var(--text-secondary);
-  font-size: 13.5px;
+  font-size: var(--text-base);
   margin: 0 auto 26px;
   max-width: 46ch;
 }
@@ -1887,7 +1997,7 @@ mark.find-hit.current {
   border: 1px solid var(--border);
   border-radius: 999px;
   color: var(--text-secondary);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   white-space: nowrap;
   transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
 }
@@ -1934,7 +2044,7 @@ mark.find-hit.current {
 .pending-question {
   flex: 1;
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -1993,7 +2103,7 @@ mark.find-hit.current {
   background: transparent;
   color: var(--text);
   font-family: inherit;
-  font-size: 14px;
+  font-size: var(--text-md);
   line-height: 1.55;
   max-height: 220px;
   padding: 5px 0;
@@ -2013,11 +2123,11 @@ mark.find-hit.current {
 .send-button {
   width: 32px;
   height: 32px;
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   display: grid;
   place-items: center;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   transition: opacity 120ms ease, transform 120ms ease;
 }
 
@@ -2033,9 +2143,9 @@ mark.find-hit.current {
 .stop-button {
   height: 32px;
   padding: 0 12px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -2059,7 +2169,7 @@ mark.find-hit.current {
 }
 
 .queued-badge {
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   padding: 0 4px;
   white-space: nowrap;
@@ -2072,10 +2182,10 @@ mark.find-hit.current {
 
 .queued-tag {
   margin-left: 8px;
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   padding: 0 4px;
   vertical-align: 1px;
 }
@@ -2089,21 +2199,21 @@ mark.find-hit.current {
   overflow-y: auto;
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   padding: 4px;
   z-index: 21;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+  box-shadow: var(--shadow-popover);
 }
 
 .command-name {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text);
   white-space: nowrap;
 }
 
 .command-hint {
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2120,10 +2230,10 @@ mark.find-hit.current {
   overflow-y: auto;
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   padding: 4px;
   z-index: 20;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+  box-shadow: var(--shadow-popover);
 }
 
 .mention-row {
@@ -2133,9 +2243,9 @@ mark.find-hit.current {
   width: 100%;
   text-align: left;
   padding: 5px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   min-width: 0;
 }
 
@@ -2151,7 +2261,7 @@ mark.find-hit.current {
 
 .mention-dir {
   color: var(--text-faint);
-  font-size: 11px;
+  font-size: var(--text-xs);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2175,8 +2285,8 @@ mark.find-hit.current {
   padding: 6px;
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
-  border-radius: 9px;
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.3);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-popover);
   z-index: 22;
 }
 
@@ -2184,7 +2294,7 @@ mark.find-hit.current {
   position: relative;
   width: 56px;
   height: 56px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
   border: 1px solid var(--border);
 }
@@ -2196,6 +2306,12 @@ mark.find-hit.current {
   display: block;
 }
 
+.attachment-remove .icon {
+  width: 10px;
+  height: 10px;
+  stroke-width: 2.4;
+}
+
 .attachment-remove {
   position: absolute;
   top: 1px;
@@ -2205,18 +2321,18 @@ mark.find-hit.current {
   display: grid;
   place-items: center;
   border-radius: 50%;
-  background: rgba(0, 0, 0, 0.6);
-  color: #fff;
-  font-size: 12px;
+  background: var(--scrim);
+  color: var(--on-accent);
+  font-size: var(--text-sm);
   line-height: 1;
 }
 
 .user-images {
   margin-left: 8px;
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   padding: 0 4px;
 }
 
@@ -2228,13 +2344,13 @@ mark.find-hit.current {
   align-items: center;
   gap: 8px;
   padding: 3px 8px 6px;
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   min-width: 0;
 }
 
 .pr-state {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   white-space: nowrap;
 }
@@ -2257,12 +2373,12 @@ mark.find-hit.current {
 }
 
 .pr-open {
-  font-size: 11px;
+  font-size: var(--text-xs);
 }
 
 .pr-checks {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   white-space: nowrap;
 }
 
@@ -2283,7 +2399,7 @@ mark.find-hit.current {
 .palette-scrim {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.42);
+  background: var(--scrim);
   z-index: 70;
 }
 
@@ -2298,8 +2414,8 @@ mark.find-hit.current {
   flex-direction: column;
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
-  border-radius: 12px;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-popover);
   z-index: 71;
   overflow: hidden;
 }
@@ -2309,7 +2425,7 @@ mark.find-hit.current {
   border-bottom: 1px solid var(--border);
   background: transparent;
   padding: 12px 14px;
-  font-size: 14px;
+  font-size: var(--text-md);
   color: var(--text);
   outline: none;
 }
@@ -2325,7 +2441,7 @@ mark.find-hit.current {
   gap: 10px;
   width: 100%;
   padding: 8px 10px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   text-align: left;
 }
 
@@ -2334,13 +2450,13 @@ mark.find-hit.current {
 }
 
 .palette-label {
-  font-size: 13px;
+  font-size: var(--text-base);
   color: var(--text);
   white-space: nowrap;
 }
 
 .palette-hint {
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2351,7 +2467,7 @@ mark.find-hit.current {
   padding: 16px;
   text-align: center;
   color: var(--text-faint);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
 }
 
 /* ---------- inline diff comments ---------- */
@@ -2372,7 +2488,7 @@ mark.find-hit.current {
 }
 
 .comments-count {
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   white-space: nowrap;
 }
@@ -2389,7 +2505,7 @@ mark.find-hit.current {
   margin: 4px 10px 8px;
   padding: 8px;
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: var(--surface-raised);
   display: flex;
   flex-direction: column;
@@ -2398,7 +2514,7 @@ mark.find-hit.current {
 
 .comment-context {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
@@ -2407,10 +2523,10 @@ mark.find-hit.current {
   min-height: 40px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   font-family: var(--sans);
-  font-size: 12px;
+  font-size: var(--text-sm);
   padding: 6px 8px;
   outline: none;
 }
@@ -2430,13 +2546,13 @@ mark.find-hit.current {
   border-left: 2px solid var(--accent);
   background: var(--surface);
   border-radius: 0 6px 6px 0;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
 .line-comment-where {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   flex: 0 0 auto;
 }
@@ -2448,9 +2564,13 @@ mark.find-hit.current {
 }
 
 .line-comment-remove {
+  display: flex;
   color: var(--text-faint);
-  font-size: 14px;
-  line-height: 1;
+}
+
+.line-comment-remove .icon {
+  width: 12px;
+  height: 12px;
 }
 
 .line-comment-remove:hover {
@@ -2466,7 +2586,7 @@ mark.find-hit.current {
   border-left: 2px solid var(--border-strong);
   background: var(--surface);
   border-radius: 0 8px 8px 0;
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 
 .subagent.running {
@@ -2485,7 +2605,13 @@ mark.find-hit.current {
 }
 
 .subagent-glyph {
+  display: flex;
   color: var(--text-faint);
+}
+
+.subagent-glyph .icon {
+  width: 14px;
+  height: 14px;
 }
 
 .subagent-title {
@@ -2495,14 +2621,14 @@ mark.find-hit.current {
 .subagent-count {
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
 .subagent-prompt {
   margin-top: 3px;
   color: var(--text-faint);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -2513,7 +2639,7 @@ mark.find-hit.current {
 .subagent-activities {
   margin-top: 5px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   max-height: 132px;
   overflow-y: auto;
@@ -2538,7 +2664,7 @@ mark.find-hit.current {
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
   color: var(--text-secondary);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--shadow-popover);
   z-index: 11;
 }
 
@@ -2561,7 +2687,7 @@ mark.find-hit.current {
   padding-top: 1px;
   padding-bottom: 1px;
   min-height: 18px;
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 
 :root[data-density="compact"] .tool-row .tool-summary {
@@ -2601,10 +2727,10 @@ mark.find-hit.current {
   min-width: 0;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   padding: 4px 8px;
   outline: none;
 }
@@ -2645,17 +2771,17 @@ mark.find-hit.current {
 .artifact-kind {
   flex: 0 0 auto;
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: var(--text-xs);
   letter-spacing: 0.02em;
   color: var(--text-faint);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: 0 4px;
 }
 
 .artifact-path {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2674,7 +2800,7 @@ mark.find-hit.current {
   width: 100%;
   height: 100%;
   border: none;
-  background: #fff;
+  background: #ffffff;
 }
 
 .artifact-svg {
@@ -2697,7 +2823,7 @@ mark.find-hit.current {
   margin: 0;
   padding: 14px 16px;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
@@ -2711,7 +2837,7 @@ mark.find-hit.current {
 .artifact-table {
   border-collapse: collapse;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 
 .artifact-table th,
@@ -2764,13 +2890,13 @@ mark.find-hit.current {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   background: var(--surface-raised);
-  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-popover);
   -webkit-app-region: no-drag;
 }
 
 .worktree-copy {
   margin: 0 0 8px;
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   color: var(--text-faint);
   word-break: break-all;
@@ -2798,7 +2924,7 @@ mark.find-hit.current {
   gap: 5px;
   min-width: 0;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -2824,7 +2950,7 @@ mark.find-hit.current {
 .git-sync {
   margin-left: auto;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   white-space: nowrap;
 }
@@ -2844,10 +2970,10 @@ mark.find-hit.current {
   min-height: 46px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   font-family: var(--sans);
-  font-size: 12px;
+  font-size: var(--text-sm);
   padding: 6px 8px;
   outline: none;
 }
@@ -2864,7 +2990,7 @@ mark.find-hit.current {
 
 .git-commit-note {
   flex: 1;
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   min-width: 0;
   overflow: hidden;
@@ -2888,13 +3014,13 @@ mark.find-hit.current {
   gap: 2px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
 }
 
 .segmented button {
   padding: 3px 9px;
-  border-radius: 6px;
-  font-size: 11.5px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   transition: background 120ms ease, color 120ms ease;
 }
@@ -2928,7 +3054,7 @@ mark.find-hit.current {
 
 .segment-label {
   padding: 3px 6px 3px 5px;
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
   letter-spacing: 0.01em;
   user-select: none;
@@ -2942,11 +3068,11 @@ mark.find-hit.current {
   align-items: center;
   gap: 6px;
   padding: 4px 8px 4px 10px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: var(--surface);
   border: 1px solid var(--border);
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   transition: border-color 120ms ease, color 120ms ease;
 }
@@ -2965,7 +3091,7 @@ mark.find-hit.current {
 
 .chip-key {
   font-family: var(--sans);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
@@ -2982,7 +3108,7 @@ mark.find-hit.current {
   background: var(--surface-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-popover);
   z-index: 20;
 }
 
@@ -3000,7 +3126,7 @@ mark.find-hit.current {
   padding: 6px 10px;
   border-radius: var(--radius-sm);
   text-align: left;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -3044,7 +3170,7 @@ mark.find-hit.current {
   background: var(--surface-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow-popover);
   z-index: 20;
   animation: slide-up 120ms ease-out;
 }
@@ -3069,7 +3195,7 @@ mark.find-hit.current {
 
 .model-id {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text);
 }
 
@@ -3078,19 +3204,19 @@ mark.find-hit.current {
 }
 
 .model-name {
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
 .model-meta {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
 .model-empty {
   padding: 10px;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
 }
 
@@ -3099,7 +3225,7 @@ mark.find-hit.current {
   margin-top: 4px;
   padding: 7px 10px;
   border-top: 1px solid var(--border);
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   text-align: left;
   border-radius: 0 0 var(--radius-sm) var(--radius-sm);
@@ -3114,7 +3240,7 @@ mark.find-hit.current {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text-faint);
   font-family: var(--mono);
   white-space: nowrap;
@@ -3123,7 +3249,7 @@ mark.find-hit.current {
 .meter {
   position: relative;
   cursor: pointer;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   padding: 2px 4px;
   margin-right: -4px;
 }
@@ -3145,8 +3271,8 @@ mark.find-hit.current {
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.4);
-  font-size: 12px;
+  box-shadow: var(--shadow-popover);
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -3168,7 +3294,7 @@ mark.find-hit.current {
 
 .usage-value {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   color: var(--text);
 }
 
@@ -3222,9 +3348,9 @@ mark.find-hit.current {
 
 .btn {
   padding: 6px 12px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   transition: background 120ms ease, color 120ms ease;
 }
@@ -3237,12 +3363,12 @@ mark.find-hit.current {
 .btn-primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .btn-primary:hover {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   filter: brightness(1.06);
 }
 
@@ -3252,7 +3378,7 @@ mark.find-hit.current {
 
 .btn.small {
   padding: 3px 9px;
-  font-size: 11.5px;
+  font-size: var(--text-sm);
 }
 
 .link-button {
@@ -3270,7 +3396,7 @@ mark.find-hit.current {
 
 .settings-hint {
   margin-top: 6px;
-  font-size: 11.5px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   color: var(--text-faint);
 }
@@ -3278,7 +3404,7 @@ mark.find-hit.current {
 .field-hint {
   display: block;
   margin-top: 4px;
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-faint);
 }
 
@@ -3291,7 +3417,7 @@ mark.find-hit.current {
 
 .about-version {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
 }
 
@@ -3300,7 +3426,7 @@ mark.find-hit.current {
 .modal-scrim {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--scrim);
   z-index: 40;
 }
 
@@ -3317,7 +3443,7 @@ mark.find-hit.current {
   padding: 0;
   width: min(620px, 92vw);
   max-height: 82vh;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-popover);
   overflow: hidden;
 }
 
@@ -3342,7 +3468,7 @@ mark.find-hit.current {
 }
 
 .dialog-head h2 {
-  font-size: 14px;
+  font-size: var(--text-md);
   font-weight: 600;
   margin: 0;
 }
@@ -3365,7 +3491,7 @@ mark.find-hit.current {
 
 .shortcut-grid .label {
   padding: 7px 0;
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   color: var(--text-secondary);
   border-bottom: 1px solid var(--border);
 }
@@ -3374,18 +3500,18 @@ mark.find-hit.current {
   align-self: center;
   justify-self: end;
   padding: 2px 7px;
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong);
   background: var(--surface);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-secondary);
 }
 
 .scrim {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.45);
+  background: var(--scrim);
   z-index: 10;
 }
 
@@ -3407,7 +3533,7 @@ mark.find-hit.current {
     position: fixed;
     inset: 0 auto 0 0;
     z-index: 12;
-    box-shadow: 0 0 40px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--shadow-popover);
   }
   .shell.collapsed .sidebar {
     margin-left: calc(-1 * var(--sidebar-width) - 1px);

@@ -8,6 +8,7 @@
  */
 
 import { settingsStrings } from "./settings-i18n.js";
+import { iconEl } from "./icons.js";
 
 export function createSettings(deps) {
   const { state, $, api, formatTokens, setTheme, setDensity, setMode, applyLocale, openModal, closeModal, getT, applyCodeFont } = deps;
@@ -32,22 +33,22 @@ state.settingsQuery = "";
 
 const S = () => settingsStrings[state.locale] ?? settingsStrings.en;
 
-/** Icon paths for the rail; 24×24, stroke drawn by the global svg rule. */
-const SETTINGS_ICONS = {
-  general: '<circle cx="12" cy="8" r="3.2" /><path d="M5.5 20a6.5 6.5 0 0 1 13 0" />',
-  appearance: '<circle cx="12" cy="12" r="4" /><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.2 5.2l1.4 1.4M17.4 17.4l1.4 1.4M18.8 5.2l-1.4 1.4M6.6 17.4l-1.4 1.4" />',
-  usage: '<path d="M4 20V9M10 20V4M16 20v-7M22 20H2" />',
-  connection: '<path d="M9 7H6a4 4 0 0 0 0 8h3M15 7h3a4 4 0 0 1 0 8h-3M8 11h8" />',
-  behavior: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9" /><circle cx="15" cy="7" r="2.2" /><circle cx="9" cy="17" r="2.2" />',
-  sessions: '<rect x="3" y="4.5" width="18" height="15" rx="2.5" /><path d="M7 9h10M7 13h6" />',
-  mcp: '<path d="M12 3v5M12 16v5M4.5 8.5 8 11M16 13l3.5 2.5M19.5 8.5 16 11M8 13l-3.5 2.5" /><circle cx="12" cy="12" r="3" />',
-  skills: '<path d="m12 3 2.4 5.2 5.6.7-4.1 3.9 1 5.6L12 15.7 7.1 18.4l1-5.6L4 8.9l5.6-.7Z" />',
-  memory: '<path d="M12 4c-2.2 0-3.4 1.2-3.4 2.7C6.6 7 6 8.2 6 9.5c0 1 .4 1.9 1.1 2.5-.7.6-1.1 1.5-1.1 2.5 0 1.4.8 2.6 2.2 3 .3 1.4 1.5 2.5 3.8 2.5s3.5-1.1 3.8-2.5c1.4-.4 2.2-1.6 2.2-3 0-1-.4-1.9-1.1-2.5.7-.6 1.1-1.5 1.1-2.5 0-1.3-.6-2.5-2.6-2.8C15.4 5.2 14.2 4 12 4Z" />',
-  instructions: '<path d="M6 3.5h8l4 4V20a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 5 20V5a1.5 1.5 0 0 1 1-1.5Z" /><path d="M14 3.5V8h4M8 12h8M8 16h5" />',
-  system: '<rect x="3" y="4.5" width="18" height="12" rx="2" /><path d="M8 20.5h8M12 16.5v4" />',
-  about: '<circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" />',
+/** Rail glyphs, named from the shared sprite so the rail and the toolbar
+ *  speak the same visual language. */
+const SETTINGS_ICON_NAMES = {
+  general: "user",
+  appearance: "palette",
+  usage: "chart",
+  connection: "plug",
+  behavior: "sliders",
+  sessions: "layers",
+  mcp: "robot",
+  skills: "sparkle",
+  memory: "book",
+  instructions: "file-code",
+  system: "monitor",
+  about: "info",
 };
-
 /**
  * One settings page: a rail entry and a builder. Builders return the pane
  * element and may refresh themselves later (usage, MCP, skills, memory).
@@ -1237,11 +1238,7 @@ function settingsRail() {
     button.type = "button";
     button.dataset.settingsTab = page.id;
     button.setAttribute("role", "tab");
-    const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    icon.setAttribute("viewBox", "0 0 24 24");
-    icon.setAttribute("aria-hidden", "true");
-    icon.innerHTML = SETTINGS_ICONS[page.id] ?? SETTINGS_ICONS.general;
-    button.append(icon, el("span", "", page.title));
+    button.append(iconEl(SETTINGS_ICON_NAMES[page.id] ?? "user"), el("span", "", page.title));
     button.addEventListener("click", () => selectSettingsTab(page.id));
     nav.appendChild(button);
   }

@@ -13,57 +13,50 @@
   </head>
   <body>
     <div class="shell">
-      <!-- Sidebar: sessions, workspace, settings (Claude Desktop / Codex layout) -->
+      <!-- Sidebar: sessions, workspace, settings -->
       <aside class="sidebar" id="sidebar">
         <div class="sidebar-head">
           <div class="brand">
-            <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 2.5c3.2 2.4 4.9 5.6 4.9 9.2 0 2.2-.7 4.1-1.9 5.6l-3-1.6-3 1.6a8.6 8.6 0 0 1-1.9-5.6c0-3.6 1.7-6.8 4.9-9.2Z" />
-              <path d="M12 9.4c1.1 1 1.7 2.2 1.7 3.7 0 1-.3 1.8-.8 2.5l-.9-.5-.9.5a4.5 4.5 0 0 1-.8-2.5c0-1.5.6-2.7 1.7-3.7Z" opacity=".55" />
-            </svg>
+            <svg class="mark" aria-hidden="true"><use href="#i-mark"></use></svg>
             <span class="wordmark">Prometheus</span>
           </div>
         </div>
 
         <div class="sidebar-actions">
           <button class="new-chat" id="new-session">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+            <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
             <span data-i18n="newSession">New chat</span>
           </button>
         </div>
 
-        <!-- The project name and its worktree live in the top bar, next to
-             the other session-scoped controls; the sidebar is the session
-             list and nothing else. -->
         <div class="sidebar-section-head">
           <span data-i18n="sessions">Sessions</span>
-          <button class="icon-button small" id="toggle-archived" title="Show archived">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18v4H3zM5 11v9h14v-9M10 15h4" /></svg>
+          <button class="icon-button small" id="toggle-archived" data-i18n-title="showArchived">
+            <svg class="icon" aria-hidden="true"><use href="#i-archive"></use></svg>
           </button>
-          <button class="icon-button small" id="refresh-sessions" title="Refresh">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6M20 20v-6h-6" /><path d="M4.5 15a8 8 0 0 0 14-3M19.5 9a8 8 0 0 0-14 3" /></svg>
+          <button class="icon-button small" id="refresh-sessions" data-i18n-title="refresh">
+            <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
           </button>
         </div>
         <div class="session-search">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>
+          <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
           <input id="session-search" type="search" spellcheck="false" autocomplete="off" />
         </div>
         <nav class="session-list" id="session-list" aria-label="Sessions"></nav>
-
       </aside>
 
       <!-- Main column -->
       <div class="main">
         <header class="topbar">
-          <button class="icon-button small topbar-sidebar-toggle" id="topbar-sidebar-toggle" title="Toggle sidebar">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg>
+          <button class="icon-button small topbar-sidebar-toggle" id="topbar-sidebar-toggle" data-i18n-title="toggleSidebar">
+            <svg class="icon" aria-hidden="true"><use href="#i-panel-left"></use></svg>
           </button>
-          <button class="topbar-cwd" id="topbar-cwd" title="Change workspace folder">
+          <button class="topbar-cwd" id="topbar-cwd" data-i18n-title="changeFolderTitle">
             <span class="topbar-cwd-name" id="topbar-cwd-name">Prometheus</span>
             <span class="topbar-cwd-branch" id="topbar-cwd-branch" hidden></span>
           </button>
-          <button class="icon-button small worktree-toggle" id="worktree-button" title="Isolated worktree" aria-haspopup="menu" aria-expanded="false">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="6" r="2.2" /><circle cx="7" cy="18" r="2.2" /><circle cx="17" cy="8" r="2.2" /><path d="M7 8.2v7.6M17 10.2c0 3-2.4 4-5 4.4-2.2.3-4 1-4 3.4" /></svg>
+          <button class="icon-button small worktree-toggle" id="worktree-button" data-i18n-title="worktreeLabel" aria-haspopup="menu" aria-expanded="false">
+            <svg class="icon" aria-hidden="true"><use href="#i-branch"></use></svg>
           </button>
           <div class="worktree-panel" id="worktree-panel" hidden>
             <p class="worktree-copy" id="worktree-copy" data-i18n="worktreeExplain">
@@ -84,31 +77,31 @@
             <span class="status-text" id="status-text" data-i18n="statusStarting">starting</span>
           </div>
           <div class="topbar-actions">
-            <button class="icon-button" id="changes-button" title="Changes (Ctrl+Shift+D)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3v12a3 3 0 0 0 3 3h9" /><circle cx="6" cy="3" r="1.6" /><circle cx="18" cy="18" r="1.6" /><path d="M18 3v6" /><circle cx="18" cy="3" r="1.6" /></svg>
+            <button class="icon-button" id="changes-button" data-i18n-title="changesTitle">
+              <svg class="icon" aria-hidden="true"><use href="#i-file-diff"></use></svg>
               <span class="icon-badge" id="changes-badge" hidden>0</span>
             </button>
-            <button class="icon-button" id="terminal-button" title="Terminal (Ctrl+`)">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2.5" /><path d="m7 9.5 3 2.5-3 2.5M12.5 15h4" /></svg>
+            <button class="icon-button" id="terminal-button" data-i18n-title="terminalTitle">
+              <svg class="icon" aria-hidden="true"><use href="#i-terminal"></use></svg>
             </button>
-            <button class="icon-button" id="more-button" title="More" aria-haspopup="menu" aria-expanded="false">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.2" fill="currentColor" /><circle cx="12" cy="12" r="1.2" fill="currentColor" /><circle cx="18" cy="12" r="1.2" fill="currentColor" /></svg>
+            <button class="icon-button" id="more-button" data-i18n-title="more" aria-haspopup="menu" aria-expanded="false">
+              <svg class="icon" aria-hidden="true"><use href="#i-more"></use></svg>
             </button>
-            <button class="icon-button" id="settings-button" title="Settings">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" /></svg>
+            <button class="icon-button" id="settings-button" data-i18n-title="settings">
+              <svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg>
             </button>
           </div>
           <div class="topbar-menu" id="topbar-menu" role="menu" hidden>
             <button class="menu-row" id="menu-export" role="menuitem">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" /></svg>
+              <svg class="icon" aria-hidden="true"><use href="#i-download"></use></svg>
               <span data-i18n="menuExport">Export conversation</span>
             </button>
             <button class="menu-row" id="menu-new-window" role="menuitem">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="7" width="12" height="12" rx="2" /><path d="M8.5 7V5.5A1.5 1.5 0 0 1 10 4h8.5A1.5 1.5 0 0 1 20 5.5V14a1.5 1.5 0 0 1-1.5 1.5H17" /></svg>
+              <svg class="icon" aria-hidden="true"><use href="#i-new-window"></use></svg>
               <span data-i18n="menuNewWindow">New window</span>
             </button>
             <button class="menu-row" id="menu-shortcuts" role="menuitem">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2.5" /><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M7 14h10" /></svg>
+              <svg class="icon" aria-hidden="true"><use href="#i-keyboard"></use></svg>
               <span data-i18n="menuShortcuts">Keyboard shortcuts</span>
             </button>
             <div class="menu-separator"></div>
@@ -129,259 +122,260 @@
             </div>
             <div class="menu-separator"></div>
             <button class="menu-row danger" id="menu-clear" role="menuitem">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12" /></svg>
+              <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
               <span data-i18n="clearSession">Clear conversation</span>
             </button>
           </div>
           <div class="window-controls" id="window-controls" hidden>
-            <button class="window-button" data-window="minimize" title="Minimize">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" /></svg>
+            <button class="window-button" data-window="minimize" data-i18n-title="minimize">
+              <svg class="icon" aria-hidden="true"><use href="#i-win-minimize"></use></svg>
             </button>
-            <button class="window-button" data-window="maximize" id="window-maximize" title="Maximize">
-              <svg class="glyph-maximize" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="1" /></svg>
-              <svg class="glyph-restore" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 8.5V6.6c0-.6.4-1 1-1h8c.6 0 1 .4 1 1v8c0 .6-.4 1-1 1h-1.9" /><rect x="5.5" y="8.5" width="10" height="10" rx="1" /></svg>
+            <button class="window-button" data-window="maximize" id="window-maximize" data-i18n-title="maximize">
+              <svg class="icon glyph-maximize" aria-hidden="true"><use href="#i-win-maximize"></use></svg>
+              <svg class="icon glyph-restore" aria-hidden="true"><use href="#i-win-restore"></use></svg>
             </button>
-            <button class="window-button window-close" data-window="close" title="Close">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7 7 17" /></svg>
+            <button class="window-button window-close" data-window="close" data-i18n-title="close">
+              <svg class="icon" aria-hidden="true"><use href="#i-win-close"></use></svg>
             </button>
           </div>
         </header>
 
         <div class="main-body">
-        <div class="chat-column">
-        <main class="transcript" id="transcript" aria-live="polite">
-          <div class="find-bar" id="find-bar" hidden>
-            <input id="find-input" type="search" spellcheck="false" autocomplete="off" />
-            <span class="find-count" id="find-count"></span>
-            <button class="icon-button small" id="find-prev" title="Previous match">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6" /></svg>
-            </button>
-            <button class="icon-button small" id="find-next" title="Next match">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 10 6 6 6-6" /></svg>
-            </button>
-            <button class="icon-button small" id="find-close" title="Close">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
-            </button>
-          </div>
-          <div class="transcript-scroll" id="transcript-scroll">
-          <section class="empty-state" id="empty-state">
-            <svg class="empty-mark" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 2.5c3.2 2.4 4.9 5.6 4.9 9.2 0 2.2-.7 4.1-1.9 5.6l-3-1.6-3 1.6a8.6 8.6 0 0 1-1.9-5.6c0-3.6 1.7-6.8 4.9-9.2Z" />
-            </svg>
-            <h1 data-i18n="emptyTitle">What should we build?</h1>
-            <p data-i18n="emptyBody">Prometheus reads, edits, and runs your code. It asks before changing files unless you switch the mode.</p>
-            <div class="suggestions">
-              <button class="suggestion" id="setup-button" data-i18n="setupTitle" hidden>
-                Set up a connection
-              </button>
-              <button class="suggestion" data-prompt-key="suggestionSummarizePrompt" data-i18n="suggestionSummarize" data-prompt="Summarize this project and list the main entry points.">
-                Summarize this project
-              </button>
-              <button class="suggestion" data-prompt-key="suggestionFailingTestsPrompt" data-i18n="suggestionFailingTests" data-prompt="Find failing tests and fix them. Verify with the project's test command.">
-                Fix the failing tests
-              </button>
-              <button class="suggestion" data-prompt-key="suggestionDocumentPrompt" data-i18n="suggestionDocument" data-prompt="Create a PROMETHEUS.md describing how this project is built, tested, and organized.">
-                Document the repo
-              </button>
-            </div>
-          </section>
-          </div>
-          <button class="scroll-bottom" id="scroll-bottom" hidden title="Scroll to latest">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m0 0-5-5m5 5 5-5" /></svg>
-          </button>
-        </main>
-
-        <section class="composer-region" id="composer-region">
-          <div class="pending-permission" id="pending-permission" hidden>
-            <div class="pending-question" id="pending-question"></div>
-            <div class="pending-actions">
-              <button class="btn btn-primary" data-permission="yes" data-i18n="allow">Allow</button>
-              <button class="btn" data-permission="always" data-i18n="alwaysAllow">Always allow</button>
-              <button class="btn btn-quiet" data-permission="no" data-i18n="deny">Deny</button>
-              <div class="pending-choices" id="pending-choices" hidden></div>
-            </div>
-          </div>
-
-          <!-- One box: the textarea and every control that shapes the request
-               live in the same frame, the way the composer reads in Codex and
-               Cursor. A second row of pills under the box was noise. -->
-          <div class="composer">
-            <div class="attachments" id="attachments" hidden></div>
-            <div class="file-mention" id="file-mention" hidden role="listbox"></div>
-            <div class="command-menu" id="command-menu" hidden role="listbox"></div>
-            <div class="composer-input-row">
-              <textarea
-                id="input"
-                rows="1"
-                placeholder="Ask Prometheus to change, explain, or build something…"
-                spellcheck="false"
-              ></textarea>
-              <div class="composer-actions">
-                <span class="queued-badge" id="queued-badge" hidden></span>
-                <button class="icon-button small voice-button" id="voice-button" hidden title="Dictate">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" /></svg>
+          <div class="chat-column">
+            <main class="transcript" id="transcript" aria-live="polite">
+              <div class="find-bar" id="find-bar" hidden>
+                <input id="find-input" type="search" spellcheck="false" autocomplete="off" />
+                <span class="find-count" id="find-count"></span>
+                <button class="icon-button small" id="find-prev" data-i18n-title="previousMatch">
+                  <svg class="icon" aria-hidden="true"><use href="#i-chevron-up"></use></svg>
                 </button>
-                <button class="stop-button" id="stop-button" data-i18n="stop" hidden title="Stop (Esc)">Stop</button>
-                <button class="send-button" id="send-button" title="Send (Enter)">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m0 0-6 6m6-6 6 6" /></svg>
+                <button class="icon-button small" id="find-next" data-i18n-title="nextMatch">
+                  <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                </button>
+                <button class="icon-button small" id="find-close" data-i18n-title="close">
+                  <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
                 </button>
               </div>
+              <div class="transcript-scroll" id="transcript-scroll">
+                <section class="empty-state" id="empty-state">
+                  <svg class="empty-mark" aria-hidden="true"><use href="#i-mark"></use></svg>
+                  <h1 data-i18n="emptyTitle">What should we build?</h1>
+                  <p data-i18n="emptyBody">Prometheus reads, edits, and runs your code. It asks before changing files unless you switch the mode.</p>
+                  <div class="suggestions">
+                    <button class="suggestion" id="setup-button" data-i18n="setupTitle" hidden>
+                      Set up a connection
+                    </button>
+                    <button class="suggestion" data-prompt-key="suggestionSummarizePrompt" data-i18n="suggestionSummarize" data-prompt="Summarize this project and list the main entry points.">
+                      Summarize this project
+                    </button>
+                    <button class="suggestion" data-prompt-key="suggestionFailingTestsPrompt" data-i18n="suggestionFailingTests" data-prompt="Find failing tests and fix them. Verify with the project's test command.">
+                      Fix the failing tests
+                    </button>
+                    <button class="suggestion" data-prompt-key="suggestionDocumentPrompt" data-i18n="suggestionDocument" data-prompt="Create a PROMETHEUS.md describing how this project is built, tested, and organized.">
+                      Document the repo
+                    </button>
+                  </div>
+                </section>
+              </div>
+              <button class="scroll-bottom" id="scroll-bottom" hidden data-i18n-title="scrollToLatest">
+                <svg class="icon" aria-hidden="true"><use href="#i-arrow-down"></use></svg>
+              </button>
+            </main>
+
+            <section class="composer-region" id="composer-region">
+              <div class="pending-permission" id="pending-permission" hidden>
+                <div class="pending-question" id="pending-question"></div>
+                <div class="pending-actions">
+                  <button class="btn btn-primary" data-permission="yes" data-i18n="allow">Allow</button>
+                  <button class="btn" data-permission="always" data-i18n="alwaysAllow">Always allow</button>
+                  <button class="btn btn-quiet" data-permission="no" data-i18n="deny">Deny</button>
+                  <div class="pending-choices" id="pending-choices" hidden></div>
+                </div>
+              </div>
+
+              <!-- One box: the textarea and every control that shapes the request
+                   live in the same frame. A second row of pills under the box
+                   was noise. -->
+              <div class="composer">
+                <div class="attachments" id="attachments" hidden></div>
+                <div class="file-mention" id="file-mention" hidden role="listbox"></div>
+                <div class="command-menu" id="command-menu" hidden role="listbox"></div>
+                <div class="composer-input-row">
+                  <textarea
+                    id="input"
+                    rows="1"
+                    data-i18n-placeholder="composerPlaceholder"
+                    placeholder="Ask Prometheus to change, explain, or build something…"
+                    spellcheck="false"
+                  ></textarea>
+                  <div class="composer-actions">
+                    <span class="queued-badge" id="queued-badge" hidden></span>
+                    <button class="icon-button small voice-button" id="voice-button" hidden data-i18n-title="voiceStart">
+                      <svg class="icon" aria-hidden="true"><use href="#i-mic"></use></svg>
+                    </button>
+                    <button class="stop-button" id="stop-button" data-i18n="stop" data-i18n-title="stopTitle" hidden>Stop</button>
+                    <button class="send-button" id="send-button" data-i18n-title="sendTitle">
+                      <svg class="icon" aria-hidden="true"><use href="#i-arrow-up"></use></svg>
+                    </button>
+                  </div>
+                </div>
+                <div class="composer-bar">
+                  <div class="controls">
+                    <div class="segmented" id="mode-control" role="radiogroup" aria-label="Permission mode">
+                      <button role="radio" data-mode="ask" class="active" data-i18n="modeAsk">Ask</button>
+                      <button role="radio" data-mode="auto" data-i18n="modeAuto">Auto</button>
+                      <button role="radio" data-mode="plan" data-i18n="modePlan">Plan</button>
+                    </div>
+                    <div class="model-control" id="model-control">
+                      <button class="chip-button model-picker" id="model-picker" aria-haspopup="listbox" aria-expanded="false">
+                        <span id="model-label" data-i18n="loadingModels">loading models…</span>
+                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                      </button>
+                      <div class="model-menu" id="model-menu" role="listbox" hidden></div>
+                    </div>
+                    <div class="effort-control" id="effort-control">
+                      <button class="chip-button" id="effort-picker" aria-haspopup="menu" aria-expanded="false">
+                        <span class="chip-key" data-i18n="effortLabel">Thinking</span>
+                        <span id="effort-label">Auto</span>
+                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                      </button>
+                      <div class="effort-menu" id="effort-menu" role="menu" hidden>
+                        <button role="menuitemradio" data-effort="auto" data-i18n="effortAuto">Auto</button>
+                        <button role="menuitemradio" data-effort="low" data-i18n="effortLow">Low</button>
+                        <button role="menuitemradio" data-effort="medium" data-i18n="effortMedium">Med</button>
+                        <button role="menuitemradio" data-effort="high" data-i18n="effortHigh">High</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="meter" id="usage-meter" tabindex="0" role="button" aria-haspopup="dialog" aria-expanded="false" data-i18n-title="usageTitle">
+                    <span id="context-label">0%</span>
+                    <div class="meter-track"><div class="meter-fill" id="context-fill"></div></div>
+                    <span class="meter-sep"></span>
+                    <span id="usage-label">0 tok</span>
+                  </div>
+                </div>
+                <div class="usage-popover" id="usage-popover" hidden role="dialog" aria-label="Token usage">
+                  <div class="usage-row">
+                    <span data-i18n="usageContext">Context window</span>
+                    <span class="usage-value" id="usage-context-value">—</span>
+                  </div>
+                  <div class="usage-track"><div class="usage-fill" id="usage-context-fill"></div></div>
+                  <div class="usage-row">
+                    <span data-i18n="usageInput">Input</span>
+                    <span class="usage-value" id="usage-input-value">0</span>
+                  </div>
+                  <div class="usage-row">
+                    <span data-i18n="usageCached">Cached</span>
+                    <span class="usage-value" id="usage-cached-value">0</span>
+                  </div>
+                  <div class="usage-row">
+                    <span data-i18n="usageOutput">Output</span>
+                    <span class="usage-value" id="usage-output-value">0</span>
+                  </div>
+                  <div class="usage-row total">
+                    <span data-i18n="usageTotal">Total this session</span>
+                    <span class="usage-value" id="usage-total-value">0</span>
+                  </div>
+                  <button type="button" class="btn btn-quiet small usage-reset" id="usage-reset" data-i18n="usageReset">Reset counter</button>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <section class="workbench" id="workbench" hidden>
+            <div class="workbench-head">
+              <div class="workbench-tabs" id="workbench-tabs" role="tablist">
+                <button role="tab" data-pane="files" data-i18n="tabFiles">Files</button>
+                <button role="tab" data-pane="diff" class="active" data-i18n="paneDiff">Changes</button>
+                <button role="tab" data-pane="history" data-i18n="tabHistory">History</button>
+                <button role="tab" data-pane="artifact" data-i18n="tabArtifacts">Artifacts</button>
+                <button role="tab" data-pane="terminal" data-i18n="paneTerminal">Terminal</button>
+                <button role="tab" data-pane="browser" data-i18n="paneBrowser">Browser</button>
+              </div>
+              <div class="workbench-meta" id="workbench-meta"></div>
+              <div class="diff-scope" id="diff-scope" role="radiogroup" aria-label="Diff scope" hidden>
+                <button role="radio" data-scope="session" class="active" data-i18n="scopeSession">Session</button>
+                <button role="radio" data-scope="turn" data-i18n="scopeTurn">Last turn</button>
+              </div>
+              <button class="icon-button small" id="close-workbench" data-i18n-title="closePane">
+                <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+              </button>
             </div>
-            <div class="composer-bar">
-              <div class="controls">
-                <div class="segmented" id="mode-control" role="radiogroup" aria-label="Permission mode">
-                  <button role="radio" data-mode="ask" class="active" data-i18n="modeAsk">Ask</button>
-                  <button role="radio" data-mode="auto" data-i18n="modeAuto">Auto</button>
-                  <button role="radio" data-mode="plan" data-i18n="modePlan">Plan</button>
-                </div>
-                <div class="model-control" id="model-control">
-                  <button class="chip-button model-picker" id="model-picker" aria-haspopup="listbox" aria-expanded="false">
-                    <span id="model-label" data-i18n="loadingModels">loading models…</span>
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+            <div class="comments-bar" id="comments-bar" hidden>
+              <span class="comments-count" id="comments-count"></span>
+              <button class="btn btn-quiet small" id="comments-clear" data-i18n="commentClear">Clear</button>
+              <button class="btn btn-primary small" id="comments-send" data-i18n="commentSend">Send to agent</button>
+            </div>
+            <div class="workbench-body">
+              <div class="pane-tree file-tree" id="pane-tree" hidden></div>
+              <aside class="diff-filelist" id="diff-filelist" hidden></aside>
+              <div class="diff-pane" id="diff-pane">
+                <div class="git-bar" id="git-bar" hidden>
+                  <button class="git-branch" id="git-branch" data-i18n-title="copyBranch">
+                    <svg class="icon" aria-hidden="true"><use href="#i-branch"></use></svg>
+                    <span id="git-branch-name">—</span>
                   </button>
-                  <div class="model-menu" id="model-menu" role="listbox" hidden></div>
+                  <span class="git-sync" id="git-sync"></span>
                 </div>
-                <div class="effort-control" id="effort-control">
-                  <button class="chip-button" id="effort-picker" aria-haspopup="menu" aria-expanded="false">
-                    <span class="chip-key" data-i18n="effortLabel">Thinking</span>
-                    <span id="effort-label">Auto</span>
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
-                  </button>
-                  <div class="effort-menu" id="effort-menu" role="menu" hidden>
-                    <button role="menuitemradio" data-effort="auto" data-i18n="effortAuto">Auto</button>
-                    <button role="menuitemradio" data-effort="low" data-i18n="effortLow">Low</button>
-                    <button role="menuitemradio" data-effort="medium" data-i18n="effortMedium">Med</button>
-                    <button role="menuitemradio" data-effort="high" data-i18n="effortHigh">High</button>
+                <div class="pr-bar" id="pr-bar" hidden>
+                  <span class="pr-state" id="pr-state"></span>
+                  <span class="pr-title" id="pr-title"></span>
+                  <button class="link-button pr-open" id="pr-open" hidden data-i18n="prOpen">Open</button>
+                  <span class="pr-checks" id="pr-checks"></span>
+                  <button class="btn btn-quiet small" id="pr-create" hidden data-i18n="prCreate">Create PR</button>
+                </div>
+                <div class="changes-summary" id="changes-summary"></div>
+                <div class="diff-root" id="diff-root"></div>
+                <div class="git-commit" id="git-commit" hidden>
+                  <textarea id="git-message" rows="2" spellcheck="false" data-i18n-placeholder="commitMessagePlaceholder" placeholder="Commit message"></textarea>
+                  <div class="git-commit-actions">
+                    <span class="git-commit-note" id="git-commit-note"></span>
+                    <button class="btn btn-primary small" id="git-commit-button" data-i18n="commitAll">Commit all</button>
                   </div>
                 </div>
               </div>
-              <div class="meter" id="usage-meter" tabindex="0" role="button" aria-haspopup="dialog" aria-expanded="false" title="Token usage">
-                <span id="context-label">0%</span>
-                <div class="meter-track"><div class="meter-fill" id="context-fill"></div></div>
-                <span class="meter-sep"></span>
-                <span id="usage-label">0 tok</span>
+              <div class="changes-list" id="changes-list" hidden></div>
+              <div class="history-root" id="history-root" hidden>
+                <div class="checkpoint-list" id="checkpoint-list"></div>
+              </div>
+              <div class="artifact-list-pane" id="artifact-list-pane" hidden>
+                <div class="artifact-list" id="artifact-list"></div>
+              </div>
+              <div class="file-root" id="file-root" hidden></div>
+              <div class="terminal-root" id="terminal-root" hidden>
+                <pre class="terminal-output" id="terminal-output" tabindex="0"></pre>
+                <div class="terminal-input-row">
+                  <span class="terminal-prompt" id="terminal-prompt">&gt;</span>
+                  <input
+                    class="terminal-input"
+                    id="terminal-input"
+                    spellcheck="false"
+                    autocomplete="off"
+                    data-i18n-placeholder="terminalPlaceholder"
+                    placeholder="Run a command in the workspace…"
+                  />
+                  <button class="btn btn-quiet small" id="terminal-restart" data-i18n="terminalRestart">Restart</button>
+                </div>
+              </div>
+              <div class="artifact-root" id="artifact-root" hidden></div>
+              <div class="browser-root" id="browser-root" hidden>
+                <div class="browser-toolbar">
+                  <button class="icon-button small" id="browser-back" data-i18n-title="back">
+                    <svg class="icon" aria-hidden="true"><use href="#i-chevron-left"></use></svg>
+                  </button>
+                  <button class="icon-button small" id="browser-forward" data-i18n-title="forward">
+                    <svg class="icon" aria-hidden="true"><use href="#i-chevron-right"></use></svg>
+                  </button>
+                  <button class="icon-button small" id="browser-reload" data-i18n-title="reload">
+                    <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
+                  </button>
+                  <input class="browser-url" id="browser-url" spellcheck="false" placeholder="https://example.com" />
+                  <button class="btn btn-quiet small" id="browser-use" data-i18n="browserUsePage">Use page</button>
+                </div>
+                <div class="browser-page" id="browser-page" data-hint="The page renders in this area."></div>
               </div>
             </div>
-            <div class="usage-popover" id="usage-popover" hidden role="dialog" aria-label="Token usage">
-              <div class="usage-row">
-                <span data-i18n="usageContext">Context window</span>
-                <span class="usage-value" id="usage-context-value">—</span>
-              </div>
-              <div class="usage-track"><div class="usage-fill" id="usage-context-fill"></div></div>
-              <div class="usage-row">
-                <span data-i18n="usageInput">Input</span>
-                <span class="usage-value" id="usage-input-value">0</span>
-              </div>
-              <div class="usage-row">
-                <span data-i18n="usageCached">Cached</span>
-                <span class="usage-value" id="usage-cached-value">0</span>
-              </div>
-              <div class="usage-row">
-                <span data-i18n="usageOutput">Output</span>
-                <span class="usage-value" id="usage-output-value">0</span>
-              </div>
-              <div class="usage-row total">
-                <span data-i18n="usageTotal">Total this session</span>
-                <span class="usage-value" id="usage-total-value">0</span>
-              </div>
-              <button type="button" class="btn btn-quiet small usage-reset" id="usage-reset" data-i18n="usageReset">Reset counter</button>
-            </div>
-          </div>
-        </section>
-        </div>
-                <section class="workbench" id="workbench" hidden>
-          <div class="workbench-head">
-            <div class="workbench-tabs" id="workbench-tabs" role="tablist">
-              <button role="tab" data-pane="files" data-i18n="tabFiles">Files</button>
-              <button role="tab" data-pane="diff" class="active" data-i18n="paneDiff">Changes</button>
-              <button role="tab" data-pane="history" data-i18n="tabHistory">History</button>
-              <button role="tab" data-pane="artifact" data-i18n="tabArtifacts">Artifacts</button>
-              <button role="tab" data-pane="terminal" data-i18n="paneTerminal">Terminal</button>
-              <button role="tab" data-pane="browser" data-i18n="paneBrowser">Browser</button>
-            </div>
-            <div class="workbench-meta" id="workbench-meta"></div>
-            <div class="diff-scope" id="diff-scope" role="radiogroup" aria-label="Diff scope" hidden>
-              <button role="radio" data-scope="session" class="active" data-i18n="scopeSession">Session</button>
-              <button role="radio" data-scope="turn" data-i18n="scopeTurn">Last turn</button>
-            </div>
-            <button class="icon-button small" id="close-workbench" title="Close pane">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
-            </button>
-          </div>
-          <div class="comments-bar" id="comments-bar" hidden>
-            <span class="comments-count" id="comments-count"></span>
-            <button class="btn btn-quiet small" id="comments-clear" data-i18n="commentClear">Clear</button>
-            <button class="btn btn-primary small" id="comments-send" data-i18n="commentSend">Send to agent</button>
-          </div>
-          <div class="workbench-body">
-            <div class="pane-tree file-tree" id="pane-tree" hidden></div>
-            <aside class="diff-filelist" id="diff-filelist" hidden></aside>
-            <div class="diff-pane" id="diff-pane">
-            <div class="git-bar" id="git-bar" hidden>
-              <button class="git-branch" id="git-branch" title="Copy branch name">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="6" r="2.2" /><circle cx="7" cy="18" r="2.2" /><circle cx="17" cy="8" r="2.2" /><path d="M7 8.2v7.6M17 10.2c0 3-2.4 4-5 4.4-2.2.3-4 1-4 3.4" /></svg>
-                <span id="git-branch-name">—</span>
-              </button>
-              <span class="git-sync" id="git-sync"></span>
-            </div>
-            <div class="pr-bar" id="pr-bar" hidden>
-              <span class="pr-state" id="pr-state"></span>
-              <span class="pr-title" id="pr-title"></span>
-              <button class="link-button pr-open" id="pr-open" hidden data-i18n="prOpen">Open</button>
-              <span class="pr-checks" id="pr-checks"></span>
-              <button class="btn btn-quiet small" id="pr-create" hidden data-i18n="prCreate">Create PR</button>
-            </div>
-            <div class="changes-summary" id="changes-summary"></div>
-            <div class="diff-root" id="diff-root"></div>
-            <div class="git-commit" id="git-commit" hidden>
-              <textarea id="git-message" rows="2" spellcheck="false" placeholder="Commit message"></textarea>
-              <div class="git-commit-actions">
-                <span class="git-commit-note" id="git-commit-note"></span>
-                <button class="btn btn-primary small" id="git-commit-button" data-i18n="commitAll">Commit all</button>
-              </div>
-            </div>
-            </div>
-            <div class="changes-list" id="changes-list" hidden></div>
-            <div class="history-root" id="history-root" hidden>
-              <div class="checkpoint-list" id="checkpoint-list"></div>
-            </div>
-            <div class="artifact-list-pane" id="artifact-list-pane" hidden>
-              <div class="artifact-list" id="artifact-list"></div>
-            </div>
-            <div class="file-root" id="file-root" hidden></div>
-            <div class="terminal-root" id="terminal-root" hidden>
-              <pre class="terminal-output" id="terminal-output" tabindex="0"></pre>
-              <div class="terminal-input-row">
-                <span class="terminal-prompt" id="terminal-prompt">&gt;</span>
-                <input
-                  class="terminal-input"
-                  id="terminal-input"
-                  spellcheck="false"
-                  autocomplete="off"
-                  placeholder="Run a command in the workspace…"
-                />
-                <button class="btn btn-quiet small" id="terminal-restart" data-i18n="terminalRestart">Restart</button>
-              </div>
-            </div>
-            <div class="artifact-root" id="artifact-root" hidden></div>
-            <div class="browser-root" id="browser-root" hidden>
-              <div class="browser-toolbar">
-                <button class="icon-button small" id="browser-back" title="Back">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6" /></svg>
-                </button>
-                <button class="icon-button small" id="browser-forward" title="Forward">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6 6 6-6 6" /></svg>
-                </button>
-                <button class="icon-button small" id="browser-reload" title="Reload">
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6" /><path d="M4.5 15a8 8 0 1 0 1-8.5L4 8" /></svg>
-                </button>
-                <input class="browser-url" id="browser-url" spellcheck="false" placeholder="https://example.com" />
-                <button class="btn btn-quiet small" id="browser-use" data-i18n="browserUsePage">Use page</button>
-              </div>
-              <div class="browser-page" id="browser-page" data-hint="The page renders in this area."></div>
-            </div>
-          </div>
-        </section>
+          </section>
         </div>
       </div>
     </div>
@@ -390,20 +384,19 @@
 
     <!-- Settings is a full-window page, not a modal: a rail of groups on the
          left, one scrolling pane on the right, and every change applies
-         immediately. The old Save/Cancel footer made the page feel like a
-         form and hid whether a value had actually taken effect. -->
+         immediately. -->
     <dialog class="settings-dialog" id="settings-dialog" hidden>
       <div class="settings-form" id="settings-form">
         <aside class="settings-rail">
           <div class="settings-rail-head">
-            <button type="button" class="icon-button small" id="settings-back" title="Back">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6" /></svg>
+            <button type="button" class="icon-button small" id="settings-back" data-i18n-title="back">
+              <svg class="icon" aria-hidden="true"><use href="#i-chevron-left"></use></svg>
             </button>
             <h2 data-i18n="settings">Settings</h2>
           </div>
           <div class="settings-search">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg>
-            <input id="settings-search" type="search" spellcheck="false" autocomplete="off" placeholder="Search settings" />
+            <svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+            <input id="settings-search" type="search" spellcheck="false" autocomplete="off" data-i18n-placeholder="searchSettings" placeholder="Search settings" />
           </div>
           <nav class="settings-nav" id="settings-nav" role="tablist" aria-orientation="vertical"></nav>
           <div class="settings-rail-foot">
@@ -417,8 +410,7 @@
           </div>
         </aside>
         <div class="settings-main">
-          <div class="settings-panes" id="settings-panes">
-          </div>
+          <div class="settings-panes" id="settings-panes"></div>
         </div>
       </div>
     </dialog>
@@ -432,8 +424,8 @@
     <dialog class="shortcuts-dialog" id="shortcuts-dialog" hidden>
       <header class="dialog-head">
         <h2 data-i18n="shortcuts">Keyboard shortcuts</h2>
-        <button type="button" class="icon-button" id="shortcuts-close" title="Close">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+        <button type="button" class="icon-button" id="shortcuts-close" data-i18n-title="close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
         </button>
       </header>
       <div class="shortcut-grid" id="shortcut-grid"></div>
