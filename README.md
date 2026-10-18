@@ -74,7 +74,11 @@ Prometheus.exe D:\code\my-project
 - **Audit log.** Every permission decision is appended to
   `~/.prometheus/audit.log`.
 - **Custom commands.** Markdown files in `.prometheus/commands/` become slash
-  commands in the composer (see `.prometheus/commands/review.md`).
+  commands in the composer (see `.prometheus/commands/review.md`). Prompts
+  advertised by MCP servers join the same list.
+- **Rules.** Markdown files in `~/.prometheus/rules/` or `.prometheus/rules/`.
+  A rule with `paths:` globs (e.g. `src/web/**`) is only injected once the
+  conversation touches a matching file; an unscoped rule always applies.
 - **MCP servers.** Stdio and Streamable HTTP servers listed in
   `~/.prometheus/mcp.json` (user scope) or `<workspace>/.prometheus/mcp.json`
   (project scope, overrides by name) contribute their tools to the agent:
@@ -105,6 +109,23 @@ The runtime is six layers, each with one job:
 `src/agent.ts` wires those together with the conversation, permissions, hooks,
 sub-agents, and the terminal UI. `desktop/host.js` drives the same `Agent`
 through the desktop event protocol.
+
+## Headless use
+
+For scripts and CI, `--output-format` swaps the terminal renderer for one that
+emits objects. `stream-json` prints one JSON line per event as it happens, so a
+consumer can render progress without waiting for the turn to end.
+
+```bash
+prometheus --output-format json "summarise the changes on this branch" | jq -r .text
+prometheus --output-format stream-json --mode auto "run the tests and fix what fails"
+prometheus --max-budget-usd 0.50 "refactor src/context.ts"
+```
+
+`--output-schema schema.json` checks the final answer against a JSON Schema and
+reports `schemaValid` rather than failing the run, so a caller can retry with a
+better prompt. In headless mode a tool that would prompt is refused with a
+readable reason instead of blocking on a terminal that is not there.
 
 ## Requirements
 
@@ -192,6 +213,9 @@ prometheus --mode auto "fix the failing test in tests/core.test.ts"
 | `--key <key>` | API key |
 | `--mode <ask\|auto\|plan>` | Permission mode |
 | `-r, --resume <id>` | Resume a saved session |
+| `--output-format <fmt>` | `text` (default), `json`, or `stream-json` |
+| `--output-schema <file>` | Check the final answer against a JSON Schema |
+| `--max-budget-usd <n>` | Stop between turns once the run has spent this much |
 | `--max-tokens <n>` | Per-response cap (default 16000) |
 | `--context-window <n>` | Compaction threshold (default 1,000,000) |
 | `--max-turns <n>` | Tool-loop cap per message (default 60) |
@@ -217,12 +241,19 @@ turn.
 | `bash` | Shell commands with timeout, output cap, and the sandbox policy |
 | `todo_write` | Maintain the visible task plan |
 | `remember` | Persist a durable fact |
-| `delegate` | Run one sub-agent, or up to four in parallel with `prompts` |
+| `delegate` | Run one sub-agent, up to four in parallel with `prompts`, or with `background: true` |
+| `mcp_read_resource` | Read a resource an MCP server advertises (present only when a server has one) |
 
 All file tools resolve paths and refuse anything outside the workspace (plus
 `allowedDirs` from config). Shell commands are classified by `src/sandbox.ts`:
 destructive commands are denied, risky ones raise a confirmation, and the rest
 run. Permission choices can be saved as persistent rules.
+
+Two rules sit above every saved approval. **Protected paths** — `.git`,
+`.vscode`, `.idea`, `.prometheus`, `.mcp.json`, and shell profiles — ask in every
+mode, including `auto`, because editing them changes how the agent itself runs.
+**Critical commands** — deleting the workspace root, the home directory, or a
+drive root — are refused outright; no saved approval can authorise them.
 
 ## Design notes
 

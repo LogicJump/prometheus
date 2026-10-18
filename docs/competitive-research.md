@@ -242,3 +242,29 @@ MCP → skills/commands → hooks → worktree → 多会话并行。
 新增：diff 行内评论并批量发给 agent、命令面板（Ctrl+K）、会话置顶 / 重命名 / 归档 / 删除 / 分叉、宿主进程崩溃后原地重启、自动批准规则与上下文窗口设置、上下文长度跟随端点、滚动位置保持与「回到最新」、窄窗口下工作台纵向堆叠、可复现的离线打包配置。
 
 **仍缺**：跨平台安装包签名、内置 CI 状态条（现由 Git 面板与外部 CI 承担）、多工作区同窗（现为多窗口）。
+
+### 第三轮（2026-10-18 深夜）：行为层
+
+重新调研 Claude Code v2.1.302、Codex、Cursor 3 后，结论是界面已不是差距，行为才是。
+详见 [competitive-round2-plan.md](competitive-round2-plan.md)。
+
+已补：
+
+| 能力 | 说明 |
+|---|---|
+| 受保护路径 | `.git` / `.vscode` / `.mcp.json` / shell 配置在任何模式（含 auto）都要单独确认 |
+| 关键路径熔断 | 删除工作区根、家目录、盘根绕过所有 allow 规则，直接拒绝 |
+| Hooks 语义 | `UserPromptSubmit` 真正派发且可改写或否决输入；`PreToolUse` 可用 stdout JSON 改写入参；新增压缩与子代理事件 |
+| 规则目录 | `rules/*.md` 带 `paths:` glob，触碰匹配文件时才注入，并立刻刷新系统提示词 |
+| 指令分层 | 从工作区根逐层加载到 cwd，支持 `@path` 导入 |
+| 压缩后重注入 | 未完成的计划、正在处理的文件、仍然生效的规则 |
+| MCP | resources / prompts / 读取；prompt 变成斜杠命令 |
+| 无头输出 | `--output-format json\|stream-json`、`--output-schema`、`--max-budget-usd` |
+| 成本 | 本地价格表（最长前缀匹配），缓存命中单独计价；用量页显示金额 |
+| 会话状态 | ready / working / needs-input / error，侧栏圆点，写入 meta |
+| 后台子代理 | `delegate` 支持 `background: true`，完成后作为独立卡片回到转录 |
+
+**与三家相比仍缺**：OS 级沙箱（Seatbelt / bubblewrap / MXC）、云执行与远程控制、
+插件市场、LSP 诊断、Tab 补全与 Cmd-K 行内编辑、多仓库环境。
+其中 **统一「代码 + 对话一起回退到第 N 轮」** 三家都没有完整实现（Cursor 只还原文件，
+Codex 只还原对话），Prometheus 的 `rewindTo` 是明确差异点。
