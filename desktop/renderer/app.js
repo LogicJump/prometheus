@@ -1902,6 +1902,7 @@ function openSessionMenu(event, session) {
   const actions = [
     [session.pinned ? t.sessionUnpin : t.sessionPin, () => sendSessionFlags(session, { pinned: !session.pinned })],
     [t.sessionRename, () => renameSession(session)],
+    [t.sessionFork, () => api.send({ cmd: "forkSession", id: session.id })],
     [session.archived ? t.sessionUnarchive : t.sessionArchive, () => {
       sendSessionFlags(session, { archived: !session.archived });
     }],
@@ -2116,6 +2117,7 @@ function paletteEntries() {
     { label: t.toggleSidebar, run: toggleSidebar },
     { label: t.newWindow, run: () => api.newWindow() },
     { label: t.exportSession, run: () => api.send({ cmd: "exportSession" }) },
+    { label: t.sessionFork, run: () => api.send({ cmd: "forkSession" }) },
     { label: t.paneDiff, run: () => openWorkbench("diff") },
     { label: t.tabFiles, run: () => selectSidebarTab("files") },
     { label: t.tabChanges, run: () => selectSidebarTab("changes") },

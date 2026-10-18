@@ -655,6 +655,26 @@ async function handle(cmd) {
       send({ type: "session_loaded", messages: publicMessages(session.messages), cwd });
       return;
     }
+    case "forkSession": {
+      // Branch the conversation into a new session: the original stays as it
+      // was, so trying a different direction does not overwrite history.
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      const source = loadSession(cmd.id ?? sessionId);
+      if (!source) return send({ type: "notice", level: "error", text: "session not found" });
+      if (source.cwd && existsSync(source.cwd) && source.cwd !== cwd) {
+        cwd = source.cwd;
+        process.chdir(cwd);
+        disposeTerminal();
+      }
+      sessionId = newSessionId();
+      sessionTitle = source.title ? `${source.title} (fork)` : "";
+      sessionCreatedAt = new Date().toISOString();
+      createAgent(source.messages);
+      persist();
+      send({ type: "session_loaded", messages: publicMessages(source.messages), cwd });
+      send({ type: "notice", level: "info", text: `forked into ${sessionId}` });
+      return;
+    }
     case "listSessions":
       send({ type: "sessions", sessions: listSessions(false, Boolean(cmd.includeArchived)).slice(0, 80) });
       return;
