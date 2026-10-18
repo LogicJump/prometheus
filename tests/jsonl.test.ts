@@ -128,3 +128,23 @@ test("flags survive an append and listing still sorts pinned first", () => {
     deleteSessionFile(id);
   }
 });
+
+test("sessions in the same folder are one project even when stored with different separators", () => {
+  const a = newSessionId();
+  const b = newSessionId();
+  const folder = `C:/tmp/project-${Date.now()}`;
+  const slash = "/";
+  const backslash = String.fromCharCode(92);
+  try {
+    saveSession({ ...baseRecord(a, [{ role: "user", content: "one" }]), cwd: folder });
+    saveSession({ ...baseRecord(b, [{ role: "user", content: "two" }]), cwd: folder.split(slash).join(backslash) });
+    const listed = listSessions(false, true).filter((session) => session.cwd.split(backslash).join(slash) === folder);
+    assert.equal(listed.length, 2);
+    // The renderer groups on a normalized key; both spellings must collapse.
+    const keys = new Set(listed.map((session) => session.cwd.split(backslash).join(slash).toLowerCase()));
+    assert.equal(keys.size, 1);
+  } finally {
+    deleteSessionFile(a);
+    deleteSessionFile(b);
+  }
+});

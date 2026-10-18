@@ -252,11 +252,35 @@
                 <div class="model-menu" id="model-menu" role="listbox" hidden></div>
               </div>
             </div>
-            <div class="meter">
+            <div class="meter" id="usage-meter" tabindex="0" role="button" aria-haspopup="dialog" aria-expanded="false" title="Token usage">
               <span id="context-label">0%</span>
               <div class="meter-track"><div class="meter-fill" id="context-fill"></div></div>
               <span class="meter-sep"></span>
               <span id="usage-label">0 tok</span>
+            </div>
+            <div class="usage-popover" id="usage-popover" hidden role="dialog" aria-label="Token usage">
+              <div class="usage-row">
+                <span data-i18n="usageContext">Context window</span>
+                <span class="usage-value" id="usage-context-value">—</span>
+              </div>
+              <div class="usage-track"><div class="usage-fill" id="usage-context-fill"></div></div>
+              <div class="usage-row">
+                <span data-i18n="usageInput">Input</span>
+                <span class="usage-value" id="usage-input-value">0</span>
+              </div>
+              <div class="usage-row">
+                <span data-i18n="usageCached">Cached</span>
+                <span class="usage-value" id="usage-cached-value">0</span>
+              </div>
+              <div class="usage-row">
+                <span data-i18n="usageOutput">Output</span>
+                <span class="usage-value" id="usage-output-value">0</span>
+              </div>
+              <div class="usage-row total">
+                <span data-i18n="usageTotal">Total this session</span>
+                <span class="usage-value" id="usage-total-value">0</span>
+              </div>
+              <button type="button" class="btn btn-quiet small usage-reset" id="usage-reset" data-i18n="usageReset">Reset counter</button>
             </div>
           </footer>
         </section>

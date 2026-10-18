@@ -76,6 +76,11 @@ const state = {
   tree: [],
   pane: "diff",
   cwd: "",
+  context: { tokens: 0, percent: 0 },
+  usage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+  /** Explicit project fold states; anything not listed follows the active-project default. */
+  expandedProjects: new Set(JSON.parse(localStorage.getItem("prometheus.expandedProjects") || "[]")),
+  collapsedProjects: new Set(JSON.parse(localStorage.getItem("prometheus.collapsedProjects") || "[]")),
   workbenchOpen: savedWorkbench === "1",
   pane: ["files", "diff", "history", "artifact", "terminal", "browser", "file"].includes(savedPane) ? savedPane : "diff",
   git: null,
@@ -637,18 +642,82 @@ function summariseLastAssistant() {
   return text.replace(/\s+/g, " ").slice(0, 160);
 }
 
+function formatTokens(n) {
+  const value = Number(n) || 0;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
+}
+
+/**
+ * The composer meter is the session's token accounting: how full the context
+ * window is, and what the conversation has spent so far. Clicking it opens the
+ * breakdown instead of hiding the numbers in a tooltip.
+ */
 function updateMeter(context, usage) {
   if (context) {
-    const percent = Math.min(100, Math.round(context.percent));
+    state.context = { tokens: context.tokens ?? 0, percent: Math.min(100, Math.round(context.percent ?? 0)) };
+    const percent = state.context.percent;
     contextLabel.textContent = `${percent}%`;
     contextFill.style.width = `${percent}%`;
     contextFill.style.background = percent > 85 ? "var(--danger)" : percent > 60 ? "var(--warn)" : "var(--accent)";
   }
   if (usage) {
-    const total = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
-    usageLabel.textContent = total >= 1000 ? `${(total / 1000).toFixed(1)}k ${t.tokens}` : `${total} ${t.tokens}`;
+    state.usage = {
+      inputTokens: usage.inputTokens ?? 0,
+      outputTokens: usage.outputTokens ?? 0,
+      cachedTokens: usage.cachedTokens ?? 0,
+    };
+    const total = state.usage.inputTokens + state.usage.outputTokens;
+    usageLabel.textContent = `${formatTokens(total)} ${t.tokens}`;
   }
+  renderUsage();
 }
+
+/** Fill the usage popover from state. Harmless while it is closed. */
+function renderUsage() {
+  const context = state.context ?? { tokens: 0, percent: 0 };
+  const usage = state.usage ?? { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  $("usage-context-value").textContent = `${formatTokens(context.tokens)} · ${context.percent}%`;
+  $("usage-context-fill").style.width = `${context.percent}%`;
+  $("usage-input-value").textContent = formatTokens(usage.inputTokens);
+  $("usage-cached-value").textContent = formatTokens(usage.cachedTokens);
+  $("usage-output-value").textContent = formatTokens(usage.outputTokens);
+  $("usage-total-value").textContent = formatTokens(usage.inputTokens + usage.outputTokens);
+}
+
+function setUsagePopover(open) {
+  const popover = $("usage-popover");
+  if (!popover) return;
+  popover.hidden = !open;
+  $("usage-meter").setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) renderUsage();
+}
+
+$("usage-meter").addEventListener("click", (event) => {
+  event.stopPropagation();
+  setUsagePopover($("usage-popover").hidden);
+});
+
+$("usage-meter").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    setUsagePopover($("usage-popover").hidden);
+  }
+});
+
+$("usage-reset").addEventListener("click", () => {
+  // The host owns the counters; a fresh baseline keeps the display honest
+  // without pretending the spend never happened.
+  state.usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  usageLabel.textContent = `0 ${t.tokens}`;
+  renderUsage();
+  setUsagePopover(false);
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#usage-popover") && !event.target.closest("#usage-meter")) setUsagePopover(false);
+});
 
 function setMode(mode) {
   state.mode = mode;
@@ -756,6 +825,7 @@ function handleEvent(message) {
 
     case "state":
       state.sessionId = message.sessionId;
+      if (message.cwd) state.cwd = message.cwd;
       state.locale = message.locale || state.locale;
       applyLocale(state.locale);
       setMode(message.mode);
@@ -947,6 +1017,10 @@ function handleEvent(message) {
       applyLocale(message.locale);
       break;
 
+    case "usage":
+      updateMeter(state.context, message.usage);
+      break;
+
     case "run_start":
       setBusy(true);
       endThinking();
@@ -1087,6 +1161,7 @@ function handleEvent(message) {
         renderTopbarLocation();
         workspacePath.title = message.cwd;
         api.send({ cmd: "getTree", path: "." });
+        api.send({ cmd: "listSessions", includeArchived: state.showArchived });
       }
       scrollToBottom(true);
       break;
@@ -1845,6 +1920,48 @@ function relativeDate(iso) {
   return new Date(iso).toLocaleDateString(state.locale === "zh" ? "zh-CN" : "en-US");
 }
 
+/** One canonical spelling per workspace, for grouping only. */
+function normalizeCwd(cwd) {
+  return String(cwd || "").replace(/[\\/]+/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * Folder names for project headers. Two different folders can share a leaf
+ * name; those get their parent as a suffix so they stay distinguishable.
+ */
+function projectLabels(keys, displayPaths) {
+  const labels = new Map();
+  const used = new Map();
+  const partsFor = (key) => String(displayPaths?.get(key) || key).split(/[\\/]/).filter(Boolean);
+  // Keys are lowercased for comparison; labels keep the original spelling.
+  for (const key of keys) {
+    const parts = partsFor(key);
+    const label = (parts.length > 0 ? parts[parts.length - 1] : "").toLowerCase();
+    used.set(label, (used.get(label) ?? 0) + 1);
+  }
+  for (const key of keys) {
+    const parts = partsFor(key);
+    const label = parts.length > 0 ? parts[parts.length - 1] : t.noProject;
+    if ((used.get(label.toLowerCase()) ?? 0) > 1 && parts.length > 1) {
+      labels.set(key, `${parts[parts.length - 2]}/${label}`);
+    } else {
+      labels.set(key, label);
+    }
+  }
+  return labels;
+}
+
+function projectLabel(cwd) {
+  const parts = String(cwd || "").split(/[\\/]/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : t.noProject;
+}
+
+/**
+ * Sessions are grouped by workspace, the way every coding agent organizes
+ * them: one collapsible project header, its conversations underneath, and the
+ * active project expanded. A flat list mixed folders together and made it
+ * impossible to tell which project a conversation belonged to.
+ */
 function renderSessions(sessions) {
   state.sessions = sessions || [];
   sessionList.innerHTML = "";
@@ -1864,38 +1981,91 @@ function renderSessions(sessions) {
     sessionList.appendChild(empty);
     return;
   }
-  // Grouping by project keeps sessions from different folders distinguishable;
-  // with a single project the headers would be noise.
-  const projects = new Set(visible.map((session) => session.cwd));
-  const grouped = projects.size > 1;
-  let currentProject = "";
+
+  // Group by workspace, keeping the recency order of first appearance so the
+  // project you just worked in stays on top. Older sessions stored the same
+  // folder with different separators (G:\x vs G:/x), so keys are normalized.
+  const groups = new Map();
+  const displayPath = new Map();
   for (const session of visible) {
-    if (grouped && session.cwd !== currentProject) {
-      currentProject = session.cwd;
-      const heading = document.createElement("div");
-      heading.className = "session-group";
-      heading.textContent = currentProject.split(/[\\/]/).filter(Boolean).pop() || currentProject;
-      heading.title = currentProject;
-      sessionList.appendChild(heading);
+    const key = normalizeCwd(session.cwd);
+    if (!groups.has(key)) {
+      groups.set(key, []);
+      displayPath.set(key, session.cwd || "");
     }
-    const button = document.createElement("button");
-    button.className = `session-item${session.id === state.sessionId ? " active" : ""}${session.pinned ? " pinned" : ""}`;
-    const title = session.title || (session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages);
-    button.innerHTML =
-      (session.pinned ? `<span class="session-pin" title="${escapeHtml(t.sessionPinned)}">◆</span>` : "") +
-      `<div class="session-title">${escapeHtml(title)}</div>` +
-      `<div class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</div>`;
-    button.title = `${title}\n${session.id}\n${session.cwd}`;
-    button.addEventListener("click", () => {
-      api.send({ cmd: "loadSession", id: session.id });
-      // On a narrow window the drawer covers the conversation once opened.
-      if (window.matchMedia("(max-width: 860px)").matches) document.querySelector(".shell").classList.add("collapsed");
+    groups.get(key).push(session);
+  }
+  const activeProject = normalizeCwd(state.cwd);
+  // A search result should reveal its projects rather than hide them.
+  const expandAll = Boolean(query);
+
+  const labels = projectLabels([...groups.keys()], displayPath);
+  for (const [cwd, items] of groups) {
+    // Active project opens by default; others stay folded until the user opens
+    // them, so a busy project cannot push the rest of the list out of view.
+    const collapsed =
+      !expandAll &&
+      (state.collapsedProjects.has(cwd) || (cwd !== activeProject && !state.expandedProjects.has(cwd)));
+    const head = document.createElement("button");
+    head.className = `session-group${cwd === activeProject ? " active" : ""}`;
+    head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    const count = document.createElement("span");
+    count.className = "session-group-count";
+    count.textContent = String(items.length);
+    const name = document.createElement("span");
+    name.className = "session-group-name";
+    name.textContent = labels.get(cwd) ?? projectLabel(displayPath.get(cwd) || cwd);
+    name.title = displayPath.get(cwd) || cwd || t.noProject;
+    const twisty = document.createElement("span");
+    twisty.className = "session-group-twisty";
+    twisty.textContent = collapsed ? "▸" : "▾";
+    // New chat inside this project, without leaving the current conversation.
+    const add = document.createElement("span");
+    add.className = "session-group-add";
+    add.title = t.newSessionIn(projectLabel(cwd));
+    add.textContent = "+";
+    add.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const target = displayPath.get(cwd) || cwd;
+      if (target && target !== state.cwd) api.send({ cmd: "setCwd", cwd: target });
+      else api.send({ cmd: "newSession" });
     });
-    button.addEventListener("contextmenu", (event) => {
-      event.preventDefault();
-      openSessionMenu(event, session);
+    head.append(twisty, name, count, add);
+    head.addEventListener("click", () => {
+      if (collapsed) {
+        state.expandedProjects.add(cwd);
+        state.collapsedProjects.delete(cwd);
+      } else {
+        state.expandedProjects.delete(cwd);
+        state.collapsedProjects.add(cwd);
+      }
+      localStorage.setItem("prometheus.expandedProjects", JSON.stringify([...state.expandedProjects]));
+      localStorage.setItem("prometheus.collapsedProjects", JSON.stringify([...state.collapsedProjects]));
+      renderSessions(state.sessions);
     });
-    sessionList.appendChild(button);
+    sessionList.appendChild(head);
+    if (collapsed) continue;
+
+    for (const session of items) {
+      const button = document.createElement("button");
+      button.className = `session-item${session.id === state.sessionId ? " active" : ""}${session.pinned ? " pinned" : ""}`;
+      const title = session.title || (session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages);
+      button.innerHTML =
+        (session.pinned ? `<span class="session-pin" title="${escapeHtml(t.sessionPinned)}">◆</span>` : "") +
+        `<div class="session-title">${escapeHtml(title)}</div>` +
+        `<div class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</div>`;
+      button.title = `${title}\n${session.id}\n${session.cwd}`;
+      button.addEventListener("click", () => {
+        api.send({ cmd: "loadSession", id: session.id });
+        // On a narrow window the drawer covers the conversation once opened.
+        if (window.matchMedia("(max-width: 860px)").matches) document.querySelector(".shell").classList.add("collapsed");
+      });
+      button.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        openSessionMenu(event, session);
+      });
+      sessionList.appendChild(button);
+    }
   }
 }
 
@@ -2459,7 +2629,7 @@ $("topbar-sidebar-toggle").addEventListener("click", toggleSidebar);
 
 function renderTopbarLocation() {
   const cwd = state.cwd ?? "";
-  const parts = cwd.split(/[/]/).filter(Boolean);
+  const parts = cwd.split(/[\\/]/).filter(Boolean);
   $("topbar-cwd-name").textContent = parts.length > 0 ? parts[parts.length - 1] : t.appName;
   $("topbar-cwd").title = cwd || t.appName;
   const branch = state.git?.available ? state.git.branch : "";

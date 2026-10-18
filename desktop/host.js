@@ -45,7 +45,17 @@ let sessionId = newSessionId();
 let sessionCreatedAt = new Date().toISOString();
 /** Custom title for the current session, if the user set one. */
 let sessionTitle = "";
-let cwd = process.cwd();
+/** Canonical workspace spelling: one project must not appear twice. */
+function canonicalCwd(path) {
+  try {
+    const resolved = resolve(path);
+    return process.platform === "win32" ? resolved.replace(/[\\]+/g, "/") : resolved;
+  } catch {
+    return path;
+  }
+}
+
+let cwd = canonicalCwd(process.cwd());
 let pendingPermissions = new Map();
 let permissionSeq = 0;
 let running = false;
@@ -341,6 +351,11 @@ function createAgent(messages = []) {
   // Compaction rewrote the history; persist the new generation immediately so
   // an interrupted turn cannot leave a stale transcript on disk.
   agent.onCompacted = () => persist();
+  // Stream token accounting to the window as the turn runs, so the meter is
+  // live instead of jumping only when the turn ends.
+  agent.onQueryEvent = (event) => {
+    if (event.type === "usage") send({ type: "usage", usage: event.usage, context: agent.contextUsage() });
+  };
   resetChanges();
   sessionCreatedAt = new Date().toISOString();
   ui.setModelName(config.model);
@@ -467,7 +482,7 @@ async function handle(cmd) {
   switch (cmd.cmd) {
     case "init": {
       if (cmd.cwd && existsSync(cmd.cwd)) {
-        cwd = cmd.cwd;
+        cwd = canonicalCwd(cmd.cwd);
         process.chdir(cwd);
       }
   if (isLocale(cmd.locale)) locale = cmd.locale;
@@ -670,7 +685,7 @@ async function handle(cmd) {
         return;
       }
       if (session.cwd && existsSync(session.cwd) && session.cwd !== cwd) {
-        cwd = session.cwd;
+        cwd = canonicalCwd(session.cwd);
         process.chdir(cwd);
         disposeTerminal();
         try {
@@ -693,7 +708,7 @@ async function handle(cmd) {
       const source = loadSession(cmd.id ?? sessionId);
       if (!source) return send({ type: "notice", level: "error", text: "session not found" });
       if (source.cwd && existsSync(source.cwd) && source.cwd !== cwd) {
-        cwd = source.cwd;
+        cwd = canonicalCwd(source.cwd);
         process.chdir(cwd);
         disposeTerminal();
       }
@@ -735,7 +750,7 @@ async function handle(cmd) {
     case "setCwd": {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
       if (cmd.cwd && existsSync(cmd.cwd)) {
-        cwd = cmd.cwd;
+        cwd = canonicalCwd(cmd.cwd);
         process.chdir(cwd);
         disposeTerminal();
         sessionId = newSessionId();

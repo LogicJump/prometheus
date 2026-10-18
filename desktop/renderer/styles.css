@@ -820,14 +820,88 @@ svg {
   opacity: 0.5;
 }
 
+/* Project header: foldable, one per workspace, with its conversation count
+   and a quick "new chat in this project" affordance. */
 .session-group {
-  padding: 10px 9px 3px;
-  font-size: 10.5px;
-  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 6px;
+  padding: 5px 7px;
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.session-group:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.session-group.active {
+  color: var(--text);
+}
+
+.session-group-twisty {
+  width: 10px;
+  flex: 0 0 10px;
+  font-size: 9px;
   color: var(--text-faint);
+}
+
+.session-group-name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-group.active .session-group-name::after {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-left: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+}
+
+.session-group-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.session-group-add {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  display: none;
+  place-items: center;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-secondary);
+}
+
+.session-group:hover .session-group-add,
+.session-group:focus-visible .session-group-add {
+  display: grid;
+}
+
+.session-group-add:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+/* Conversations sit visually inside their project. */
+.session-group + .session-item {
+  margin-left: 6px;
+  width: calc(100% - 6px);
 }
 
 .session-item:hover {
@@ -2643,6 +2717,7 @@ mark.find-hit.current {
   justify-content: space-between;
   gap: 14px;
   flex-wrap: wrap;
+  position: relative;
 }
 
 .composer-footer .meter {
@@ -2830,6 +2905,85 @@ mark.find-hit.current {
   color: var(--text-faint);
   font-family: var(--mono);
   white-space: nowrap;
+}
+
+.meter {
+  position: relative;
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 2px 4px;
+  margin-right: -4px;
+}
+
+.meter:hover,
+.meter:focus-visible {
+  background: var(--surface);
+}
+
+.usage-popover {
+  /* Anchored to the footer's right edge, above the control row. */
+  position: absolute;
+  right: 0;
+  top: -6px;
+  transform: translateY(-100%);
+  z-index: 30;
+  width: 240px;
+  padding: 12px 14px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+
+.usage-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+}
+
+.usage-row.total {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+}
+
+.usage-value {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.usage-track {
+  height: 3px;
+  margin: 2px 0 8px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.usage-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 240ms ease;
+}
+
+.usage-reset {
+  width: 100%;
+  margin-top: 8px;
+  border: none;
+  color: var(--text-faint);
+}
+
+.usage-reset:hover {
+  color: var(--danger);
+  background: transparent;
 }
 
 .meter-track {
