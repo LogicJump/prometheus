@@ -253,6 +253,11 @@ export const dictionaries = {
     sessionPin: "Pin",
     sessionUnpin: "Unpin",
     sessionPinned: "Pinned",
+    backgroundReport: "Background task",
+    backgroundDone: "finished",
+    backgroundFailed: "failed",
+    sessionStatusLabel: (status) =>
+      status === "working" ? "Working" : status === "needs-input" ? "Needs input" : status === "error" ? "Failed" : "Ready",
     sessionRename: "Rename",
     sessionRenamePrompt: "Session name (leave empty to use the first message)",
     sessionArchive: "Archive",
@@ -533,6 +538,11 @@ export const dictionaries = {
     sessionPin: "置顶",
     sessionUnpin: "取消置顶",
     sessionPinned: "已置顶",
+    backgroundReport: "后台任务",
+    backgroundDone: "已完成",
+    backgroundFailed: "失败",
+    sessionStatusLabel: (status) =>
+      status === "working" ? "正在工作" : status === "needs-input" ? "等待输入" : status === "error" ? "出错" : "就绪",
     sessionRename: "重命名",
     sessionRenamePrompt: "会话名称（留空则恢复默认）",
     sessionArchive: "归档",

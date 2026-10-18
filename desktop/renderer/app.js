@@ -1335,6 +1335,33 @@ function handleEvent(message) {
       break;
     }
 
+    case "background_report": {
+      // Rendered as a distinct card so it is clear this arrived on its own,
+      // not in reply to the message above it.
+      const ok = message.ok !== false;
+      addNode(
+        `<div class="background-report${ok ? "" : " failed"}">` +
+          `<div class="background-head">${icon("corner-up-right")}<span>${escapeHtml(t.backgroundReport)}</span>` +
+          `<span class="background-state">${escapeHtml(ok ? t.backgroundDone : t.backgroundFailed)}</span></div>` +
+          `<div class="background-prompt">${escapeHtml(message.prompt ?? "")}</div>` +
+          `<div class="markdown">${md(message.report ?? "")}</div>` +
+        `</div>`,
+      );
+      scrollToBottom();
+      break;
+    }
+
+    case "session_status":
+      // The sidebar row for this conversation reflects what the task is doing.
+      {
+        const current = state.sessions.find((session) => session.id === message.sessionId);
+        if (current) {
+          current.status = message.status;
+          renderSessions(state.sessions);
+        }
+      }
+      break;
+
     case "sessions":
       renderSessions(message.sessions);
       break;
@@ -2226,7 +2253,9 @@ function renderSessions(sessions) {
       const title = session.title || (session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages);
       // The timestamp is reference, not navigation: it appears on hover and
       // gives the row back its second line of height.
+      const status = session.status && session.status !== "ready" ? session.status : "";
       button.innerHTML =
+        (status ? `<span class="session-state ${status}" title="${escapeHtml(t.sessionStatusLabel(status))}"></span>` : "") +
         (session.pinned ? `<span class="session-pin" title="${escapeHtml(t.sessionPinned)}">${icon("pin")}</span>` : "") +
         `<div class="session-title">${escapeHtml(title)}</div>` +
         `<span class="session-meta">${escapeHtml(relativeDate(session.updatedAt))}</span>`;

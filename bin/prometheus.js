@@ -18,6 +18,9 @@ const { values, positionals } = parseArgs({
     "max-tokens": { type: "string" },
     "context-window": { type: "string" },
     "max-turns": { type: "string" },
+    "output-format": { type: "string" },
+    "output-schema": { type: "string" },
+    "max-budget-usd": { type: "string" },
     help: { type: "boolean", short: "h" },
     version: { type: "boolean", short: "v" },
   },
@@ -39,6 +42,9 @@ Options:
       --max-tokens <n>        per-response token cap (default: 16000)
       --context-window <n>    context window for compaction (default: 128000)
       --max-turns <n>         tool-loop turn cap per message (default: 60)
+      --output-format <fmt>   text (default) | json | stream-json
+      --output-schema <file>  validate the final JSON against a JSON Schema
+      --max-budget-usd <n>    stop before a turn that would exceed this spend
   -h, --help                  show this help
   -v, --version               show the version
 
@@ -70,6 +76,18 @@ if (effort && !["auto", "low", "medium", "high"].includes(effort)) {
   process.exit(2);
 }
 
+const outputFormat = values["output-format"] ?? "text";
+if (!["text", "json", "stream-json"].includes(outputFormat)) {
+  console.error(`Invalid --output-format "${outputFormat}". Use text, json, or stream-json.`);
+  process.exit(2);
+}
+
+const maxBudget = values["max-budget-usd"] ? Number(values["max-budget-usd"]) : null;
+if (maxBudget !== null && !(maxBudget > 0)) {
+  console.error("--max-budget-usd must be a positive number.");
+  process.exit(2);
+}
+
 let config;
 try {
   config = loadConfig({
@@ -97,11 +115,15 @@ if (values.resume) {
 }
 
 if (positionals.length > 0) {
-  // One-shot mode.
+  // One-shot mode. `text` keeps the terminal UI; the JSON formats swap in a UI
+  // that emits events instead of drawing them, so the same turn can be consumed
+  // by a script without parsing ANSI output.
   const { Agent } = await import("../src/agent.ts");
-  const { TerminalUi } = await import("../src/ui.ts");
   const { ChatClient } = await import("../src/llm.ts");
-  const ui = new TerminalUi();
+  const headless = outputFormat !== "text";
+  const ui = headless
+    ? new (await import("../src/headless.ts")).JsonUi({ stream: outputFormat === "stream-json" })
+    : new (await import("../src/ui.ts")).TerminalUi();
   const client = new ChatClient({
     baseUrl: config.baseUrl,
     apiKey: config.apiKey,
@@ -111,12 +133,36 @@ if (positionals.length > 0) {
     timeoutMs: 300_000,
   });
   const agent = new Agent(config, ui, client, undefined, undefined, session?.messages ?? []);
+
+  // A budget check runs between turns: the agent's counters are live, so a run
+  // that has already spent its allowance stops before starting more work.
+  if (maxBudget !== null) {
+    const { costOf } = await import("../src/pricing.ts");
+    let lastCost = 0;
+    const originalRun = agent.run.bind(agent);
+    agent.run = async (text) => {
+      const before = { ...agent.usage };
+      await originalRun(text);
+      const spent = costOf(config.model, {
+        inputTokens: agent.usage.inputTokens - before.inputTokens,
+        outputTokens: agent.usage.outputTokens - before.outputTokens,
+        cachedTokens: agent.usage.cachedTokens - before.cachedTokens,
+      });
+      lastCost = (lastCost ?? 0) + (spent ?? 0);
+      if (lastCost > maxBudget) {
+        throw new Error(`stopped: this run has spent about $${lastCost.toFixed(4)}, over the $${maxBudget} budget`);
+      }
+    };
+  }
+
+  let failure = null;
   try {
     await agent.run(positionals.join(" "));
   } catch (err) {
-    ui.error(err instanceof Error ? err.message : String(err));
-    process.exit(1);
+    failure = err instanceof Error ? err.message : String(err);
+    ui.error(failure);
   }
+
   const { saveSession } = await import("../src/sessions.ts");
   saveSession({
     id: session?.id ?? `oneshot-${Date.now()}`,
@@ -127,7 +173,31 @@ if (positionals.length > 0) {
     updatedAt: new Date().toISOString(),
     messages: agent.messages.filter((m) => m.role !== "system"),
   });
-  process.exit(0);
+
+  if (headless) {
+    const finalText = [...agent.messages]
+      .reverse()
+      .find((message) => message.role === "assistant" && typeof message.content === "string" && message.content.trim());
+    const payload = {
+      type: "result",
+      ok: !failure,
+      text: typeof finalText?.content === "string" ? finalText.content : "",
+      usage: agent.usage,
+      cost: (await import("../src/pricing.ts")).costOf(config.model, agent.usage),
+      sessionId: session?.id ?? null,
+      ...(failure ? { error: failure } : {}),
+      events: ui.events,
+    };
+    if (values["output-schema"]) {
+      const { validateAgainstSchema, readSchema } = await import("../src/schema.ts");
+      const check = validateAgainstSchema(payload.text, readSchema(values["output-schema"]));
+      payload.schemaValid = check.valid;
+      if (!check.valid) payload.schemaError = check.error;
+    }
+    process.stdout.write(`${JSON.stringify(payload)}
+`);
+  }
+  process.exit(failure ? 1 : 0);
 }
 
 const repl = new Repl({ config, session });

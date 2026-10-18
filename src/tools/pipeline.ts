@@ -33,8 +33,12 @@ export interface PipelineDeps {
   runSubagent: (prompt: string) => Promise<string>;
   /** Run several sub-tasks concurrently (optional; falls back to serial). */
   runSubagents?: (prompts: string[]) => Promise<{ ok: boolean; report: string }[]>;
+  /** Start a sub-task that outlives the call; false when the cap is reached. */
+  runSubagentInBackground?: (prompt: string) => boolean;
   /** Conversation length right now, recorded on each checkpoint for rewind. */
   messageIndex?: () => number;
+  /** Called with a path the tool touched, so scoped rules can load. */
+  onTouch?: (path: string) => void;
   /** Skip permission prompts and hooks (sub-agents run under the parent's grant). */
   trusted?: boolean;
   cwd: string;
@@ -100,6 +104,13 @@ export class ToolPipeline {
     }
 
     ui.toolStart(name, safeSummarize(tool, input));
+    if (typeof input.path === "string") {
+      try {
+        this.deps.onTouch?.(input.path);
+      } catch {
+        /* rule scoping must never block a tool */
+      }
+    }
 
     // 2. guard - hooks run first so a guard script can veto even in auto mode.
     if (!this.deps.trusted) {
@@ -125,6 +136,13 @@ export class ToolPipeline {
         }
         const noise = results.map((result) => result.output).filter(Boolean).join("\n");
         if (noise) ui.toolOutput?.(name, noise);
+        // A hook may rewrite the arguments (a path normaliser, a policy that
+        // pins a flag); the tool then runs with the merged input.
+        for (const result of results) {
+          if (result.replace && typeof result.replace === "object") {
+            input = { ...input, ...(result.replace as Record<string, unknown>) };
+          }
+        }
       }
     }
 
@@ -152,6 +170,7 @@ export class ToolPipeline {
       todo: this.deps.todos,
       runSubagent: this.deps.runSubagent,
       ...(this.deps.runSubagents ? { runSubagents: this.deps.runSubagents } : {}),
+      ...(this.deps.runSubagentInBackground ? { runSubagentInBackground: this.deps.runSubagentInBackground } : {}),
     };
     let result: ToolResult;
     try {

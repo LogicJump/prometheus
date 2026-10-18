@@ -11,6 +11,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
+import { costOf } from "./pricing.ts";
 
 export interface UsageRecord {
   at: string;
@@ -20,6 +21,8 @@ export interface UsageRecord {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  /** Estimated US dollars for the turn; absent when the model has no price. */
+  cost?: number | null;
 }
 
 export interface UsageDay {
@@ -34,11 +37,12 @@ export interface UsageModel {
   model: string;
   inputTokens: number;
   outputTokens: number;
+  cost: number;
 }
 
 export interface UsageSummary {
   days: UsageDay[];
-  totals: { inputTokens: number; outputTokens: number; cachedTokens: number; turns: number };
+  totals: { inputTokens: number; outputTokens: number; cachedTokens: number; turns: number; cost: number };
   models: UsageModel[];
 }
 
@@ -59,6 +63,7 @@ export function recordUsage(record: Omit<UsageRecord, "at"> & { at?: string }): 
       outputTokens,
       cachedTokens: Math.max(0, Math.round(record.cachedTokens || 0)),
     };
+    entry.cost = costOf(entry.model, entry);
     appendFileSync(FILE, `${JSON.stringify(entry)}\n`, "utf8");
   } catch {
     /* accounting must never break a turn */
@@ -112,7 +117,7 @@ export function usageSummary(days = 30): UsageSummary {
     byDay.set(key, { date: key, inputTokens: 0, outputTokens: 0, cachedTokens: 0, turns: 0 });
   }
 
-  const totals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, turns: 0 };
+  const totals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, turns: 0, cost: 0 };
   const models = new Map<string, UsageModel>();
 
   for (const record of records) {
@@ -128,10 +133,12 @@ export function usageSummary(days = 30): UsageSummary {
     totals.outputTokens += record.outputTokens;
     totals.cachedTokens += record.cachedTokens ?? 0;
     totals.turns += 1;
+    totals.cost += record.cost ?? costOf(record.model, record) ?? 0;
     const model = record.model || "unknown";
-    const entry = models.get(model) ?? { model, inputTokens: 0, outputTokens: 0 };
+    const entry = models.get(model) ?? { model, inputTokens: 0, outputTokens: 0, cost: 0 };
     entry.inputTokens += record.inputTokens;
     entry.outputTokens += record.outputTokens;
+    entry.cost += record.cost ?? costOf(record.model, record) ?? 0;
     models.set(model, entry);
   }
 

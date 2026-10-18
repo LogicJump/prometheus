@@ -46,7 +46,16 @@ export interface SessionFile {
   archived?: boolean;
   /** Highest generation on disk; internal, maintained by the writer. */
   generation?: number;
+  /** Last known task state, shown as a dot in the sidebar. */
+  status?: SessionStatus;
 }
+
+/**
+ * The task state of a conversation. `needs-input` is set while a permission
+ * prompt is open, which is the only state a user can be blocking without
+ * having asked a question.
+ */
+export type SessionStatus = "ready" | "working" | "needs-input" | "error";
 
 export interface SessionMeta {
   id: string;
@@ -63,6 +72,7 @@ export interface SessionMeta {
   messageCount: number;
   /** Hash of the last stored message, so an append can verify its prefix in O(1). */
   lastHash?: string;
+  status?: SessionStatus;
 }
 
 function hashMessage(message: ChatMessage): string {
@@ -210,6 +220,7 @@ export function saveSession(session: SessionFile): void {
       archived: session.archived,
       generation: 1,
       messageCount: session.messages.length,
+      status: session.status,
     };
     mkdirSync(sessionDir(session.id), { recursive: true });
     writeFileSync(
@@ -237,6 +248,7 @@ export function saveSession(session: SessionFile): void {
     title: session.title !== undefined ? session.title : existing.title,
     pinned: session.pinned !== undefined ? session.pinned : existing.pinned,
     archived: session.archived !== undefined ? session.archived : existing.archived,
+    status: session.status !== undefined ? session.status : existing.status,
     updatedAt: now,
   };
   const stored = loadMessages(session.id);
@@ -325,12 +337,13 @@ export interface SessionSummary {
   title?: string;
   pinned?: boolean;
   archived?: boolean;
+  status?: SessionStatus;
 }
 
 /** Rewrite flags on a saved session without touching its messages. */
 export function updateSessionFlags(
   id: string,
-  patch: { title?: string | null; pinned?: boolean; archived?: boolean },
+  patch: { title?: string | null; pinned?: boolean; archived?: boolean; status?: SessionStatus },
 ): SessionFile | null {
   const session = loadSession(id);
   if (!session) return null;
@@ -339,6 +352,7 @@ export function updateSessionFlags(
     if (patch.title !== undefined) meta.title = patch.title?.trim() || undefined;
     if (patch.pinned !== undefined) meta.pinned = patch.pinned;
     if (patch.archived !== undefined) meta.archived = patch.archived;
+    if (patch.status !== undefined) meta.status = patch.status;
     meta.updatedAt = new Date().toISOString();
     writeMeta(meta);
     return loadSession(session.id);
@@ -347,6 +361,7 @@ export function updateSessionFlags(
   if (patch.title !== undefined) session.title = patch.title?.trim() || undefined;
   if (patch.pinned !== undefined) session.pinned = patch.pinned;
   if (patch.archived !== undefined) session.archived = patch.archived;
+  if (patch.status !== undefined) session.status = patch.status;
   saveSession(session);
   return session;
 }
@@ -392,6 +407,7 @@ export function listSessions(cwdOnly: boolean, includeArchived = false): Session
       title: meta.title,
       pinned: meta.pinned,
       archived: meta.archived,
+      status: meta.status,
     });
   }
 
@@ -409,6 +425,7 @@ export function listSessions(cwdOnly: boolean, includeArchived = false): Session
         title: session.title,
         pinned: session.pinned,
         archived: session.archived,
+        status: session.status,
       });
     } catch {
       /* skip unreadable sessions */

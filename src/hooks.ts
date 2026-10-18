@@ -26,7 +26,19 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
 
-export type HookEvent = "PreToolUse" | "PostToolUse" | "SessionStart" | "Stop" | "UserPromptSubmit";
+export type HookEvent =
+  | "PreToolUse"
+  | "PostToolUse"
+  | "UserPromptSubmit"
+  | "PreCompact"
+  | "PostCompact"
+  | "SubagentStart"
+  | "SubagentStop"
+  | "SessionStart"
+  | "Stop";
+
+/** Events whose non-zero exit blocks the action rather than only reporting. */
+const BLOCKING: HookEvent[] = ["PreToolUse", "UserPromptSubmit"];
 
 export interface Hook {
   event: HookEvent;
@@ -39,13 +51,24 @@ interface HookFile {
   hooks?: Partial<Record<HookEvent, { matcher?: string; command?: string; timeout_ms?: number }[]>>;
 }
 
-const EVENTS: HookEvent[] = ["PreToolUse", "PostToolUse", "SessionStart", "Stop", "UserPromptSubmit"];
+const EVENTS: HookEvent[] = [
+  "PreToolUse",
+  "PostToolUse",
+  "UserPromptSubmit",
+  "PreCompact",
+  "PostCompact",
+  "SubagentStart",
+  "SubagentStop",
+  "SessionStart",
+  "Stop",
+];
 
 export interface HookResult {
-  /** Non-zero for PreToolUse means "block the tool". */
   code: number;
   output: string;
   blocked: boolean;
+  /** A replacement tool input (PreToolUse) or prompt (UserPromptSubmit). */
+  replace?: unknown;
 }
 
 function readFile(file: string): Hook[] {
@@ -80,7 +103,9 @@ export function hooksFor(hooks: Hook[], event: HookEvent, toolName = ""): Hook[]
   return hooks.filter((hook) => {
     if (hook.event !== event) return false;
     if (!hook.matcher) return true;
-    if (event !== "PreToolUse" && event !== "PostToolUse") return true;
+    if (event !== "PreToolUse" && event !== "PostToolUse" && event !== "SubagentStart" && event !== "SubagentStop") {
+      return true;
+    }
     try {
       return new RegExp(hook.matcher).test(toolName);
     } catch {
@@ -95,12 +120,17 @@ function runOne(hook: Hook, payload: Record<string, unknown>, cwd: string): Prom
     const args =
       process.platform === "win32" ? ["/d", "/s", "/c", hook.command] : ["-c", hook.command];
     const child = spawn(shell, args, { cwd, env: { ...process.env }, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-    let output = "";
-    const append = (chunk: Buffer) => {
-      if (output.length < 20_000) output += chunk.toString("utf8");
-    };
-    child.stdout.on("data", append);
-    child.stderr.on("data", append);
+    // stdout is the hook's answer; stderr is commentary. Keeping them apart is
+    // what lets a PreToolUse hook return a rewritten input as JSON on stdout
+    // while still logging freely on stderr.
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (stdout.length < 20_000) stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.length < 20_000) stderr += chunk.toString("utf8");
+    });
     const timer = setTimeout(() => {
       try {
         child.kill();
@@ -108,15 +138,30 @@ function runOne(hook: Hook, payload: Record<string, unknown>, cwd: string): Prom
         /* ignore */
       }
     }, hook.timeoutMs ?? 30_000);
+    const settle = (exitCode: number) => {
+      clearTimeout(timer);
+      const output = (stdout.trim() || stderr.trim()).slice(0, 20_000);
+      // Exit code 2 is the explicit "block" signal; any other non-zero is a
+      // failure the user should see, but only blocking events act on it.
+      const blocking = BLOCKING.includes(hook.event);
+      const blocked = blocking && exitCode !== 0;
+      let replace: unknown;
+      if (stdout.trim().startsWith("{")) {
+        try {
+          const parsed = JSON.parse(stdout.trim()) as { input?: unknown; prompt?: unknown };
+          if (hook.event === "PreToolUse" && parsed.input && typeof parsed.input === "object") replace = parsed.input;
+          if (hook.event === "UserPromptSubmit" && typeof parsed.prompt === "string") replace = parsed.prompt;
+        } catch {
+          /* stdout was prose, not a control message */
+        }
+      }
+      resolve({ code: exitCode, output, blocked, ...(replace !== undefined ? { replace } : {}) });
+    };
     child.on("error", (err) => {
       clearTimeout(timer);
-      resolve({ code: 1, output: err.message, blocked: hook.event === "PreToolUse" });
+      resolve({ code: 1, output: err.message, blocked: BLOCKING.includes(hook.event) });
     });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      const exitCode = code ?? 1;
-      resolve({ code: exitCode, output: output.trim(), blocked: hook.event === "PreToolUse" && exitCode !== 0 });
-    });
+    child.on("exit", (code) => settle(code ?? 1));
     child.stdin.end(`${JSON.stringify(payload)}\n`);
   });
 }
@@ -135,4 +180,26 @@ export async function runHooks(
     if (result.blocked) break;
   }
   return results;
+}
+
+/**
+ * Run the prompt hooks and return the text the turn should actually use.
+ * A hook that prints `{"prompt": "..."}` replaces the user's message, which is
+ * how a project can expand its own shorthand without teaching the model a new
+ * syntax.
+ */
+export async function applyPromptHooks(
+  hooks: Hook[],
+  text: string,
+  cwd: string,
+): Promise<{ text: string; blocked: boolean; output: string }> {
+  const matched = hooksFor(hooks, "UserPromptSubmit");
+  if (matched.length === 0) return { text, blocked: false, output: "" };
+  const results = await runHooks(matched, "UserPromptSubmit", { prompt: text }, cwd);
+  const blocker = results.find((result) => result.blocked);
+  if (blocker) return { text, blocked: true, output: blocker.output };
+  let next = text;
+  for (const result of results) if (typeof result.replace === "string") next = result.replace;
+  const output = results.map((result) => result.output).filter(Boolean).join("\n");
+  return { text: next, blocked: false, output };
 }

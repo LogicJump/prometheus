@@ -59,6 +59,10 @@ let sessionId = newSessionId();
 let sessionCreatedAt = new Date().toISOString();
 /** Custom title for the current session, if the user set one. */
 let sessionTitle = "";
+/** Task state of this conversation, mirrored into the sidebar. */
+let sessionStatus = "ready";
+/** Prompts advertised by MCP servers, exposed as slash commands. */
+let mcpPrompts = [];
 /** Canonical workspace spelling: one project must not appear twice. */
 function canonicalCwd(path) {
   try {
@@ -308,8 +312,11 @@ class HostUi {
   }
   async confirm(question) {
     const id = ++permissionSeq;
+    setSessionStatus("needs-input");
     send({ type: "permission_request", id, question });
-    return await new Promise((resolve) => pendingPermissions.set(id, resolve));
+    const answer = await new Promise((resolve) => pendingPermissions.set(id, resolve));
+    setSessionStatus("working");
+    return answer;
   }
   async ask(question, options) {
     // The permission bar is still open in this flow, so reuse its answer channel
@@ -321,8 +328,10 @@ class HostUi {
       ...option,
       i18nKey: option.value === "always-tool" ? "rememberTool" : option.value === "always-detail" ? "rememberDetail" : "",
     }));
+    setSessionStatus("needs-input");
     send({ type: "permission_choice", id, question, options: withKeys });
     const answer = await new Promise((resolve) => pendingPermissions.set(id, resolve));
+    setSessionStatus("working");
     pendingPermissions.delete(id);
     return answer;
   }
@@ -352,6 +361,51 @@ function changedFiles() {
   return [...seen.entries()].map(([path, action]) => ({ path, action }));
 }
 
+/**
+ * Every slash command the composer can offer: the project's markdown commands
+ * plus any prompt an MCP server advertises. A project command wins a name
+ * collision, because the user wrote it for this workspace.
+ */
+function availableCommands() {
+  const local = listCommands(cwd).map(({ name, description, argumentHint }) => ({ name, description, argumentHint }));
+  const names = new Set(local.map((command) => command.name));
+  for (const { server, prompt } of mcpPrompts) {
+    if (!prompt?.name || names.has(prompt.name)) continue;
+    names.add(prompt.name);
+    local.push({
+      name: prompt.name,
+      description: prompt.description ?? `MCP prompt from ${server}`,
+      argumentHint: (prompt.arguments ?? []).map((arg) => (arg.required ? `<${arg.name}>` : `[${arg.name}]`)).join(" "),
+      mcp: server,
+    });
+  }
+  return local.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Expand a slash command typed in the composer, MCP prompts included. */
+function expandAnySlash(text) {
+  const expanded = expandSlash(cwd, text);
+  if (expanded) return expanded;
+  const match = /^\/([a-z0-9][a-z0-9-_]*)\s*([\s\S]*)$/i.exec(text.trim());
+  if (!match) return null;
+  const entry = mcpPrompts.find(({ prompt }) => prompt.name === match[1]);
+  if (!entry) return null;
+  return { command: { name: entry.prompt.name }, prompt: mcpPromptText(entry, match[2]) };
+}
+
+/** MCP prompts take named arguments; the typed tail fills them in order. */
+function mcpPromptText(entry, tail) {
+  const args = entry.prompt.arguments ?? [];
+  const values = tail.trim() ? tail.trim().split(/\s+/) : [];
+  if (args.length === 0) {
+    return tail.trim()
+      ? `Use the MCP prompt "${entry.prompt.name}" from ${entry.server}. Additional input: ${tail.trim()}`
+      : `Use the MCP prompt "${entry.prompt.name}" from ${entry.server}.`;
+  }
+  const filled = args.map((arg, index) => `${arg.name}: ${values[index] ?? ""}`).join("\n");
+  return `Use the MCP prompt "${entry.prompt.name}" from ${entry.server} with these arguments:\n${filled}`;
+}
+
 function sessionRecord() {
   // Keep flags written by sessionFlags; persist() must not erase them.
   const existing = (() => {
@@ -372,7 +426,25 @@ function sessionRecord() {
     title: sessionTitle || existing?.title,
     pinned: existing?.pinned,
     archived: existing?.archived,
+    status: sessionStatus,
   };
+}
+
+/**
+ * Move the session between ready / working / needs-input / error. The sidebar
+ * reads this from the saved meta, so a crashed host still shows the last state
+ * instead of pretending everything is idle.
+ */
+function setSessionStatus(next) {
+  if (sessionStatus === next) return;
+  sessionStatus = next;
+  try {
+    updateSessionFlags(sessionId, { status: next });
+  } catch {
+    /* status is cosmetic; never block a turn on it */
+  }
+  send({ type: "session_status", sessionId, status: next });
+  send({ type: "sessions", sessions: listSessions(false).slice(0, 80) });
 }
 
 function persist() {
@@ -409,6 +481,19 @@ function createAgent(messages = []) {
   agent.sessionId = sessionId;
   agent.outputStyle = uiPrefs.outputStyle ?? "default";
   agent.onBeforeMutate = (name, input) => recordChange(name, input);
+  // A background sub-task reports when it is done. The notice is not a user
+  // turn: it lands in the transcript as a result, and the conversation only
+  // sees it if the user asks a follow-up.
+  agent.onBackgroundReport = (prompt, report, ok) => {
+    send({
+      type: "background_report",
+      ok,
+      prompt: String(prompt).slice(0, 300),
+      report: String(report).slice(0, 20_000),
+    });
+    if (!ok) send({ type: "notice", level: "error", text: `background task failed: ${String(report).slice(0, 200)}` });
+    void emitGitStatus();
+  };
   // Compaction rewrote the history; persist the new generation immediately so
   // an interrupted turn cannot leave a stale transcript on disk.
   agent.onCompacted = (info) => {
@@ -466,9 +551,15 @@ async function startMcp() {
     return;
   }
   mcpClients = loaded.clients;
+  // MCP prompts become slash commands; a project's own command with the same
+  // name wins, so this list is only the servers' contribution.
+  mcpPrompts = loaded.prompts;
   if (loaded.tools.length > 0) {
     agent?.addTools(loaded.tools);
     send({ type: "notice", level: "dim", text: `MCP: ${loaded.tools.length} tool(s) loaded` });
+  }
+  if (loaded.prompts.length > 0) {
+    send({ type: "notice", level: "dim", text: `MCP: ${loaded.prompts.length} prompt(s) available as commands` });
   }
   for (const error of loaded.errors) send({ type: "notice", level: "warn", text: `MCP: ${error}` });
 }
@@ -526,6 +617,7 @@ async function runPrompt(text, images) {
     return;
   }
   running = true;
+  setSessionStatus("working");
   turnBaseline = new Map();
   const usageBefore = { ...agent.usage };
   markRunActive({ sessionId, cwd, startedAt: new Date().toISOString() });
@@ -539,9 +631,13 @@ async function runPrompt(text, images) {
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (err?.name !== "AbortError") send({ type: "error", message });
+    if (err?.name !== "AbortError") {
+      send({ type: "error", message });
+      setSessionStatus("error");
+    }
   } finally {
     running = false;
+    setSessionStatus("ready");
     clearRunActive();
     ui.assistantEnd();
     ui.thinkingEnd();
@@ -729,7 +825,7 @@ async function handle(cmd) {
           body: String(cmd.skill?.body ?? ""),
         });
         send({ type: "skills", skills: listSkills(cwd) });
-        send({ type: "commands", commands: listCommands(cwd).map(({ name, description, argumentHint }) => ({ name, description, argumentHint })) });
+        send({ type: "commands", commands: availableCommands() });
       } catch (err) {
         send({ type: "notice", level: "error", text: `skill: ${err.message}` });
       }
@@ -848,7 +944,7 @@ async function handle(cmd) {
     case "prompt": {
       // A known slash command expands into its prompt; anything else is sent
       // verbatim so a message starting with "/" is never swallowed.
-      const expanded = expandSlash(cwd, String(cmd.text ?? ""));
+      const expanded = expandAnySlash(String(cmd.text ?? ""));
       if (!expanded) {
         void runPrompt(cmd.text, cmd.images);
         return;

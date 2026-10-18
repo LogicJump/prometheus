@@ -56,6 +56,8 @@ export interface QueryOptions {
   drainQueue?: () => string[];
   /** How many recoverable failures to tolerate in one turn. */
   maxRetries?: number;
+  /** Rebuilt state (plan, files in play, rules) to keep across compaction. */
+  rehydrate?: () => string;
   /**
    * Ask the model for the recap when compaction needs one. Without it the
    * local keyword summary is used (tests, offline runs).
@@ -121,7 +123,11 @@ export async function* query(options: QueryOptions): AsyncGenerator<QueryEvent, 
 
     // compact: shrink the window before paying for a request
     const compaction = options.summarize
-      ? await compactWithModel(messages, config.contextWindow, { summarize: options.summarize, signal })
+      ? await compactWithModel(messages, config.contextWindow, {
+          summarize: options.summarize,
+          signal,
+          ...(options.rehydrate ? { rehydrate: options.rehydrate } : {}),
+        })
       : await compactWithModel(messages, config.contextWindow, { summarize: async () => "" });
     if (compaction) {
       messages.splice(0, messages.length, ...compaction.messages);

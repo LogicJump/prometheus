@@ -75,6 +75,12 @@ export async function compactWithModel(
   options: {
     summarize: (old: ChatMessage[], localSummary: string) => Promise<string>;
     signal?: AbortSignal;
+    /**
+     * Lines re-injected after the recap. Compaction drops the parts of the
+     * context that are cheapest to rebuild — the plan, the files in play, the
+     * project rules — and the model otherwise loses them silently.
+     */
+    rehydrate?: () => string;
   },
 ): Promise<CompactionResult | null> {
   const budget = Math.floor(contextWindow * BUDGET_RATIO);
@@ -113,7 +119,7 @@ export async function compactWithModel(
     level = "local-fallback";
   }
 
-  const recap = recapMessage(summary);
+  const recap = recapMessage(summary, safeRehydrate(options.rehydrate));
   const summarized: ChatMessage[] = system ? [system, recap, ...recent] : [recap, ...recent];
   if (estimateTokens(summarized) <= budget) {
     return result(summarized, old.length, level, summary, before);
@@ -121,7 +127,8 @@ export async function compactWithModel(
 
   const aggressiveSplit = splitPoint(recent, AGGRESSIVE_KEEP);
   const clipped = recent.slice(aggressiveSplit).map(clipMessage);
-  const aggressive: ChatMessage[] = system ? [system, recapMessage(summary), ...clipped] : [recapMessage(summary), ...clipped];
+  const aggressiveRecap = recapMessage(summary, safeRehydrate(options.rehydrate));
+  const aggressive: ChatMessage[] = system ? [system, aggressiveRecap, ...clipped] : [aggressiveRecap, ...clipped];
   return result(aggressive, old.length + aggressiveSplit, "aggressive", summary, before);
 }
 
@@ -224,13 +231,23 @@ function splitPoint(messages: ChatMessage[], keep: number): number {
   return split >= messages.length ? Math.max(0, messages.length - 2) : split;
 }
 
-function recapMessage(summary: string): ChatMessage {
+function recapMessage(summary: string, rehydrate = ""): ChatMessage {
+  const restored = rehydrate.trim() ? `\n\nStill in effect:\n${rehydrate.trim()}` : "";
   return {
     role: "user",
     content:
-      `[Earlier context was compacted to save space. Recap of what happened:\n${summary}\n]\n\n` +
+      `[Earlier context was compacted to save space. Recap of what happened:\n${summary}\n]${restored}\n\n` +
       `Continue from here. Do not repeat completed work; re-read files if you need their current contents.`,
   };
+}
+
+function safeRehydrate(rehydrate?: () => string): string {
+  if (!rehydrate) return "";
+  try {
+    return rehydrate().slice(0, 4000);
+  } catch {
+    return "";
+  }
 }
 
 function clipMessage(message: ChatMessage): ChatMessage {

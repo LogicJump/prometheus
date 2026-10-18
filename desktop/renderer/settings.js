@@ -495,6 +495,10 @@ function buildUsagePage() {
       tile(s.usageCached, formatTokens(summary.totals.cachedTokens)),
       tile(s.usageTurns, String(summary.totals.turns)),
     );
+    // Money is the number people actually act on; token counts only explain it.
+    if (summary.totals.cost > 0) {
+      tiles.append(tile(s.usageCost, formatMoney(summary.totals.cost), s.usageEstimate));
+    }
     body.appendChild(tiles);
 
     const chart = el("div", "usage-chart");
@@ -522,7 +526,9 @@ function buildUsagePage() {
       for (const model of summary.models) {
         const row = el("div", "usage-model-row");
         row.appendChild(el("span", "usage-model-name", model.model));
-        row.appendChild(el("span", "usage-model-value", formatTokens(model.inputTokens + model.outputTokens)));
+        const value = el("span", "usage-model-value", formatTokens(model.inputTokens + model.outputTokens));
+        if (model.cost > 0) value.textContent += ` · ${formatMoney(model.cost)}`;
+        row.appendChild(value);
         models.appendChild(row);
       }
       body.appendChild(models);
@@ -535,6 +541,14 @@ function buildUsagePage() {
   state.renderUsagePage = render;
   render();
   return pane;
+}
+
+/** Prices are an estimate from a local table, so the label says so. */
+function formatMoney(dollars) {
+  if (!dollars) return "$0";
+  if (dollars < 0.01) return `$${dollars.toFixed(4)}`;
+  if (dollars < 1) return `$${dollars.toFixed(3)}`;
+  return `$${dollars.toFixed(2)}`;
 }
 
 function buildConnectionPage() {

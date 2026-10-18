@@ -746,6 +746,33 @@ svg {
 }
 
 
+/* Task state, as a dot the eye can catch while scanning the list. */
+.session-state {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.session-state.working {
+  background: var(--accent);
+  animation: state-pulse 1.6s var(--ease) infinite;
+}
+
+.session-state.needs-input {
+  background: var(--warn);
+}
+
+.session-state.error {
+  background: var(--danger);
+}
+
+@keyframes state-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
 .session-pin {
   display: flex;
   color: var(--accent);
@@ -2679,6 +2706,49 @@ mark.find-hit.current {
   fill: none;
   stroke: currentColor;
   stroke-width: 1.8;
+}
+
+/* A result that arrived on its own, after the turn that started it. */
+.background-report {
+  max-width: var(--reading-width);
+  margin: 2px auto 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.background-report.failed {
+  border-left-color: var(--danger);
+}
+
+.background-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.background-head .icon {
+  color: var(--accent);
+}
+
+.background-report.failed .background-head .icon {
+  color: var(--danger);
+}
+
+.background-state {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.background-prompt {
+  margin: 6px 0 8px;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
 }
 
 /* ---------- tool density ---------- */

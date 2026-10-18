@@ -66,6 +66,8 @@ export interface ToolContext {
   runSubagent: (prompt: string) => Promise<string>;
   /** Run several independent sub-tasks concurrently; results are in input order. */
   runSubagents?: (prompts: string[]) => Promise<{ ok: boolean; report: string }[]>;
+  /** Start a sub-task that outlives the tool call; false when the cap is reached. */
+  runSubagentInBackground?: (prompt: string) => boolean;
 }
 
 export interface Tool {

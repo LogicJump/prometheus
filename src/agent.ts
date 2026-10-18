@@ -17,8 +17,8 @@ import { Permissions } from "./permissions.ts";
 import { estimateTokens, summarizerInput, SUMMARIZE_PROMPT } from "./context.ts";
 import { loadMemory } from "./memory.ts";
 import { SUBAGENT_TOOLS, ALL_TOOLS } from "./tools/index.ts";
-import { loadProjectInstructions } from "./instructions.ts";
-import { loadHooks, hooksFor, runHooks, type Hook } from "./hooks.ts";
+import { loadProjectInstructions, loadRules, renderRules } from "./instructions.ts";
+import { loadHooks, hooksFor, runHooks, applyPromptHooks, type Hook } from "./hooks.ts";
 import { ToolPipeline } from "./tools/pipeline.ts";
 import { query, type QueryEvent } from "./query.ts";
 
@@ -51,6 +51,8 @@ export class Agent {
   onBeforeMutate: ((toolName: string, input: Record<string, unknown>) => void) | null = null;
   /** Set by the host so a turn can stream to the renderer instead of a terminal. */
   onQueryEvent: ((event: QueryEvent) => void) | null = null;
+  /** Called when a background sub-task finishes, with its report. */
+  onBackgroundReport: ((prompt: string, report: string, ok: boolean) => void) | null = null;
   /** Called by the host so it can persist or count a compacted history. */
   onCompacted:
     | ((info: { removed: number; before: number; after: number; summary: string; level: string; kept: number }) => void)
@@ -58,6 +60,10 @@ export class Agent {
 
   /** Mutable so MCP tools can be added after startup. */
   private tools: Tool[];
+  /** Workspace-relative paths the conversation has read or written, for scoped rules. */
+  private readonly touched = new Set<string>();
+  /** Background sub-tasks still running; capped so a loop cannot spawn hundreds. */
+  private readonly background = new Set<Promise<void>>();
   /** Hooks loaded at construction (PreToolUse can veto a tool). */
   private hooks: Hook[] = [];
   private readonly permissions: Permissions;
@@ -114,6 +120,7 @@ export class Agent {
   private systemPrompt(): string {
     const memory = loadMemory();
     const instructions = loadProjectInstructions();
+    const rules = renderRules(loadRules(), [...this.touched]);
     const mode = this.config.permissionMode;
     const modeNote =
       mode === "plan"
@@ -159,13 +166,43 @@ ${memory ? `\n# Existing memory\n${memory}` : ""}
 ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""}`;
   }
 
+  /** SubagentStart/Stop are advisory: a failing hook must not kill the task. */
+  private async fireSubagentHooks(event: "SubagentStart" | "SubagentStop", prompt: string, report = ""): Promise<void> {
+    const hooks = hooksFor(this.hooks, event);
+    if (hooks.length === 0) return;
+    try {
+      const results = await runHooks(hooks, event, { prompt, report }, process.cwd());
+      const noise = results.map((result) => result.output).filter(Boolean).join("\n");
+      if (noise) this.ui.dim(`[${event}] ${noise}`);
+    } catch {
+      /* lifecycle hooks are advisory */
+    }
+  }
+
   /** Fire the session-lifecycle hooks; callers do not await the Stop hook. */
-  async fireSessionHooks(event: "SessionStart" | "Stop", extra: Record<string, unknown> = {}): Promise<void> {
+  async fireSessionHooks(
+    event: "SessionStart" | "Stop" | "PreCompact" | "PostCompact",
+    extra: Record<string, unknown> = {},
+  ): Promise<void> {
     const hooks = hooksFor(this.hooks, event);
     if (hooks.length === 0) return;
     const results = await runHooks(hooks, event, extra, process.cwd());
     const noise = results.map((result) => result.output).filter(Boolean).join("\n");
     if (noise) this.ui.dim(`[${event}] ${noise}`);
+  }
+
+  /**
+   * Remember a path the conversation touched. A path that activates a new
+   * scoped rule rebuilds the system prompt immediately, so the rule is in
+   * effect for the very next request rather than the next turn.
+   */
+  noteTouched(path: unknown): void {
+    if (typeof path !== "string" || !path.trim()) return;
+    if (this.touched.size > 200) return;
+    const before = renderRules(loadRules(), [...this.touched]);
+    this.touched.add(path);
+    const after = renderRules(loadRules(), [...this.touched]);
+    if (after !== before) this.refreshSystemPrompt();
   }
 
   /** Add tools at runtime (MCP servers connect after the first turn may start). */
@@ -181,7 +218,9 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
 
   /** Queue a user turn that may carry images; `text` is the prompt. */
   async runWithParts(text: string, parts: UserContentPart[]): Promise<void> {
-    this.messages.push({ role: "user", content: [{ type: "text", text }, ...parts] });
+    const prompt = await this.applyPromptHooks(text);
+    if (prompt === null) return;
+    this.messages.push({ role: "user", content: [{ type: "text", text: prompt }, ...parts] });
     await this.loop();
   }
 
@@ -207,8 +246,27 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
 
   /** Stream one assistant turn and execute any tool calls until the model stops. */
   async run(text: string): Promise<void> {
-    this.pushUser(text);
+    const prompt = await this.applyPromptHooks(text);
+    if (prompt === null) return;
+    this.pushUser(prompt);
     await this.loop();
+  }
+
+  /**
+   * UserPromptSubmit hooks run before the message reaches the model. They can
+   * rewrite it (stdout `{"prompt": ...}`) or veto the turn (non-zero exit), so
+   * a project can enforce a template or refuse an off-limits request without
+   * relying on the model to comply.
+   */
+  private async applyPromptHooks(text: string): Promise<string | null> {
+    if (this.isSubagent) return text;
+    const result = await applyPromptHooks(this.hooks, text, process.cwd());
+    if (result.blocked) {
+      this.ui.warn(`the prompt was blocked by a UserPromptSubmit hook: ${result.output.slice(0, 300)}`);
+      return null;
+    }
+    if (result.output) this.ui.dim(`[UserPromptSubmit] ${result.output}`);
+    return result.text;
   }
 
   private buildPipeline(): ToolPipeline {
@@ -224,7 +282,9 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         onBeforeMutate: this.onBeforeMutate,
         runSubagent: (prompt) => this.runSubagent(prompt, this.abortController?.signal ?? new AbortController().signal),
         runSubagents: (prompts) => this.runSubagents(prompts, this.abortController?.signal ?? new AbortController().signal),
+        runSubagentInBackground: (prompt) => this.startBackgroundSubagent(prompt),
         messageIndex: () => this.messages.length,
+        onTouch: (path) => this.noteTouched(path),
         trusted: this.isSubagent,
         cwd: process.cwd(),
       },
@@ -246,6 +306,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         signal,
         drainQueue: () => this.queued.splice(0),
         summarize: (old, local) => this.summarizeWithModel(old, local, signal),
+        rehydrate: () => this.rehydration(),
         maxRetries: 3,
       });
 
@@ -259,6 +320,27 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       this.ui.thinkingEnd();
       this.abortController = null;
     }
+  }
+
+  /**
+   * What the model should still know after compaction: the plan, the files the
+   * conversation has touched, and the rules currently in force. All three are
+   * cheap to rebuild and expensive to lose mid-task.
+   */
+  private rehydration(): string {
+    const parts: string[] = [];
+    const open = this.todos.items.filter((item) => item.status !== "completed");
+    if (open.length > 0) {
+      const lines = open.map((item) => `- [${item.status === "in_progress" ? "x" : " "}] ${item.content}`);
+      parts.push(`Open plan:\n${lines.join("\n")}`);
+    }
+    if (this.touched.size > 0) {
+      const recent = [...this.touched].slice(-5);
+      parts.push(`Files in play: ${recent.join(", ")}`);
+    }
+    const rules = renderRules(loadRules(), [...this.touched]);
+    if (rules) parts.push(rules);
+    return parts.join("\n\n");
   }
 
   /**
@@ -306,6 +388,8 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         break;
       case "compacted":
         ui.dim(`compacted (${event.level}) ${event.removed} earlier messages (~${event.before} -> ~${event.after} tokens)`);
+        void this.fireSessionHooks("PreCompact", { removed: event.removed, before: event.before, after: event.after });
+        void this.fireSessionHooks("PostCompact", { removed: event.removed, after: event.after, summary: event.summary.slice(0, 2000) });
         this.onCompacted?.({
           removed: event.removed,
           before: event.before,
@@ -364,6 +448,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     if (this.isSubagent) throw new Error("sub-agents cannot spawn sub-agents");
     this.ui.info("  ↳ sub-agent started");
     this.ui.subagentStart?.(prompt);
+    await this.fireSubagentHooks("SubagentStart", prompt);
     const child = this.spawnSubagent("sub-agent");
     const onAbort = () => child.abort();
     signal.addEventListener("abort", onAbort, { once: true });
@@ -375,9 +460,11 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       this.ui.info("  ↳ sub-agent finished");
       const report = typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
       this.ui.subagentEnd?.(true, report.slice(0, 160));
+      await this.fireSubagentHooks("SubagentStop", prompt, report);
       return report;
     } catch (err) {
       this.ui.subagentEnd?.(false, (err as Error).message);
+      await this.fireSubagentHooks("SubagentStop", prompt, (err as Error).message);
       throw err;
     } finally {
       signal.removeEventListener("abort", onAbort);
@@ -421,6 +508,48 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     signal.removeEventListener("abort", onAbort);
     this.ui.info(`  ↳ ${results.filter((result) => result.ok).length}/${results.length} sub-agents finished`);
     return results;
+  }
+
+  /**
+   * Start a sub-task whose report is not needed to continue. The turn ends
+   * normally; when the child finishes, the report is handed to
+   * `onBackgroundReport` instead of being spliced into the conversation, so a
+   * long-running task never holds the main loop open.
+   */
+  private startBackgroundSubagent(prompt: string): boolean {
+    if (this.isSubagent) return false;
+    if (this.background.size >= 4) return false;
+    this.ui.subagentStart?.(`(background) ${prompt}`);
+    const child = this.spawnSubagent("background");
+    // `tracked` is assigned after the promise is created, so the finally block
+    // can remove exactly this task without capturing a stale binding.
+    const tracked = new Set<Promise<void>>();
+    const task: Promise<void> = (async () => {
+      try {
+        await child.run(prompt);
+        const text = [...child.messages].reverse().find((m) => m.role === "assistant" && m.content);
+        const report = typeof text?.content === "string" ? text.content : "(background sub-agent produced no text report)";
+        this.usage.inputTokens += child.usage.inputTokens;
+        this.usage.outputTokens += child.usage.outputTokens;
+        this.ui.subagentEnd?.(true, `background: ${report.slice(0, 120)}`);
+        this.onBackgroundReport?.(prompt, report, true);
+      } catch (err) {
+        this.ui.subagentEnd?.(false, `background: ${(err as Error).message}`);
+        this.onBackgroundReport?.(prompt, (err as Error).message, false);
+      } finally {
+        child.abortController = null;
+        for (const entry of tracked) this.background.delete(entry);
+        tracked.clear();
+      }
+    })();
+    tracked.add(task);
+    this.background.add(task);
+    return true;
+  }
+
+  /** Wait for background sub-tasks (tests and graceful shutdown). */
+  async drainBackground(): Promise<void> {
+    await Promise.allSettled([...this.background]);
   }
 
   /** Test seam for the parallel path; the delegate tool uses the pipeline copy. */

@@ -42,7 +42,7 @@ const memoryTool: Tool = {
 export const subagentTool: Tool = {
   name: "delegate",
   description:
-    "Run independent sub-tasks in fresh contexts with their own tool access, returning only final reports. Use `prompt` for one task, or `prompts` to run up to four independent tasks in parallel. Use it for broad searches or self-contained work that would otherwise flood your context. Sub-agents cannot ask the user questions; give each a complete, self-contained prompt.",
+    "Run independent sub-tasks in fresh contexts with their own tool access, returning only final reports. Use `prompt` for one task, or `prompts` to run up to four independent tasks in parallel. Set `background: true` for a long task whose report is not needed to continue; you will be told when it finishes. Use it for broad searches or self-contained work that would otherwise flood your context. Sub-agents cannot ask the user questions; give each a complete, self-contained prompt.",
   readonly: false,
   parameters: {
     type: "object",
@@ -53,6 +53,10 @@ export const subagentTool: Tool = {
         description: "Several independent sub-tasks to run in parallel (max 4). Results come back in order.",
         items: { type: "string" },
         maxItems: 4,
+      },
+      background: {
+        type: "boolean",
+        description: "Run without blocking this turn. The report arrives as a notice when it finishes.",
       },
     },
     additionalProperties: false,
@@ -82,6 +86,14 @@ export const subagentTool: Tool = {
     }
     const single = String(input.prompt ?? "").trim();
     if (!single) return { isError: true, content: "Provide a prompt or a prompts array." };
+    if (input.background === true) {
+      if (!ctx.runSubagentInBackground) {
+        return { isError: true, content: "background sub-agents are not available in this session" };
+      }
+      const started = ctx.runSubagentInBackground(single);
+      if (!started) return { isError: true, content: "too many background sub-agents are already running" };
+      return { content: "Started in the background. Its report will be delivered when it finishes.", display: "background" };
+    }
     const report = await ctx.runSubagent(single);
     return { content: report, display: "sub-agent finished" };
   },

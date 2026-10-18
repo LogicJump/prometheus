@@ -49,6 +49,19 @@ export interface McpServerConfig {
 
 export type McpScope = "user" | "project";
 
+export interface McpResource {
+  uri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface McpPrompt {
+  name: string;
+  description?: string;
+  arguments?: { name: string; description?: string; required?: boolean }[];
+}
+
 export interface McpConfigFile {
   servers?: Record<string, McpServerConfig>;
 }
@@ -63,6 +76,10 @@ export interface McpClient {
   initialize(): Promise<void>;
   listTools(): Promise<{ name: string; description?: string; inputSchema?: Record<string, unknown> }[]>;
   callTool(name: string, args: Record<string, unknown>): Promise<ToolResult>;
+  /** Optional: servers that expose resources or prompts are not required to. */
+  listResources?(): Promise<McpResource[]>;
+  readResource?(uri: string): Promise<string>;
+  listPrompts?(): Promise<McpPrompt[]>;
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
   dispose(): void;
 }
@@ -180,6 +197,26 @@ export class StdioMcpClient implements McpClient {
     return toToolResult(result);
   }
 
+
+  async listResources(): Promise<McpResource[]> {
+    const result = (await this.request("resources/list", {})) as { resources?: McpResource[] };
+    return Array.isArray(result?.resources) ? result.resources : [];
+  }
+
+  async readResource(uri: string): Promise<string> {
+    const result = (await this.request("resources/read", { uri }, 60_000)) as {
+      contents?: { text?: string; uri?: string }[];
+    };
+    return (result?.contents ?? [])
+      .map((entry) => entry.text ?? "")
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  async listPrompts(): Promise<McpPrompt[]> {
+    const result = (await this.request("prompts/list", {})) as { prompts?: McpPrompt[] };
+    return Array.isArray(result?.prompts) ? result.prompts : [];
+  }
   dispose(): void {
     this.closed = true;
     try {
@@ -310,6 +347,26 @@ export class HttpMcpClient implements McpClient {
     return toToolResult(result);
   }
 
+
+  async listResources(): Promise<McpResource[]> {
+    const result = (await this.request("resources/list", {})) as { resources?: McpResource[] };
+    return Array.isArray(result?.resources) ? result.resources : [];
+  }
+
+  async readResource(uri: string): Promise<string> {
+    const result = (await this.request("resources/read", { uri }, 60_000)) as {
+      contents?: { text?: string; uri?: string }[];
+    };
+    return (result?.contents ?? [])
+      .map((entry) => entry.text ?? "")
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  async listPrompts(): Promise<McpPrompt[]> {
+    const result = (await this.request("prompts/list", {})) as { prompts?: McpPrompt[] };
+    return Array.isArray(result?.prompts) ? result.prompts : [];
+  }
   dispose(): void {
     /* nothing to close; the server owns the session */
   }
@@ -354,6 +411,10 @@ export interface LoadedMcp {
   clients: McpClient[];
   tools: Tool[];
   errors: string[];
+  /** Prompts advertised by servers, exposed as slash commands by the host. */
+  prompts: { server: string; prompt: McpPrompt }[];
+  /** Resources advertised by servers, readable through mcp_read_resource. */
+  resources: { server: string; resource: McpResource }[];
 }
 
 /**
@@ -365,6 +426,8 @@ export async function loadMcpTools(cwd: string, timeoutMs = 15_000): Promise<Loa
   const clients: McpClient[] = [];
   const tools: Tool[] = [];
   const errors: string[] = [];
+  const prompts: { server: string; prompt: McpPrompt }[] = [];
+  const resources: { server: string; resource: McpResource }[] = [];
 
   await Promise.all(
     Object.entries(configs).map(async ([name, config]) => {
@@ -380,6 +443,26 @@ export async function loadMcpTools(cwd: string, timeoutMs = 15_000): Promise<Loa
         await withTimeout(client.initialize(), timeoutMs, `MCP server "${name}" did not initialize`);
         const listed = await withTimeout(client.listTools(), timeoutMs, `MCP server "${name}" did not list tools`);
         clients.push(client);
+        // Resources and prompts are optional; a server that does not implement
+        // them answers with an error, which must not fail the whole server.
+        if (client.listResources) {
+          try {
+            for (const resource of await client.listResources()) {
+              if (resource?.uri) resources.push({ server: name, resource });
+            }
+          } catch {
+            /* server has no resources */
+          }
+        }
+        if (client.listPrompts) {
+          try {
+            for (const prompt of await client.listPrompts()) {
+              if (prompt?.name) prompts.push({ server: name, prompt });
+            }
+          } catch {
+            /* server has no prompts */
+          }
+        }
         for (const entry of listed) {
           if (!entry?.name) continue;
           const toolName = `mcp__${name}__${entry.name}`;
@@ -404,7 +487,51 @@ export async function loadMcpTools(cwd: string, timeoutMs = 15_000): Promise<Loa
     }),
   );
 
-  return { clients, tools, errors };
+  if (resources.length > 0) tools.push(resourceTool(clients, resources));
+  return { clients, tools, errors, prompts, resources };
+}
+
+/**
+ * One read-only tool for every advertised resource. Listing them as a single
+ * tool keeps the tool schema small while still letting the model open a
+ * document the server offered.
+ */
+function resourceTool(
+  clients: McpClient[],
+  resources: { server: string; resource: McpResource }[],
+): Tool {
+  const catalogue = resources
+    .slice(0, 60)
+    .map((entry) => `${entry.resource.uri} — ${entry.resource.name ?? entry.resource.description ?? entry.server}`)
+    .join("\n");
+  return {
+    name: "mcp_read_resource",
+    description: `Read a resource exposed by an MCP server. Available resources:\n${catalogue}`,
+    readonly: true,
+    parameters: {
+      type: "object",
+      properties: {
+        uri: { type: "string", description: "The resource URI, exactly as listed" },
+      },
+      required: ["uri"],
+      additionalProperties: false,
+    },
+    summarize: (input) => String(input.uri ?? "").slice(0, 120),
+    async execute(input) {
+      const uri = String(input.uri ?? "");
+      const entry = resources.find((candidate) => candidate.resource.uri === uri);
+      if (!entry) return { isError: true, content: `no MCP resource with uri ${uri}` };
+      const index = resources.indexOf(entry);
+      const client = clients[index];
+      if (!client?.readResource) return { isError: true, content: `${entry.server} cannot read resources` };
+      try {
+        const text = await client.readResource(uri);
+        return { content: text || "(empty resource)" };
+      } catch (err) {
+        return { isError: true, content: `could not read ${uri}: ${(err as Error).message}` };
+      }
+    },
+  };
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
