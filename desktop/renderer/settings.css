@@ -1104,3 +1104,9 @@
 .pack-offline .setting-note {
   margin-bottom: 8px;
 }
+
+.pack-housekeeping {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+}

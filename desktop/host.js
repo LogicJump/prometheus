@@ -44,7 +44,7 @@ import {
 } from "../src/settingsFiles.ts";
 import { readMemorySections, deleteMemory } from "../src/memory.ts";
 import { installFromManifest, installPack } from "../src/packs/install.ts";
-import { listPacks, packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
+import { packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
 import { catalogFor, isInstallable, toInstallEntry } from "../src/packs/catalog.ts";
 import { resetToolchainCache } from "../src/embedded/toolchain.ts";
 import { TerminalSession } from "./terminal.js";

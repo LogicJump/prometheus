@@ -1167,8 +1167,21 @@ function buildInstructionsPage() {
  * 进度是确定的（显示百分比和阶段），因为下载 289 MB 时一个转圈什么都说明
  * 不了；到底是在下载、校验、解压还是验证，决定了用户要不要等。
  */
-function buildToolsPage() {
-  const s = S();
+/** Byte size for the toolchain page, at the module level so event handlers
+ *  outside the page builder can use it too. */
+function formatPackBytes(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value.toFixed(unit >= 3 ? 2 : 1)} ${units[unit]}`;
+}
+
+function buildToolsPage() {  const s = S();
   const pane = sPage(s.pageTools, s.pageToolsDesc);
   // 顺序即优先级：根目录与占用在第一行，进度条其次，包列表最后。
   const summary = el("div", "pack-summary");
@@ -1177,17 +1190,7 @@ function buildToolsPage() {
   const list = el("div", "pack-list");
   pane.appendChild(list);
 
-  const formatBytes = (bytes) => {
-    if (!bytes) return "0 B";
-    const units = ["B", "KB", "MB", "GB", "TB"];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit++;
-    }
-    return `${value.toFixed(unit >= 3 ? 2 : 1)} ${units[unit]}`;
-  };
+  const formatBytes = formatPackBytes;
 
   const render = () => {
     const packs = state.packState;
@@ -1227,6 +1230,13 @@ function buildToolsPage() {
       empty.appendChild(el("h3", "", s.packEmptyTitle));
       empty.appendChild(el("p", "", s.packEmptyBody));
       list.appendChild(empty);
+    } else {
+      // 清理只删「本应用创建且已经过期」的目录：中断留下的半截下载，
+      // 和删了一半的旧版本。它不会碰任何已安装的包，所以可以放在这里
+      // 让用户随时点，而不必等启动时那一次自动清理。
+      const tools = el("div", "pack-housekeeping");
+      tools.appendChild(sButton(s.packPrune, () => api.send({ cmd: "prunePacks" }), { quiet: true }));
+      list.appendChild(tools);
     }
 
     for (const pack of packs.packs) {
@@ -1746,6 +1756,12 @@ function basename(path) {
         state.renderPackPage?.();
         break;
       case "pack_pruned":
+        // 没删到东西也是结果，也要说；否则用户分不清"已经干净了"和
+        // "按钮坏了"。
+        state.packNotice =
+          message.removed > 0
+            ? S().packPrunedSome.replace("{n}", String(message.removed)).replace("{size}", formatPackBytes(message.bytes))
+            : S().packPrunedNone;
         api.send({ cmd: "getPacks" });
         break;
       default:
