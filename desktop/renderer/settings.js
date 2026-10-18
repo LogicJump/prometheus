@@ -31,6 +31,8 @@ state.memory = { global: [], project: [] };
 state.systemState = null;
 state.packState = null;
 state.packProgress = null;
+/** The pack id whose Remove button is awaiting its second click. */
+state.packRemoveArmed = null;
 state.settingsQuery = "";
 
 const S = () => settingsStrings[state.locale] ?? settingsStrings.en;
@@ -1247,31 +1249,42 @@ function buildToolsPage() {
       actions.appendChild(sButton(s.packVerify, () => api.send({ cmd: "verifyPack", id: pack.manifest.id }), { quiet: true }));
 
       // 删除要两次点击：一个 pack 是一 GB，误删的代价是重新下载十分钟。
-      let armed = false;
+      // 确认状态放在 `state` 上而不是闭包里 —— `render()` 会重建整个列表，
+      // 闭包里的 armed 会跟着旧按钮一起消失，用户第二次点的是新按钮，
+      // 于是永远要求"再点一次"。
       const remove = sButton(s.packRemove, () => {
-        if (!armed) {
-          armed = true;
-          remove.textContent = s.packRemoveConfirm;
-          remove.classList.add("danger");
+        if (state.packRemoveArmed !== pack.manifest.id) {
+          state.packRemoveArmed = pack.manifest.id;
+          render();
           setTimeout(() => {
-            armed = false;
-            remove.textContent = s.packRemove;
+            if (state.packRemoveArmed === pack.manifest.id) {
+              state.packRemoveArmed = null;
+              render();
+            }
           }, 4000);
           return;
         }
+        state.packRemoveArmed = null;
         api.send({ cmd: "removePack", id: pack.manifest.id });
       }, { quiet: true, danger: true });
+      if (state.packRemoveArmed === pack.manifest.id) {
+        remove.textContent = s.packRemoveConfirm;
+        remove.classList.add("danger");
+      }
       actions.appendChild(remove);
 
       row.append(main, actions);
       list.appendChild(row);
     }
 
-    // 可安装的条目
-    if (state.packCatalog?.length) {
+    // 可安装的条目。已经装过的那个不再列出来 —— 同一份东西出现在
+    // "已安装"和"可安装"两处，用户只会读成"还能再装一次"。
+    const installedIds = new Set((packs.packs ?? []).map((pack) => pack.manifest.id));
+    const available = (state.packCatalog ?? []).filter((entry) => !installedIds.has(entry.id));
+    if (available.length) {
       const group = el("section", "setting-group");
       group.appendChild(el("h3", "setting-group-title", s.packAvailable));
-      for (const entry of state.packCatalog) {
+      for (const entry of available) {
         const row = el("div", "pack-row pack-available");
         const main = el("div", "pack-main");
         const title = el("div", "pack-title");
