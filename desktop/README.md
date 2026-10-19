@@ -7,7 +7,7 @@ speaks newline-delimited JSON over stdio, and renders the event stream.
 ```
 desktop/main.js        Electron main process: window, IPC, host process lifecycle
 desktop/host.js        Agent host: owns one Agent, handles commands, emits events
-desktop/terminal.js    Persistent shell behind the terminal pane
+desktop/terminal.js    Persistent shell behind the terminal pane (a command runner, not a PTY)
 desktop/git.js         Git status and commits for the Changes pane
 desktop/preload.cjs    The renderer's only bridge to the main process
 desktop/renderer/      UI: index.html, app.js, styles.css (no framework, no build)

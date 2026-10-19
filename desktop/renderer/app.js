@@ -62,6 +62,9 @@ const state = {
   providers: [],
   sessionId: "",
   sessions: [],
+  /** How many sessions exist and how many are loaded; see the "show more" row. */
+  sessionsTotal: 0,
+  sessionsLimit: 80,
   locale: savedLocale === "zh" || savedLocale === "en" ? savedLocale : detectLocale(),
   theme: savedTheme || "dark",
   density: savedDensity === "compact" || savedDensity === "detailed" ? savedDensity : "balanced",
@@ -1297,6 +1300,7 @@ function handleEvent(message) {
     case "skills":
     case "memory":
     case "instructions":
+    case "hook_status":
     case "packs":
     case "pack_catalog":
     case "pack_progress":
@@ -1429,6 +1433,7 @@ function handleEvent(message) {
     case "permission_request":
       state.pendingPermissionId = message.id;
       pendingQuestion.textContent = message.question;
+      renderPendingDiff(message.detail);
       $("pending-choices").hidden = true;
       $("pending-choices").innerHTML = "";
       pendingPermission.querySelectorAll("[data-permission]").forEach((button) => (button.hidden = false));
@@ -1440,6 +1445,12 @@ function handleEvent(message) {
     case "notice":
       addNotice(message.level, message.text);
       scrollToBottom();
+      break;
+
+    case "open_external":
+      // The host asks for a browser, usually for an OAuth consent page; only
+      // the renderer can reach the shell.
+      if (message.url) api.openExternal(message.url);
       break;
 
     case "compacted":
@@ -1532,6 +1543,17 @@ function handleEvent(message) {
 
     case "session_loaded": {
       const target = scrollTarget();
+      // Reopening a conversation restores the settings it was working with.
+      // Without this a plan-mode investigation came back in auto mode, and the
+      // next message ran under a different permission model than the one the
+      // user was reading.
+      if (message.mode && message.mode !== state.mode) {
+        state.mode = message.mode;
+        setMode(state.mode);
+      }
+      if (message.effort && message.effort !== state.effort) {
+        setEffort(message.effort);
+      }
       target
         .querySelectorAll(".turn, .tool-row, .tool-group, .tool-item, .tool-output, .notice, .plan, .thinking, .subagent, .compact-marker")
         .forEach((node) => node.remove());
@@ -1600,6 +1622,11 @@ function handleEvent(message) {
       break;
 
     case "sessions":
+      // The host pages the list; remember how many exist so the "show more"
+      // row can disappear once everything is loaded. Search covers what was
+      // loaded, and loading more is how a user reaches an old conversation.
+      state.sessionsTotal = Number(message.total) || (message.sessions || []).length;
+      state.sessionsLimit = Number(message.limit) || (message.sessions || []).length;
       renderSessions(message.sessions);
       break;
 
@@ -3045,6 +3072,19 @@ function renderSessions(sessions) {
       sessionList.appendChild(button);
     }
   }
+
+  // Older conversations are reachable instead of silently missing. The host
+  // used to cap the list at 80 with no way past it, so search only ever saw
+  // the newest 80 and an old session could not be opened at all.
+  if (!query && state.sessionsTotal > state.sessions.length) {
+    const more = document.createElement("button");
+    more.className = "sidebar-more";
+    more.textContent = t.loadMoreSessions.replace("{n}", String(state.sessionsTotal - state.sessions.length));
+    more.addEventListener("click", () => {
+      api.send({ cmd: "listSessions", includeArchived: state.showArchived, limit: state.sessionsLimit + 200 });
+    });
+    sessionList.appendChild(more);
+  }
 }
 
 let sessionMenu = null;
@@ -3620,8 +3660,73 @@ transcript.addEventListener("scroll", updateScrollButton);
 transcriptScroll.addEventListener("scroll", updateScrollButton);
 $("scroll-bottom").addEventListener("click", () => scrollToBottom(true));
 
-function answerPermission(answer) {
-  if (state.pendingPermissionId == null) return;
+/**
+ * The change a permission prompt is about.
+ *
+ * Approving `edit_file: src/app.ts` while seeing only the path is a rubber
+ * stamp. The host sends the before/after it computed from the same matching
+ * the edit will run, and this renders the changed lines with a little context,
+ * capped so the question and its buttons stay visible.
+ */
+function renderPendingDiff(detail) {
+  const box = $("pending-diff");
+  box.innerHTML = "";
+  if (!detail || typeof detail !== "object") {
+    box.hidden = true;
+    return;
+  }
+  const older = String(detail.before ?? "").split("\n");
+  const newer = String(detail.after ?? "").split("\n");
+  const olderSet = new Set(older);
+  const newerSet = new Set(newer);
+  const rows = [];
+  let i = 0;
+  let j = 0;
+  // Leading context: the last unchanged lines before the first change, so the
+  // hunk has somewhere to sit.
+  const contextBefore = [];
+  while (i < older.length && j < newer.length && older[i] === newer[j]) {
+    contextBefore.push(older[i]);
+    i++;
+    j++;
+  }
+  for (const line of contextBefore.slice(-3)) rows.push({ kind: "context", text: line });
+  while ((i < older.length || j < newer.length) && rows.length < 40) {
+    if (i < older.length && j < newer.length && older[i] === newer[j]) {
+      rows.push({ kind: "context", text: older[i] });
+      i++;
+      j++;
+      continue;
+    }
+    if (i < older.length && !newerSet.has(older[i])) {
+      rows.push({ kind: "del", text: older[i] });
+      i++;
+      continue;
+    }
+    if (j < newer.length && !olderSet.has(newer[j])) {
+      rows.push({ kind: "add", text: newer[j] });
+      j++;
+      continue;
+    }
+    i++;
+    j++;
+  }
+  for (const row of rows) {
+    const node = document.createElement("div");
+    node.className = `pending-diff-line ${row.kind}`;
+    node.textContent = `${row.kind === "add" ? "+" : row.kind === "del" ? "−" : " "} ${row.text}`;
+    box.appendChild(node);
+  }
+  if (i < older.length || j < newer.length) {
+    const more = document.createElement("div");
+    more.className = "pending-diff-more";
+    more.textContent = `+${detail.additions} −${detail.deletions} · ${detail.path}`;
+    box.appendChild(more);
+  }
+  box.hidden = rows.length === 0;
+}
+
+function answerPermission(answer) {  if (state.pendingPermissionId == null) return;
   api.send({ cmd: "permission", id: state.pendingPermissionId, answer });
   state.pendingPermissionId = null;
   pendingPermission.hidden = true;
@@ -3879,7 +3984,7 @@ function openShortcuts() {
     [t.shortcutModeAsk, `${mod}+1`],
     [t.shortcutModeAuto, `${mod}+2`],
     [t.shortcutModePlan, `${mod}+3`],
-    [t.shortcutEffort, `${mod}+Shift+E`],
+    [t.shortcutEffort, `${mod}+E`],
   ];
   const grid = $("shortcut-grid");
   grid.innerHTML = "";

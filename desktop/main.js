@@ -275,7 +275,37 @@ function startWindow() {
   return { win, sendToHost };
 }
 
+/**
+ * One app instance per user.
+ *
+ * Two windows are supported — each runs its own agent host — but two *launches*
+ * are not: the second would load a second copy of the tray icon, the global
+ * shortcut, the update check and the workspace-last-used file, and the two
+ * copies overwrite each other's `workspace.json`. A second launch brings the
+ * first instance's window forward instead.
+ *
+ * The single-window/single-session rule lives in the session lock
+ * (`src/sessionLock.ts`): a window cannot open a session another window has,
+ * so even within one instance two windows never write one transcript.
+ */
+if (!app.requestSingleInstanceLock()) {
+  // This launch loses the race: the instance that owns the lock already has
+  // the window. Quit without ever reaching whenReady.
+  app.exit(0);
+}
+
+app.on("second-instance", () => {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (!win) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+});
+
 app.whenReady().then(() => {
+  // The second launch holds no lock and has already quit; whenReady still
+  // resolves, so do nothing here rather than creating a window it cannot own.
+  if (!app.hasSingleInstanceLock()) return;
   const debugLog = (line) => {
     if (!process.env.PROMETHEUS_DEBUG_ARGV) return;
     try {

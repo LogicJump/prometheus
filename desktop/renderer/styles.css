@@ -25,7 +25,7 @@
   /* type */
   --text: #e6e9ef;
   --text-secondary: #9aa3b2;
-  --text-faint: #6b7484;
+  --text-faint: #7d8797;
 
   /* one accent, one warning, one failure */
   --accent: #4c9df0;
@@ -82,7 +82,7 @@
   --border-strong: #cdd4de;
   --text: #171b21;
   --text-secondary: #5b6472;
-  --text-faint: #8b95a4;
+  --text-faint: #66707e;
   --accent: #1f6feb;
   --accent-hover: #1858bd;
   --accent-soft: rgba(31, 111, 235, 0.1);
@@ -1070,6 +1070,32 @@ svg {
   padding: 8px;
   font-size: var(--text-sm);
   color: var(--text-faint);
+}
+
+/* Same rhythm as a session row, but it is an action rather than a place. */
+.sidebar-more {
+  width: 100%;
+  margin: 4px 0 2px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
+}
+
+.sidebar-more:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.sidebar-more:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .sidebar-foot {
@@ -2082,7 +2108,7 @@ mark.find-hit.current {
   border-radius: var(--radius);
   padding: 12px 14px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 16px;
   animation: slide-up 180ms ease-out;
 }
@@ -2094,12 +2120,59 @@ mark.find-hit.current {
   }
 }
 
+.pending-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .pending-question {
   flex: 1;
   font-family: var(--mono);
   font-size: var(--text-sm);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* The change an approval is about. Same governed lines as the diff pane,
+   capped so the question and its buttons stay on screen. */
+.pending-diff {
+  max-height: 190px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
+.pending-diff-line {
+  padding: 0 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pending-diff-line.add {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.pending-diff-line.del {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.pending-diff-line.context {
+  color: var(--text-faint);
+}
+
+.pending-diff-more {
+  padding: 2px 8px;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
 }
 
 .pending-actions {

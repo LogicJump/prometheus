@@ -345,6 +345,23 @@
   font-size: var(--text-sm);
 }
 
+/* Semantic variants: the badge already states a fact, so its colour has to
+   agree with it. Without these every state read as "active". */
+.setting-badge.ok {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.setting-badge.warn {
+  background: var(--danger-soft);
+  color: var(--warn);
+}
+
+.setting-badge.muted {
+  background: var(--surface-hover);
+  color: var(--text-faint);
+}
+
 .setting-switch {
   position: relative;
   width: 36px;

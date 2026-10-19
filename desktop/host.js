@@ -22,6 +22,7 @@ import { Agent } from "../src/agent.ts";
 import { Permissions } from "../src/permissions.ts";
 import { ALL_TOOLS } from "../src/tools/index.ts";
 import { listSessions, loadSession, newSessionId, saveSession, updateSessionFlags, deleteSessionFile } from "../src/sessions.ts";
+import { acquireSessionLock, releaseSessionLock, lockConflictMessage, sessionLockHolder, removeSessionLockFile } from "../src/sessionLock.ts";
 import { compactForce } from "../src/context.ts";
 import { discoverModels, FALLBACK_MODELS } from "../src/models.ts";
 import { detectLocale, isLocale } from "../src/i18n.ts";
@@ -49,6 +50,7 @@ import { catalogFor, isInstallable, toInstallEntry } from "../src/packs/catalog.
 import { runGoal, runTaskLoop } from "../src/autoloop.ts";
 import { detectToolchains, resetToolchainCache, TOOLCHAIN_INFO } from "../src/embedded/toolchain.ts";
 import { detectProject } from "../src/embedded/project.ts";
+import { hooksStatus, trustProjectHooks, revokeProjectHooks } from "../src/hooks.ts";
 import { listProbes, listTargets } from "../src/embedded/probe.ts";
 import { listSerialPorts, openPort } from "../src/embedded/serial.ts";
 import { SerialLineBuffer } from "../src/embedded/serialStream.ts";
@@ -56,7 +58,8 @@ import { assembleBoardState, boardTargetStatus } from "../src/embedded/board.ts"
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
-import { loadMcpTools } from "../src/mcp.ts";
+import { loadMcpTools, refreshServerTools, elicitationQuestions } from "../src/mcp.ts";
+import { interactiveAuthorize } from "../src/oauth.ts";
 import { sessionToMarkdown, exportFilename, markRunActive, clearRunActive, findInterruptedRun } from "../src/export.ts";
 import { createWorktree, commitWorktree, worktreeDiff, mergeWorktree, removeWorktree } from "../src/worktree.ts";
 import { artifactCandidates, collectArtifacts, readArtifact } from "../src/artifacts.ts";
@@ -91,6 +94,8 @@ let running = false;
 let terminal = null;
 /** MCP servers started for the current workspace. */
 let mcpClients = [];
+/** Server name → client, so a prompt or resource is asked of its owner. */
+let mcpByServer = new Map();
 /** Set when this session runs in an isolated worktree. */
 let worktree = null;
 /** The workspace the session started from, before switching into a worktree. */
@@ -122,7 +127,12 @@ function applyModelContext(id) {
   const entry = catalog.models.find((model) => model.id === id);
   if (!entry || !Number.isFinite(entry.contextLength) || entry.contextLength <= 0) return;
   config.contextWindow = entry.contextLength;
-  if (agent) agent.config.contextWindow = entry.contextLength;
+  // The value came from the endpoint, not from a guess.
+  config.contextWindowAssumed = false;
+  if (agent) {
+    agent.config.contextWindow = entry.contextLength;
+    agent.config.contextWindowAssumed = false;
+  }
 }
 
 /**
@@ -175,6 +185,7 @@ function makeClient() {
     model: config.model,
     maxTokens: config.maxTokens,
     reasoningEffort: config.thinkingEffort,
+    echoReasoning: Boolean(config.echoReasoning),
     timeoutMs: 300_000,
   });
   const ids = Array.isArray(config.fallbackModels) ? config.fallbackModels : [];
@@ -360,10 +371,28 @@ class HostUi {
   spinnerStop() {
     this.spinner = null;
   }
-  async confirm(question) {
+  async confirm(question, detail) {
     const id = ++permissionSeq;
+    // Acceptance harness only: answer permission prompts from a script so a
+    // headless run can exercise the approval path without a person clicking.
+    const scripted = process.env.PROMETHEUS_ANSWER_PERMISSION;
+    if (scripted && ["yes", "always", "no"].includes(scripted)) {
+      send({ type: "permission_request", id, question, ...(detail ? { detail } : {}), answered: scripted });
+      setTimeout(() => {
+        const resolve = pendingPermissions.get(id);
+        if (resolve) {
+          pendingPermissions.delete(id);
+          resolve(scripted);
+        }
+      }, Number(process.env.PROMETHEUS_ANSWER_DELAY_MS ?? 2500));
+      const answer = await new Promise((resolve) => pendingPermissions.set(id, resolve));
+      setSessionStatus("working");
+      return answer;
+    }
     setSessionStatus("needs-input");
-    send({ type: "permission_request", id, question });
+    // The diff travels with the question so the bar can show the change the
+    // approval is about, not just the file name.
+    send({ type: "permission_request", id, question, ...(detail ? { detail } : {}) });
     const answer = await new Promise((resolve) => pendingPermissions.set(id, resolve));
     setSessionStatus("working");
     return answer;
@@ -433,27 +462,78 @@ function availableCommands() {
 }
 
 /** Expand a slash command typed in the composer, MCP prompts included. */
-function expandAnySlash(text) {
+async function expandAnySlash(text) {
   const expanded = expandSlash(cwd, text);
   if (expanded) return expanded;
   const match = /^\/([a-z0-9][a-z0-9-_]*)\s*([\s\S]*)$/i.exec(text.trim());
   if (!match) return null;
   const entry = mcpPrompts.find(({ prompt }) => prompt.name === match[1]);
   if (!entry) return null;
-  return { command: { name: entry.prompt.name }, prompt: mcpPromptText(entry, match[2]) };
+  return { command: { name: entry.prompt.name }, prompt: await mcpPromptText(entry, match[2]) };
 }
 
-/** MCP prompts take named arguments; the typed tail fills them in order. */
-function mcpPromptText(entry, tail) {
+/**
+ * Expand an MCP prompt by asking the server for it.
+ *
+ * The old code never sent `prompts/get`: it built a sentence saying "use the
+ * MCP prompt X", so a prompt whose body is a review checklist arrived as its
+ * own name. The template remains the fallback for a server that lists prompts
+ * but cannot serve one, because a failed expansion must not swallow the
+ * message.
+ */
+async function mcpPromptText(entry, tail) {
   const args = entry.prompt.arguments ?? [];
   const values = tail.trim() ? tail.trim().split(/\s+/) : [];
+  const filled = {};
+  args.forEach((arg, index) => {
+    filled[arg.name] = values[index] ?? "";
+  });
+  const client = mcpByServer.get(entry.server) ?? null;
+  if (client?.getPrompt) {
+    try {
+      const result = await client.getPrompt(entry.prompt.name, filled);
+      const text = promptMessagesToText(result.messages);
+      if (text) return text;
+    } catch (err) {
+      send({ type: "notice", level: "dim", text: `MCP: ${entry.server} could not serve prompt ${entry.prompt.name}: ${err.message}` });
+    }
+  }
   if (args.length === 0) {
     return tail.trim()
       ? `Use the MCP prompt "${entry.prompt.name}" from ${entry.server}. Additional input: ${tail.trim()}`
       : `Use the MCP prompt "${entry.prompt.name}" from ${entry.server}.`;
   }
-  const filled = args.map((arg, index) => `${arg.name}: ${values[index] ?? ""}`).join("\n");
-  return `Use the MCP prompt "${entry.prompt.name}" from ${entry.server} with these arguments:\n${filled}`;
+  const rendered = args.map((arg, index) => `${arg.name}: ${values[index] ?? ""}`).join("\n");
+  return `Use the MCP prompt "${entry.prompt.name}" from ${entry.server} with these arguments:\n${rendered}`;
+}
+
+/** Flatten `prompts/get` messages into the single string the composer sends. */
+function promptMessagesToText(messages) {
+  return (messages ?? [])
+    .map((message) => {
+      const content = message?.content;
+      if (typeof content === "string") return content;
+      if (content?.type === "text" && typeof content.text === "string") return content.text;
+      if (content?.type === "resource" && typeof content.resource?.text === "string") return content.resource.text;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/**
+ * Send the session list.
+ *
+ * The sidebar used to be capped at 80 with no way past it, so old sessions
+ * were not merely below the fold — they were unreachable, and search only saw
+ * those 80. The cap is now a page size the renderer can raise; `total` says how
+ * many exist so the "show more" row knows when to disappear.
+ */
+const SESSION_PAGE = 80;
+function sendSessions(options = {}) {
+  const all = listSessions(false, Boolean(options.includeArchived));
+  const limit = Math.max(SESSION_PAGE, Math.min(5000, Number(options.limit) || SESSION_PAGE));
+  send({ type: "sessions", sessions: all.slice(0, limit), total: all.length, limit });
 }
 
 function sessionRecord() {
@@ -477,6 +557,13 @@ function sessionRecord() {
     pinned: existing?.pinned,
     archived: existing?.archived,
     status: sessionStatus,
+    // The settings the conversation ran with, so reopening it restores the
+    // mode and effort the user was actually working in.
+    mode: config.permissionMode,
+    effort: config.thinkingEffort,
+    sandbox: config.sandbox ?? "enforce",
+    networkPolicy: config.networkPolicy ?? "off",
+    board: config.board,
   };
 }
 
@@ -494,7 +581,7 @@ function setSessionStatus(next) {
     /* status is cosmetic; never block a turn on it */
   }
   send({ type: "session_status", sessionId, status: next });
-  send({ type: "sessions", sessions: listSessions(false).slice(0, 80) });
+  sendSessions();
 }
 
 function persist() {
@@ -814,20 +901,66 @@ function serialError(message) {
  * Start the configured MCP servers and give their tools to the agent. Failures
  * are reported as notices: one broken server must not block the session.
  */
+/**
+ * Run the browser authorization flow for a remote MCP server.
+ *
+ * The host cannot open a browser itself (it is a plain Node process beside the
+ * window), so it asks the renderer to do it and waits for the loopback
+ * redirect. When the user is not there — a headless run, or a window that never
+ * answered — the flow is abandoned rather than left pending.
+ */
+async function authorizeMcpServer(options) {
+  if (!ui || ui.canPrompt === false) return null;
+  send({
+    type: "notice",
+    level: "info",
+    text: `MCP: ${options.server} requires authorization; a browser window will open`,
+  });
+  return interactiveAuthorize({
+    server: options.server,
+    resourceUrl: options.resourceUrl,
+    metadata: options.metadata,
+    scope: options.scope,
+    open: (url) => send({ type: "open_external", url }),
+    log: (line) => send({ type: "notice", level: "dim", text: line }),
+  });
+}
+
 async function startMcp() {
   for (const client of mcpClients) client.dispose();
   mcpClients = [];
+  mcpByServer = new Map();
   let loaded;
   try {
-    loaded = await loadMcpTools(cwd);
+    loaded = await loadMcpTools(cwd, 15_000, askElicitation, authorizeMcpServer);
   } catch (err) {
     send({ type: "notice", level: "warn", text: `MCP: ${err.message}` });
     return;
   }
   mcpClients = loaded.clients;
+  mcpByServer = loaded.byServer;
   // MCP prompts become slash commands; a project's own command with the same
   // name wins, so this list is only the servers' contribution.
   mcpPrompts = loaded.prompts;
+  // A server that adds or removes a tool announces it instead of waiting for a
+  // restart. Re-list that one server and replace its tools in place; the other
+  // servers' tools are untouched.
+  loaded.onRefresh = (server, kind) => {
+    if (kind !== "tools") {
+      // Resources and prompts are re-read on the next session; the transcript
+      // only needs to know the list moved.
+      send({ type: "notice", level: "dim", text: `MCP: ${server} announced a ${kind} change` });
+      return;
+    }
+    const client = loaded.byServer.get(server);
+    if (!client || !agent) return;
+    void refreshServerTools(server, client)
+      .then((tools) => {
+        agent.replaceToolsByPrefix(`mcp__${server}__`, tools);
+        send({ type: "notice", level: "dim", text: `MCP: ${server} now has ${tools.length} tool(s)` });
+      })
+      .catch((err) => send({ type: "notice", level: "warn", text: `MCP: could not refresh ${server}: ${err.message}` }));
+  };
   if (loaded.tools.length > 0) {
     agent?.addTools(loaded.tools);
     send({ type: "notice", level: "dim", text: `MCP: ${loaded.tools.length} tool(s) loaded` });
@@ -836,6 +969,38 @@ async function startMcp() {
     send({ type: "notice", level: "dim", text: `MCP: ${loaded.prompts.length} prompt(s) available as commands` });
   }
   for (const error of loaded.errors) send({ type: "notice", level: "warn", text: `MCP: ${error}` });
+}
+
+/**
+ * Answer a server's `elicitation/create`.
+ *
+ * The protocol exists so a tool can ask a question mid-call ("which branch?",
+ * "the target directory does not exist — create it?"). It is answered through
+ * the same composer prompt the permission bar uses, so the question appears
+ * where the user already answers things. A run with nobody behind it declines:
+ * accepting on the user's behalf would be exactly the wrong default.
+ */
+async function askElicitation(server, request) {
+  const questions = elicitationQuestions(request ?? { message: "" });
+  if (!ui || ui.canPrompt === false) return { action: "decline" };
+  const message = String(request?.message ?? "").trim() || `${server} is asking for input`;
+  if (questions.length === 0) {
+    const verdict = await ui.confirm(`${server}: ${message}`);
+    return verdict === "no" ? { action: "decline" } : { action: "accept", content: {} };
+  }
+  const content = {};
+  for (const question of questions) {
+    // A bounded set of choices maps onto the existing option prompt; a free
+    // field has no good terminal shape, so it is declined rather than faked.
+    if (!question.options || question.options.length === 0) {
+      send({ type: "notice", level: "warn", text: `MCP: ${server} asked for "${question.label}" as free text; answer it from the server's own UI` });
+      return { action: "decline" };
+    }
+    const chosen = await ui.ask?.(`${server}: ${message} — ${question.label}`, question.options.map((value) => ({ value, label: value })));
+    if (chosen === undefined || chosen === null || chosen === "") return { action: "decline" };
+    content[question.name] = chosen;
+  }
+  return { action: "accept", content };
 }
 
 function stopMcp() {
@@ -877,9 +1042,31 @@ function archiveInactive(days) {
     archived++;
   }
   if (archived > 0) {
-    send({ type: "sessions", sessions: listSessions(false, false).slice(0, 80) });
+    sendSessions();
     send({ type: "notice", level: "dim", text: `archived ${archived} inactive session(s)` });
   }
+}
+
+/**
+ * Flush the transcript during a running turn.
+ *
+ * The save used to happen only when the turn ended, so a crash, a kill, or a
+ * closed window lost the entire turn — the file's own comment promised "a
+ * crash loses at most the last line". A timer writes the append-only tail
+ * while the turn runs; `saveSession` appends only what is new, so the cost is
+ * proportional to the new messages, not the whole conversation.
+ */
+let midTurnTimer = null;
+function scheduleMidTurnPersist() {
+  if (midTurnTimer) return;
+  midTurnTimer = setTimeout(function tick() {
+    midTurnTimer = null;
+    if (running) {
+      persist();
+      midTurnTimer = setTimeout(tick, 5000);
+    }
+  }, 5000);
+  midTurnTimer.unref?.();
 }
 
 async function runPrompt(text, images) {
@@ -894,9 +1081,14 @@ async function runPrompt(text, images) {
   setSessionStatus("working");
   turnBaseline = new Map();
   const usageBefore = { ...agent.usage };
+  const usageBeforeBySource = {
+    subagent: { ...agent.usageBySource.subagent },
+    background: { ...agent.usageBySource.background },
+  };
   markRunActive({ sessionId, cwd, startedAt: new Date().toISOString() });
   send({ type: "queued", count: 0 });
   send({ type: "run_start" });
+  scheduleMidTurnPersist();
   let ok = true;
   try {
     if (Array.isArray(images) && images.length > 0) {
@@ -918,16 +1110,34 @@ async function runPrompt(text, images) {
     ui.assistantEnd();
     ui.thinkingEnd();
     persist();
+    if (midTurnTimer) {
+      clearTimeout(midTurnTimer);
+      midTurnTimer = null;
+    }
     // Persist this turn's spend before the next one starts, so the Usage page
     // has real history instead of a number that dies with the process.
     recordUsage({
       sessionId,
       cwd,
-      model: config.model,
+      model: agent.lastUsedModel || config.model,
       inputTokens: agent.usage.inputTokens - usageBefore.inputTokens,
       outputTokens: agent.usage.outputTokens - usageBefore.outputTokens,
       cachedTokens: agent.usage.cachedTokens - usageBefore.cachedTokens,
+      source: "main",
     });
+    // Sub-agents spend real money too. Recording only the total put the whole
+    // bill on the main loop, so `delegate` looked free instead of expensive.
+    for (const kind of ["subagent", "background"]) {
+      const spent = agent.usageBySource[kind];
+      const delta = {
+        inputTokens: spent.inputTokens - (usageBeforeBySource[kind]?.inputTokens ?? 0),
+        outputTokens: spent.outputTokens - (usageBeforeBySource[kind]?.outputTokens ?? 0),
+        cachedTokens: spent.cachedTokens - (usageBeforeBySource[kind]?.cachedTokens ?? 0),
+      };
+      if (delta.inputTokens !== 0 || delta.outputTokens !== 0) {
+        recordUsage({ sessionId, cwd, model: agent.lastUsedModel || config.model, ...delta, source: kind });
+      }
+    }
     send({
       type: "run_end",
       context: agent.contextUsage(),
@@ -1208,6 +1418,7 @@ async function handle(cmd) {
           fallbackModels: config?.fallbackModels ?? [],
           sandbox: config?.sandbox ?? "enforce",
           networkPolicy: config?.networkPolicy ?? "off",
+          echoReasoning: Boolean(config?.echoReasoning),
           rules: loadRules().map((rule) => ({
             id: rule.id,
             tool: rule.tool,
@@ -1216,7 +1427,7 @@ async function handle(cmd) {
             scope: rule.scope,
             cwd: rule.cwd ?? "",
           })),
-          contextWindow: config?.contextWindow ?? 1_000_000,
+          contextWindow: config?.contextWindow ?? 128_000,
           modelContext: config ? catalog.models.find((model) => model.id === config.model)?.contextLength ?? null : null,
           locale,
           theme: uiPrefs.theme ?? "dark",
@@ -1364,6 +1575,9 @@ async function handle(cmd) {
         const list = Array.isArray(patch.autoApprove) ? patch.autoApprove : String(patch.autoApprove).split(",");
         filePatch.autoApprove = list.map((name) => String(name).trim()).filter(Boolean);
       }
+      // Providers whose tool loop needs the previous reasoning echoed back.
+      // Off is the safe default: an unknown field on another gateway is a 400.
+      if (typeof patch.echoReasoning === "boolean") filePatch.echoReasoning = patch.echoReasoning;
       try {
         writeConfigFile(filePatch);
         const uiPatch = {};
@@ -1409,6 +1623,7 @@ async function handle(cmd) {
         agent.config.networkPolicy = config.networkPolicy;
         agent.config.thinkingEffort = config.thinkingEffort;
         agent.config.permissionMode = config.permissionMode;
+        agent.config.echoReasoning = config.echoReasoning;
         agent.refreshSystemPrompt();
         emitState();
         // Only a connection change invalidates the catalog; a slider or a
@@ -1423,7 +1638,7 @@ async function handle(cmd) {
     case "prompt": {
       // A known slash command expands into its prompt; anything else is sent
       // verbatim so a message starting with "/" is never swallowed.
-      const expanded = expandAnySlash(String(cmd.text ?? ""));
+      const expanded = await expandAnySlash(String(cmd.text ?? ""));
       if (!expanded) {
         void runPrompt(cmd.text, cmd.images);
         return;
@@ -1485,9 +1700,14 @@ async function handle(cmd) {
     }
     case "newSession": {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+      releaseSessionLock(sessionId);
       sessionId = newSessionId();
       sessionTitle = "";
       createAgent([]);
+      // The new session exists on disk only after the first persist; take its
+      // lock now so two windows cannot both create the same id.
+      const claimed = acquireSessionLock(sessionId, "desktop window");
+      if (!claimed.ok) send({ type: "notice", level: "warn", text: lockConflictMessage(sessionId, claimed.holder) });
       send({ type: "session_loaded", messages: [] });
       return;
     }
@@ -1496,6 +1716,14 @@ async function handle(cmd) {
       const session = loadSession(cmd.id);
       if (!session) {
         send({ type: "notice", level: "error", text: `session not found: ${cmd.id}` });
+        return;
+      }
+      // Two windows writing one JSONL interleave their appends and corrupt the
+      // message count; refuse the second writer instead of forking the
+      // conversation on disk.
+      const claim = acquireSessionLock(session.id, "desktop window");
+      if (!claim.ok) {
+        send({ type: "notice", level: "error", text: lockConflictMessage(session.id, claim.holder) });
         return;
       }
       if (session.cwd && existsSync(session.cwd) && session.cwd !== cwd) {
@@ -1508,11 +1736,27 @@ async function handle(cmd) {
           /* keep existing config */
         }
       }
+      releaseSessionLock(sessionId);
       sessionId = session.id;
       sessionTitle = session.title ?? "";
+      // Restore what the conversation was running with. A plan-mode session
+      // reopened in auto mode is a different agent, and a resumed conversation
+      // should not silently gain write access it never had.
+      if (session.mode) config.permissionMode = session.mode;
+      if (session.effort) {
+        config.thinkingEffort = session.effort;
+        if (client) client.options.reasoningEffort = session.effort;
+      }
       createAgent(session.messages);
       sessionCreatedAt = session.createdAt;
-      send({ type: "session_loaded", messages: publicMessages(session.messages), cwd });
+      send({
+        type: "session_loaded",
+        messages: publicMessages(session.messages),
+        cwd,
+        mode: config.permissionMode,
+        effort: config.thinkingEffort,
+      });
+      emitState();
       return;
     }
     case "forkSession": {
@@ -1526,6 +1770,7 @@ async function handle(cmd) {
         process.chdir(cwd);
         disposeTerminal();
       }
+      releaseSessionLock(sessionId);
       sessionId = newSessionId();
       sessionTitle = source.title ? `${source.title} (fork)` : "";
       sessionCreatedAt = new Date().toISOString();
@@ -1536,7 +1781,7 @@ async function handle(cmd) {
       return;
     }
     case "listSessions":
-      send({ type: "sessions", sessions: listSessions(false, Boolean(cmd.includeArchived)).slice(0, 80) });
+      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit });
       return;
     case "sessionFlags": {
       const updated = updateSessionFlags(String(cmd.id), {
@@ -1545,7 +1790,7 @@ async function handle(cmd) {
         archived: cmd.archived,
       });
       if (!updated) return send({ type: "notice", level: "error", text: `session not found: ${cmd.id}` });
-      send({ type: "sessions", sessions: listSessions(false, Boolean(cmd.includeArchived)).slice(0, 80) });
+      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit });
       if (updated.id === sessionId) {
         sessionTitle = updated.title ?? "";
         send({ type: "session_title", title: sessionTitle });
@@ -1556,8 +1801,16 @@ async function handle(cmd) {
       if (String(cmd.id) === sessionId) {
         return send({ type: "notice", level: "warn", text: "open another session before deleting the current one" });
       }
+      // Another window may have it open; deleting the files under a live
+      // writer leaves that window appending into a directory that no longer
+      // exists.
+      const holder = sessionLockHolder(String(cmd.id));
+      if (holder) {
+        return send({ type: "notice", level: "warn", text: lockConflictMessage(String(cmd.id), holder) });
+      }
+      removeSessionLockFile(String(cmd.id));
       const deleted = deleteSessionFile(String(cmd.id));
-      send({ type: "sessions", sessions: listSessions(false, Boolean(cmd.includeArchived)).slice(0, 80) });
+      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit });
       if (!deleted) send({ type: "notice", level: "error", text: `session not found: ${cmd.id}` });
       return;
     }
@@ -1638,6 +1891,7 @@ async function handle(cmd) {
       disposeSerial();
       disposeTerminal();
       stopMcp();
+      releaseSessionLock(sessionId);
       // Give the last writes a tick to reach stdout before the process goes away.
       setTimeout(() => process.exit(0), 30);
       return;
@@ -1746,8 +2000,23 @@ async function handle(cmd) {
     }
     case "compact": {
       const before = agent.contextUsage().tokens;
-      agent.messages = compactForce(agent.messages);
-      send({ type: "notice", level: "dim", text: `compacted: ~${before} -> ~${agent.contextUsage().tokens} tokens` });
+      try {
+        // The model writes the recap; the old call used the keyword summary,
+        // which made the explicit "compact well" command produce the worst
+        // recap of all the paths.
+        const result = await agent.compactNow({ ...(cmd.focus ? { focus: String(cmd.focus) } : {}) });
+        if (!result) {
+          send({ type: "notice", level: "dim", text: "nothing to compact" });
+        } else {
+          send({
+            type: "notice",
+            level: "dim",
+            text: `compacted (${result.level}): ~${before} -> ~${agent.contextUsage().tokens} tokens`,
+          });
+        }
+      } catch (error) {
+        send({ type: "notice", level: "warn", text: error instanceof Error ? error.message : String(error) });
+      }
       send({ type: "run_end", context: agent.contextUsage(), usage: agent.usage, todos: agent.todos.items, files: changedFiles() });
       return;
     }
@@ -1848,10 +2117,35 @@ async function handle(cmd) {
       send({ type: "export_ready", markdown, filename: exportFilename(sessionRecord()) });
       return;
     }
+    case "hookTrust": {
+      // A project hook is code the checkout supplies. The Settings page shows
+      // what it would run, and only this command records the decision.
+      const status = hooksStatus(cwd);
+      if (cmd.trust === true) {
+        if (!status.exists) return send({ type: "notice", level: "warn", text: "this workspace has no .prometheus/hooks.json" });
+        trustProjectHooks(cwd);
+        // The running agent loaded its hooks at construction; a fresh decision
+        // must apply now, not after a restart.
+        if (agent) agent.refreshHooks();
+      } else if (cmd.trust === false) {
+        revokeProjectHooks(cwd);
+        if (agent) agent.refreshHooks();
+      }
+      send({ type: "hook_status", ...hooksStatus(cwd) });
+      return;
+    }
+    case "getHooks":
+      send({ type: "hook_status", ...hooksStatus(cwd) });
+      return;
     case "worktreeStart": {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
       if (worktree) return send({ type: "notice", level: "dim", text: "this session is already isolated" });
       baseCwd = cwd;
+      // Entering a worktree moves the session, it does not restart it: the
+      // conversation is carried across so the user does not watch their
+      // history disappear and have to repeat themselves.
+      const carried = agent.messages;
+      const carriedTodos = [...agent.todos.items];
       const created = await createWorktree(cwd, sessionId, "HEAD", uiPrefs.branchPrefix || "prometheus/");
       if (!created.ok) {
         baseCwd = null;
@@ -1861,8 +2155,9 @@ async function handle(cmd) {
       cwd = worktree.path;
       process.chdir(cwd);
       disposeTerminal();
-      createAgent([]);
-      send({ type: "session_loaded", messages: [], cwd });
+      createAgent(carried);
+      agent.todos.items = carriedTodos;
+      send({ type: "session_loaded", messages: publicMessages(carried), cwd });
       send({ type: "notice", level: "info", text: `worktree: ${worktree.branch}` });
       void emitGitStatus();
       void startMcp();
@@ -1914,8 +2209,10 @@ async function handle(cmd) {
       return;
     }
     case "clearHistory": {
-      // /clear keeps the session but drops the conversation
-      agent.messages = agent.messages.slice(0, 1);
+      // /clear keeps the session but drops the conversation. The system
+      // prompt is not stored in messages any more (it is rendered per
+      // request), so there is nothing to preserve at index 0.
+      agent.messages = [];
       send({ type: "session_loaded", messages: [] });
       return;
     }
@@ -1932,7 +2229,12 @@ async function handle(cmd) {
         send({ type: "notice", level: "warn", text: "the agent is still working; wait for this turn to finish" });
         return;
       }
-      term.run(String(cmd.command ?? ""));
+      if (!term.run(String(cmd.command ?? ""))) {
+        // `run` refuses while a command is in flight or after the shell exited
+        // between the pane's last state and this keystroke. Saying so beats a
+        // silently swallowed command.
+        send({ type: "notice", level: "warn", text: "the terminal is busy; press Stop before running another command" });
+      }
       return;
     }
     case "terminalInterrupt":
@@ -2036,6 +2338,7 @@ process.stdin.on("end", () => {
   stopMcp();
   disposeTerminal();
   disposeSerial();
+  releaseSessionLock(sessionId);
   process.exit(0);
 });
 
@@ -2044,7 +2347,13 @@ process.on("uncaughtException", (err) => {
   // A crash must not orphan the PowerShell holding COM7: the next open would
   // fail with "access denied" and look like a hardware fault.
   disposeSerial();
+  releaseSessionLock(sessionId);
   process.exit(1);
 });
+
+// A clean exit through any other path (SIGINT from a debugger, app quit) also
+// gives the session back. A lock left by a killed process is detected as stale
+// on the next acquire, so this is a courtesy rather than the safety net.
+process.on("exit", () => releaseSessionLock(sessionId));
 
 send({ type: "hello" });

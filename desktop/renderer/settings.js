@@ -73,6 +73,7 @@ function settingsPages() {
     { id: "skills", group: s.groupCustomize, title: s.pageSkills, build: buildSkillsPage },
     { id: "memory", group: s.groupCustomize, title: s.pageMemory, build: buildMemoryPage },
     { id: "instructions", group: s.groupCustomize, title: s.pageInstructions, build: buildInstructionsPage },
+    { id: "hooks", group: s.groupCustomize, title: s.pageHooks, build: buildHooksPage },
     { id: "tools", group: s.groupComputer, title: s.pageTools, build: buildToolsPage },
     { id: "system", group: s.groupComputer, title: s.pageSystem, build: buildSystemPage },
     { id: "about", group: s.groupComputer, title: s.pageAbout, build: buildAboutPage },
@@ -88,11 +89,11 @@ function el(tag, className, text) {
   return node;
 }
 
-function sRow({ label, desc, control, id, wide = false }) {
+function sRow({ label, desc, control, id, wide = false, mono = false }) {
   const row = el("div", `setting-row${wide ? " wide" : ""}`);
   row.dataset.search = `${label} ${desc ?? ""}`.toLowerCase();
   const copy = el("div", "setting-copy");
-  const labelNode = el("label", "setting-label", label);
+  const labelNode = mono ? el("code", "setting-code", label) : el("label", "setting-label", label);
   if (id) labelNode.htmlFor = id;
   copy.appendChild(labelNode);
   if (desc) copy.appendChild(el("p", "setting-desc", desc));
@@ -543,6 +544,29 @@ function buildUsagePage() {
     } else {
       body.appendChild(el("p", "setting-note", s.usageEmpty));
     }
+
+    // Delegation has a price; until it was itemised, `delegate` looked free.
+    // Only sources that actually spent something are listed, so a session with
+    // no sub-agents does not grow two zero rows.
+    const spent = (summary.sources ?? []).filter((entry) => entry.inputTokens + entry.outputTokens > 0);
+    if (spent.length > 1) {
+      const sources = el("div", "usage-models");
+      sources.appendChild(el("h3", "setting-group-title", s.usageBySource));
+      const labels = {
+        main: s.usageSourceMain,
+        subagent: s.usageSourceSubagent,
+        background: s.usageSourceBackground,
+      };
+      for (const entry of spent) {
+        const row = el("div", "usage-model-row");
+        row.appendChild(el("span", "usage-model-name", labels[entry.source] ?? entry.source));
+        const value = el("span", "usage-model-value", formatTokens(entry.inputTokens + entry.outputTokens));
+        if (entry.cost > 0) value.textContent += ` · ${formatMoney(entry.cost)}`;
+        row.appendChild(value);
+        sources.appendChild(row);
+      }
+      body.appendChild(sources);
+    }
     body.appendChild(el("p", "setting-note", s.usageNote));
   };
 
@@ -785,6 +809,16 @@ function buildBehaviorPage() {
           mono: true,
           placeholder: "read_file, glob, grep",
           onChange: (value) => applyConfig({ autoApprove: value }),
+        }),
+      }),
+      sRow({
+        id: "setting-echo-reasoning",
+        label: s.echoReasoning,
+        desc: s.echoReasoningDesc,
+        control: sToggle({
+          id: "setting-echo-reasoning",
+          checked: Boolean(settings.echoReasoning),
+          onChange: (value) => applyConfig({ echoReasoning: value }),
         }),
       }),
       sHint(s.sandboxHint),
@@ -1548,8 +1582,69 @@ function setSystem(key, value) {
   });
 }
 
-function buildAboutPage() {
+/**
+ * Hooks: what a workspace wants to run around agent activity, and whether the
+ * user has accepted it.
+ *
+ * A project hook is code the checkout supplies and the agent runs with the
+ * user's own permissions, so the page shows the commands before the switch
+ * that enables them. Enabling is an explicit action recorded per workspace;
+ * editing the file afterwards asks again.
+ */
+function buildHooksPage() {
   const s = S();
+  const pane = sPage(s.pageHooks, s.pageHooksDesc);
+  const status = state.hookStatus ?? { file: "", exists: false, trusted: false, entries: [], global: 0 };
+
+  const stateRow = el("div", "setting-badge", "");
+  if (!status.exists) {
+    stateRow.textContent = s.hookNone;
+    stateRow.classList.add("muted");
+  } else if (status.trusted) {
+    stateRow.textContent = s.hookTrusted;
+    stateRow.classList.add("ok");
+  } else {
+    stateRow.textContent = s.hookUntrusted;
+    stateRow.classList.add("warn");
+  }
+
+  const actions = el("div", "setting-control");
+  if (status.exists) {
+    const button = status.trusted
+      ? sButton(s.hookRevoke, () => api.send({ cmd: "hookTrust", trust: false }), { danger: true })
+      : sButton(s.hookTrust, () => api.send({ cmd: "hookTrust", trust: true }), { primary: true });
+    actions.appendChild(button);
+  }
+
+  pane.appendChild(
+    sGroup(s.groupCustomize, [
+      // A file path, not a setting: repeating the page description under it
+      // said nothing about the file.
+      sRow({ label: status.file || ".prometheus/hooks.json", desc: "", control: stateRow, wide: true, mono: true }),
+      sRow({ label: s.hookState, desc: s.hookReview, control: actions, wide: true }),
+    ]),
+  );
+
+  if (status.entries.length > 0) {
+    const table = el("section", "setting-group");
+    table.appendChild(el("h3", "setting-group-title", s.hookEvent));
+    for (const entry of status.entries) {
+      const row = el("div", "setting-row");
+      const copy = el("div", "setting-copy");
+      copy.appendChild(el("code", "setting-code", entry.event));
+      const control = el("div", "setting-control");
+      control.appendChild(el("code", "setting-code", entry.command));
+      row.append(copy, control);
+      table.appendChild(row);
+    }
+    pane.appendChild(table);
+  }
+
+  if (status.global > 0) pane.appendChild(el("p", "setting-note", s.hookGlobal.replace("{n}", String(status.global))));
+  return pane;
+}
+
+function buildAboutPage() {  const s = S();
   const pane = sPage(s.pageAbout, s.pageAboutDesc);
   const row = el("section", "about-row");
   row.appendChild(el("span", "about-version", `Prometheus ${state.appVersion ?? ""}`));
@@ -1646,6 +1741,7 @@ function openSettings(tab = "general") {
   api.send({ cmd: "getSkills" });
   api.send({ cmd: "getMemory" });
   api.send({ cmd: "getInstructions" });
+  api.send({ cmd: "getHooks" });
   void api.systemState?.().then((next) => {
     state.systemState = next;
   });
@@ -1860,6 +1956,16 @@ function basename(path) {
           const area = $("setting-instructions");
           if (area && document.activeElement !== area) area.value = state.instructionsText;
         }
+        break;
+      case "hook_status":
+        state.hookStatus = {
+          file: message.file ?? "",
+          exists: Boolean(message.exists),
+          trusted: Boolean(message.trusted),
+          entries: message.entries ?? [],
+          global: message.global ?? 0,
+        };
+        if (state.settingsTab === "hooks") rerenderSettingsPage("hooks");
         break;
       case "rules":
         if (!settingsDialog.hidden) api.send({ cmd: "getSettings" });
