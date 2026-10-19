@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { assertPackId, isInside, packDir, packsRoot, ROOT_ENV, ensureRoot, isOwnedRoot, acquireRootLock } from "../src/packs/paths.ts";
 import { parseManifest, readManifest, resolvePayloadPath, writeManifest, type PackManifest } from "../src/packs/manifest.ts";
 import { planExtraction, validateMember, walkStats } from "../src/packs/archive.ts";
+import { TOOLCHAIN_INFO } from "../src/embedded/toolchain.ts";
 
 function scratch(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -221,6 +222,22 @@ test("stripping depends on how many top-level entries the archive has", () => {
   const noisy = planExtraction(["tool/bin/gcc", "__MACOSX/._gcc"]);
   assert.equal(noisy.strip, 1);
   assert.deepEqual(noisy.topLevels, ["tool"]);
+});
+
+test("an archive holding one bare file is not stripped", () => {
+  // ninja-win.zip is exactly `ninja.exe`. One top-level entry, but it is the
+  // payload rather than a wrapper: stripping it extracts nothing, and the
+  // validation step then fails with "command not found" — a confusing symptom
+  // for what is really an empty payload.
+  const plan = planExtraction(["ninja.exe"]);
+  assert.equal(plan.strip, 0);
+  assert.deepEqual(plan.topLevels, ["ninja.exe"]);
+
+  // A directory holding one file still strips, because the member that proves
+  // it is a directory is present.
+  assert.equal(planExtraction(["bin/ninja.exe"]).strip, 1);
+  // A file alongside a directory is not a wrapper either.
+  assert.equal(planExtraction(["ninja.exe", "docs/readme"]).strip, 0);
 });
 
 test("a violation is reported and blocks extraction even when a strip is possible", () => {
@@ -516,13 +533,23 @@ test("目录按平台和架构过滤", () => {
   assert.equal(catalogFor("win32", "arm64", { includeUnverified: true }).length, 0);
 });
 
-test("目录里的每个条目都是 Windows 的 arm-none-eabi 工具链", () => {
+test("目录里的每个条目都是 Windows x64 的独立工具", () => {
   // 这条测试是产品范围的锚点：只做 Win 端时，目录里出现别的平台条目
   // 一定是有意加的，而不是拷贝粘贴带进来的。
+  //
+  // 它曾经还断言每个条目都只 provide `gcc-arm`，那只是当时目录里恰好
+  // 只有一条的真实写照，而不是产品约束 —— 目录本来就该覆盖一次固件
+  // 会话需要的编译、烧录和分析工具。
   for (const entry of CATALOG) {
     assert.equal(entry.platform, "win32", `${entry.id} 不是 Windows 条目`);
     assert.equal(entry.arch, "x64", `${entry.id} 不是 x64 条目`);
-    assert.deepEqual(entry.provides, ["gcc-arm"], `${entry.id} 提供的东西变了`);
+    assert.ok(entry.provides.length > 0, `${entry.id} 没有声明提供什么`);
+    for (const kind of entry.provides) {
+      assert.ok(
+        Object.hasOwn(TOOLCHAIN_INFO, kind),
+        `${entry.id} 提供的 ${kind} 不是探测器认识的一种工具链`,
+      );
+    }
   }
 });
 

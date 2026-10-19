@@ -139,6 +139,8 @@ function isNoise(name: string): boolean {
 export function planExtraction(names: string[]): { strip: 0 | 1; violations: string[]; topLevels: string[] } {
   const violations: string[] = [];
   const topLevels = new Set<string>();
+  /** Top-level entries that are themselves files rather than directories. */
+  let looseFiles = 0;
 
   for (const name of names) {
     const problem = validateMember(name);
@@ -150,11 +152,20 @@ export function planExtraction(names: string[]): { strip: 0 | 1; violations: str
     const segments = name.split(/[\\/]/).filter(Boolean);
     if (segments.length === 0) continue;
     topLevels.add(segments[0]);
+    // A trailing slash marks a directory entry explicitly; without one, a
+    // single-segment name is a file.
+    if (segments.length === 1 && !/[/\\]$/.test(name)) looseFiles++;
   }
 
-  // A single top-level entry that is a directory wrapper is stripped; anything
-  // else keeps its structure.
-  return { strip: topLevels.size === 1 ? 1 : 0, violations, topLevels: [...topLevels] };
+  // A single top-level directory wrapper is stripped; anything else keeps its
+  // structure.
+  //
+  // "Single top-level *entry*" is not enough: an archive holding one bare file
+  // (ninja-win.zip is exactly `ninja.exe` and nothing else) also has one top
+  // level, and stripping it would extract zero files. Only strip when that
+  // entry is a directory, which shows up as at least one member below it.
+  const singleDirectory = topLevels.size === 1 && looseFiles === 0;
+  return { strip: singleDirectory ? 1 : 0, violations, topLevels: [...topLevels] };
 }
 
 /** Whether this platform's tar can read the format. Probed, not assumed. */

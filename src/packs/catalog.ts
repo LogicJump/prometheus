@@ -47,6 +47,19 @@ export interface CatalogEntryDef {
 const SRC = "https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain";
 
 /**
+ * GitHub release downloads redirect to `release-assets.githubusercontent.com`
+ * (and older assets to `objects.githubusercontent.com`). Both are listed
+ * because the host check runs against the URL that finally answered.
+ */
+const GITHUB_HOSTS = [
+  "github.com",
+  "release-assets.githubusercontent.com",
+  "objects.githubusercontent.com",
+];
+
+const XPACK_RELEASES = "https://github.com/xpack-dev-tools";
+
+/**
  * Arm GNU Toolchain 15.3.rel2。
  *
  * URL 会被重定向到 AWS S3，所以两个主力域都列进 hosts —— 下载器只信任
@@ -92,6 +105,179 @@ export const CATALOG: CatalogEntryDef[] = [
     env: { pathPrepend: ["payload/bin"], vars: {} },
     validation: { command: "bin/arm-none-eabi-gcc.exe", args: ["-dumpmachine"], expect: "^arm-none-eabi$" },
     priority: 10,
+  },
+  {
+    // xPack's build of OpenOCD. Single self-contained directory, one
+    // executable, and `--version` prints to stderr — which is why `expect`
+    // matches the banner text rather than an anchored line.
+    id: "xpack-openocd-0.12.0-6-win32-x64",
+    name: "OpenOCD (xPack)",
+    version: "0.12.0-6",
+    provider: "xpack",
+    platform: "win32",
+    arch: "x64",
+    downloadBytes: 3_090_548,
+    unpackedBytes: 12_000_000,
+    sources: [
+      {
+        url: `${XPACK_RELEASES}/openocd-xpack/releases/download/v0.12.0-6/xpack-openocd-0.12.0-6-win32-x64.zip`,
+        archive: "zip",
+        // 实测：2026-10-19 下载 3,090,548 字节后计算得到。
+        sha256: "c57724f87219bafde78f61b54fb7f303f456fed9826a3d0ee2d54d461ad58020",
+        bytes: 3_090_548,
+        hosts: GITHUB_HOSTS,
+      },
+    ],
+    license: {
+      name: "GPL-2.0-or-later",
+      url: "https://github.com/xpack-dev-tools/openocd-xpack/blob/v0.12.0-6/LICENSE",
+      sourceUrl: "https://github.com/xpack-dev-tools/openocd-xpack",
+      separateProcess: true,
+    },
+    provides: ["openocd"],
+    executables: [{ name: "openocd", path: "bin/openocd.exe", toolchain: "openocd" }],
+    env: { pathPrepend: ["payload/bin"], vars: {} },
+    validation: { command: "bin/openocd.exe", args: ["--version"], expect: "Open On-Chip Debugger" },
+    priority: 10,
+  },
+  {
+    // xPack's Arm GCC. Listed alongside the Arm-built one as a second choice:
+    // some projects pin xPack specifically, and its layout differs.
+    id: "xpack-arm-none-eabi-gcc-14.2.1-1.1-win32-x64",
+    name: "Arm GNU Toolchain (xPack)",
+    version: "14.2.1-1.1",
+    provider: "xpack",
+    platform: "win32",
+    arch: "x64",
+    downloadBytes: 323_368_593,
+    unpackedBytes: 1_200_000_000,
+    sources: [
+      {
+        url: `${XPACK_RELEASES}/arm-none-eabi-gcc-xpack/releases/download/v14.2.1-1.1/xpack-arm-none-eabi-gcc-14.2.1-1.1-win32-x64.zip`,
+        archive: "zip",
+        // 实测：2026-10-19 下载 323,368,593 字节后计算得到。
+        sha256: "0b2d496b383ba578182eb57b3f7d35ff510e36eda56257883b902fa07c3bba55",
+        bytes: 323_368_593,
+        hosts: GITHUB_HOSTS,
+      },
+    ],
+    license: {
+      name: "GPL-3.0-or-later with GCC Runtime Library Exception; newlib BSD",
+      url: "https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/blob/v14.2.1-1.1/LICENSE",
+      sourceUrl: "https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack",
+      separateProcess: true,
+    },
+    provides: ["gcc-arm"],
+    executables: [
+      { name: "arm-none-eabi-gcc", path: "bin/arm-none-eabi-gcc.exe", toolchain: "gcc-arm" },
+      { name: "arm-none-eabi-gdb", path: "bin/arm-none-eabi-gdb.exe", toolchain: "gcc-arm" },
+      { name: "arm-none-eabi-size", path: "bin/arm-none-eabi-size.exe", toolchain: "gcc-arm" },
+    ],
+    env: { pathPrepend: ["payload/bin"], vars: {} },
+    validation: { command: "bin/arm-none-eabi-gcc.exe", args: ["-dumpmachine"], expect: "^arm-none-eabi$" },
+    priority: 5,
+  },
+  {
+    // RISC-V is the one compiler the default Arm install does not cover. Same
+    // xPack packaging, so the same layout and validation shape.
+    id: "xpack-riscv-none-elf-gcc-14.2.0-3-win32-x64",
+    name: "RISC-V GNU Toolchain (xPack)",
+    version: "14.2.0-3",
+    provider: "xpack",
+    platform: "win32",
+    arch: "x64",
+    downloadBytes: 378_807_720,
+    unpackedBytes: 1_400_000_000,
+    sources: [
+      {
+        url: `${XPACK_RELEASES}/riscv-none-elf-gcc-xpack/releases/download/v14.2.0-3/xpack-riscv-none-elf-gcc-14.2.0-3-win32-x64.zip`,
+        archive: "zip",
+        // 实测：2026-10-19 下载 378,807,720 字节后计算得到。
+        sha256: "9bb15efdeca256532c4a83ce6462c7dc1f9cfebe1f1f43d581b2ad7d077209b6",
+        bytes: 378_807_720,
+        hosts: GITHUB_HOSTS,
+      },
+    ],
+    license: {
+      name: "GPL-3.0-or-later with GCC Runtime Library Exception; newlib BSD",
+      url: "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack/blob/v14.2.0-3/LICENSE",
+      sourceUrl: "https://github.com/xpack-dev-tools/riscv-none-elf-gcc-xpack",
+      separateProcess: true,
+    },
+    provides: ["gcc-riscv"],
+    executables: [
+      { name: "riscv-none-elf-gcc", path: "bin/riscv-none-elf-gcc.exe", toolchain: "gcc-riscv" },
+      { name: "riscv-none-elf-gdb", path: "bin/riscv-none-elf-gdb.exe", toolchain: "gcc-riscv" },
+      { name: "riscv-none-elf-size", path: "bin/riscv-none-elf-size.exe", toolchain: "gcc-riscv" },
+    ],
+    env: { pathPrepend: ["payload/bin"], vars: {} },
+    validation: { command: "bin/riscv-none-elf-gcc.exe", args: ["-dumpmachine"], expect: "^riscv" },
+    priority: 10,
+  },
+  {
+    // CMake is the build-system front end most Cortex-M projects use. The
+    // archive wraps everything in `cmake-4.2.3-windows-x86_64/`, which the
+    // installer strips.
+    id: "cmake-4.2.3-win32-x64",
+    name: "CMake",
+    version: "4.2.3",
+    provider: "kitware",
+    platform: "win32",
+    arch: "x64",
+    downloadBytes: 50_391_842,
+    unpackedBytes: 190_000_000,
+    sources: [
+      {
+        url: "https://github.com/Kitware/CMake/releases/download/v4.2.3/cmake-4.2.3-windows-x86_64.zip",
+        archive: "zip",
+        // 实测：2026-10-19 下载 50,391,842 字节后计算得到。
+        sha256: "eb4ebf5155dbb05436d675706b2a08189430df58904257ae5e91bcba4c86933c",
+        bytes: 50_391_842,
+        hosts: GITHUB_HOSTS,
+      },
+    ],
+    license: {
+      name: "BSD-3-Clause",
+      url: "https://github.com/Kitware/CMake/blob/v4.2.3/Copyright.txt",
+      separateProcess: true,
+    },
+    provides: ["cmake"],
+    executables: [{ name: "cmake", path: "bin/cmake.exe", toolchain: "cmake" }],
+    env: { pathPrepend: ["payload/bin"], vars: {} },
+    validation: { command: "bin/cmake.exe", args: ["--version"], expect: "^cmake version" },
+  },
+  {
+    // Ninja's release zip is one bare `ninja.exe`: no wrapper directory. The
+    // extractor keeps it whole because a single entry that is a file is the
+    // payload, not a wrapper.
+    id: "ninja-1.13.2-win32-x64",
+    name: "Ninja",
+    version: "1.13.2",
+    provider: "ninja-build",
+    platform: "win32",
+    arch: "x64",
+    downloadBytes: 291_570,
+    unpackedBytes: 800_000,
+    sources: [
+      {
+        url: "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
+        archive: "zip",
+        // 实测：2026-10-19 下载 291,570 字节后计算得到。
+        sha256: "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65",
+        bytes: 291_570,
+        hosts: GITHUB_HOSTS,
+      },
+    ],
+    license: {
+      name: "Apache-2.0",
+      url: "https://github.com/ninja-build/ninja/blob/v1.13.2/COPYING",
+      separateProcess: true,
+    },
+    provides: ["ninja"],
+    // No wrapper was stripped, so the executable sits at the payload root.
+    executables: [{ name: "ninja", path: "ninja.exe", toolchain: "ninja" }],
+    env: { pathPrepend: ["payload"], vars: {} },
+    validation: { command: "ninja.exe", args: ["--version"], expect: "^1\\.13" },
   },
 ];
 
