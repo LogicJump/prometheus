@@ -93,8 +93,28 @@ export function rulesFor(cwd: string): ApprovalRule[] {
   });
 }
 
+/**
+ * Parse a `Tool(specifier)` rule string into a tool name and a matcher.
+ *
+ * `Bash(git *)`, `read_file(src/**)` and `mcp__github__*` cover the three
+ * cases that a tool-level rule cannot: one shape of a command, one part of the
+ * tree, one MCP server. Anything without parentheses keeps the old meaning, so
+ * existing rules parse exactly as before.
+ */
+export function parseRuleSpec(spec: string): { tool: string; match?: string } | null {
+  const text = String(spec ?? "").trim();
+  if (!text) return null;
+  const open = text.indexOf("(");
+  if (open < 0) return { tool: text };
+  if (!text.endsWith(")")) return null;
+  const tool = text.slice(0, open).trim();
+  const match = text.slice(open + 1, -1).trim();
+  if (!tool) return null;
+  return match ? { tool, match } : { tool };
+}
+
 /** Glob over the call detail: `*` matches any run of characters. */
-function globMatch(pattern: string, text: string): boolean {
+export function globMatch(pattern: string, text: string): boolean {
   if (!pattern) return true;
   const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
   try {
@@ -112,6 +132,34 @@ export function matchRule(rules: ApprovalRule[], toolName: string, detail: strin
   for (const rule of rules) {
     if (rule.tool !== "*" && rule.tool !== toolName) continue;
     if (!globMatch(rule.match ?? "", detail)) continue;
+    return rule;
+  }
+  return null;
+}
+
+/**
+ * Match a rule against a structured call, falling back to the summary.
+ *
+ * A `Bash(git status*)` rule has to look at the command, not at the summary
+ * the approval prompt showed — the summary appends the model's prose
+ * description, so a correctly scoped rule would miss its own call. Tools pass
+ * the argument their rule is written against (`command` for bash, `path` for
+ * file tools, the tool name itself for a whole MCP server).
+ */
+export function matchRuleAgainst(
+  rules: ApprovalRule[],
+  toolName: string,
+  summary: string,
+  argument: string | undefined,
+): ApprovalRule | null {
+  for (const rule of rules) {
+    if (rule.tool !== "*" && rule.tool !== toolName) continue;
+    const candidate = argument ?? summary;
+    if (!globMatch(rule.match ?? "", candidate)) {
+      // A path rule written as `src/**` should also match `src/a/b.ts` when
+      // the tool reports an absolute path in the summary.
+      if (!argument || !globMatch(rule.match ?? "", summary)) continue;
+    }
     return rule;
   }
   return null;

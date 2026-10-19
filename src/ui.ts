@@ -130,6 +130,33 @@ export class TerminalUi implements Ui {
     this.assistantEnd();
   }
 
+  /** Tool arguments are streaming; show a compact progress hint. */
+  toolDelta(name: string, text: string): void {
+    // The terminal has one line for this kind of progress and the desktop
+    // shows a fuller hint; keeping the terminal quiet until the call starts
+    // would leave a long file write looking frozen.
+    this.spinnerStart(`${name} ${text.replace(/\s+/g, " ").slice(-40)}`);
+  }
+
+  /** The loop is about to retry a failed request. */
+  retryAttempt(attempt: number, delayMs: number, message: string): void {
+    void attempt;
+    void delayMs;
+    void message;
+  }
+
+  /** A retry is about to re-stream this reply; forget the first attempt. */
+  discardAssistant(): void {
+    if (!this.assistantActive) return;
+    this.streamedText = "";
+    this.assistantActive = false;
+    this.lineDirty = false;
+    // Erase the line the abandoned attempt left on screen. The retry prints
+    // the reply from the first token, and two copies of the opening sentence
+    // is the visible symptom this method exists to prevent.
+    this.out.write("\r\x1b[2K");
+  }
+
   assistantEnd(): void {
     if (this.assistantActive) {
       if (this.streamedText.trim()) this.appendTranscript("assistant", this.streamedText);
@@ -156,7 +183,8 @@ export class TerminalUi implements Ui {
   }
 
   /** A sub-agent's lifecycle, drawn as an indented group in the transcript. */
-  subagentStart(prompt: string): void {
+  subagentStart(prompt: string, meta?: { id: string }): void {
+    void meta;
     this.assistantEnd();
     this.thinkingEnd();
     this.spinnerStop();

@@ -25,7 +25,13 @@ import type { ChatMessage } from "./types.ts";
  *                  would be rejected.
  */
 
-const BUDGET_RATIO = 0.75;
+/**
+ * Compact once the request would use this much of the window.
+ *
+ * The number is a fraction of the whole window, but the comparison in
+ * `query.ts` includes the system prompt and tool schemas, not only messages.
+ */
+export const BUDGET_RATIO = 0.75;
 const TRIM_KEEP = 24;
 const SUMMARIZE_KEEP = 8;
 const AGGRESSIVE_KEEP = 4;
@@ -141,6 +147,15 @@ export interface CompactOptions {
    * request, not a reaction to size, so it must not become a no-op.
    */
   force?: boolean;
+  /**
+   * How many trailing messages to keep verbatim (`/compact --keep N`).
+   *
+   * The tiers had fixed window sizes, so a user who wanted to compact but keep
+   * the last few exchanges had no way to say so and lost more than they asked
+   * to. The value is a floor on the summarize tier, not an override of the
+   * size check: a conversation that still fits is untouched.
+   */
+  keepRecent?: number;
 }
 
 /**
@@ -183,7 +198,8 @@ export async function compactWithModel(
   }
 
   // 2/3. summarize with the model
-  const summarizeSplit = splitPoint(rest, SUMMARIZE_KEEP);
+  const keep = Math.max(SUMMARIZE_KEEP, Math.min(200, Math.floor(options.keepRecent ?? 0)));
+  const summarizeSplit = splitPoint(rest, keep);
   const old = rest.slice(0, summarizeSplit);
   const recent = rest.slice(summarizeSplit);
   const local = summarize(old);

@@ -115,6 +115,15 @@ export class ChatClient {
     onText: (delta: string) => void,
     onThinking: (delta: string) => void,
     signal: AbortSignal,
+    /**
+     * Tool-argument deltas as they arrive.
+     *
+     * A large `write_file` or `apply_patch` argument is the slowest part of a
+     * request to stream; a UI that waited for the whole call showed nothing
+     * while the largest text was arriving. The callback is advisory — the
+     * argument is still assembled and parsed at the end.
+     */
+    onToolDelta?: (index: number, name: string, delta: string) => void,
   ): Promise<StreamResult> {
     const body: Record<string, unknown> = {
       model: this.options.model,
@@ -152,7 +161,7 @@ export class ChatClient {
       if (!this.stream) {
         return await this.parseNonStreaming(res);
       }
-      return await this.parseStreaming(res, onText, onThinking);
+      return await this.parseStreaming(res, onText, onThinking, onToolDelta);
     } finally {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
@@ -172,6 +181,8 @@ export class ChatClient {
         prompt_tokens_details?: { cached_tokens?: number };
         prompt_cache_hit_tokens?: number;
         cached_tokens?: number;
+        cache_creation_input_tokens?: number;
+        prompt_cache_miss_tokens?: number;
       };
     };
     const choice = json.choices?.[0];
@@ -184,6 +195,7 @@ export class ChatClient {
         inputTokens: json.usage?.prompt_tokens ?? 0,
         outputTokens: json.usage?.completion_tokens ?? 0,
         cachedTokens: cachedTokensFrom(json.usage),
+        ...(cacheWriteTokensFrom(json.usage) ? { cacheWriteTokens: cacheWriteTokensFrom(json.usage) } : {}),
       },
     };
   }
@@ -192,6 +204,7 @@ export class ChatClient {
     res: Response,
     onText: (delta: string) => void,
     onThinking: (delta: string) => void,
+    onToolDelta?: (index: number, name: string, delta: string) => void,
   ): Promise<StreamResult> {
     if (!res.body) throw new ApiError(0, "Streaming response has no body");
 
@@ -226,6 +239,8 @@ export class ChatClient {
           prompt_tokens_details?: { cached_tokens?: number };
           prompt_cache_hit_tokens?: number;
           cached_tokens?: number;
+          cache_creation_input_tokens?: number;
+          prompt_cache_miss_tokens?: number;
         };
       };
       try {
@@ -239,6 +254,8 @@ export class ChatClient {
         usage.outputTokens = chunk.usage.completion_tokens ?? usage.outputTokens;
         const cached = cachedTokensFrom(chunk.usage);
         if (cached > 0) usage.cachedTokens = cached;
+        const written = cacheWriteTokensFrom(chunk.usage);
+        if (written > 0) usage.cacheWriteTokens = written;
       }
 
       const choice = chunk.choices?.[0];
@@ -266,7 +283,10 @@ export class ChatClient {
           }
           if (tc.id) current.id = tc.id;
           if (tc.function?.name) current.function.name += tc.function.name;
-          if (tc.function?.arguments) current.function.arguments += tc.function.arguments;
+          if (tc.function?.arguments) {
+            current.function.arguments += tc.function.arguments;
+            onToolDelta?.(index, current.function.name, tc.function.arguments);
+          }
         }
       }
       if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -324,6 +344,22 @@ function cachedTokensFrom(usage: {
     if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
   }
   return 0;
+}
+
+/**
+ * Input tokens written to a prompt cache, where the gateway reports them.
+ *
+ * These are billed at a different rate from an uncached input token on most
+ * providers, and the usage page could not show the difference at all. A
+ * gateway that reports nothing yields 0 rather than a guess.
+ */
+function cacheWriteTokensFrom(usage: {
+  cache_creation_input_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+} | undefined): number {
+  if (!usage) return 0;
+  const value = usage.cache_creation_input_tokens ?? usage.prompt_cache_miss_tokens;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 export class ApiError extends Error {

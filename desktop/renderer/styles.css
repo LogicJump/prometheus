@@ -48,12 +48,15 @@
   --radius: 10px;
   --radius-lg: 14px;
 
+  /* Interface scale multiplies the chrome; the transcript has --font-scale. */
+  --ui-scale: 1;
+
   /* type scale */
-  --text-xs: 11px;
-  --text-sm: 12px;
-  --text-base: 13px;
-  --text-md: 14px;
-  --text-lg: 17px;
+  --text-xs: calc(11px * var(--ui-scale));
+  --text-sm: calc(12px * var(--ui-scale));
+  --text-base: calc(13px * var(--ui-scale));
+  --text-md: calc(14px * var(--ui-scale));
+  --text-lg: calc(17px * var(--ui-scale));
   --text-xl: 22px;
 
   /* motion */
@@ -65,10 +68,68 @@
   --sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
   --shadow-composer: 0 10px 34px rgba(0, 0, 0, 0.42);
   --shadow-popover: 0 14px 40px rgba(0, 0, 0, 0.5);
-  --sidebar-width: 264px;
+  --sidebar-width: calc(264px * var(--ui-scale));
   --reading-width: 780px;
   --font-scale: 1;
   --mark-size: 22px;
+}
+
+/* High contrast: the same semantic colors, raised against the background so
+   every token clears WCAG AA at body size. It is a variant of dark/light, not a
+   third personality: the layout and type are untouched. */
+:root[data-theme="contrast"] {
+  --bg: #000000;
+  --sidebar: #0a0a0a;
+  --surface: #141414;
+  --surface-raised: #1c1c1c;
+  --surface-hover: #262626;
+  --border: #4a4a4a;
+  --border-strong: #7a7a7a;
+  --text: #ffffff;
+  --text-secondary: #d6d6d6;
+  --text-faint: #a8a8a8;
+  --accent: #6cb0ff;
+  --accent-hover: #8cc4ff;
+  --accent-soft: rgba(108, 176, 255, 0.22);
+  --accent-text: #a9d1ff;
+  --success: #5ddc9a;
+  --warn: #ffcc66;
+  --danger: #ff8a7a;
+  --danger-soft: rgba(255, 138, 122, 0.2);
+  --success-soft: rgba(93, 220, 154, 0.18);
+  --add-bg: rgba(93, 220, 154, 0.18);
+  --del-bg: rgba(255, 138, 122, 0.18);
+  --mark-bg: rgba(255, 204, 102, 0.35);
+  --on-accent: #000000;
+  --scrim: rgba(0, 0, 0, 0.7);
+}
+
+:root[data-theme="light-contrast"] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --sidebar: #f0f0f0;
+  --surface: #ebebeb;
+  --surface-raised: #ffffff;
+  --surface-hover: #dcdcdc;
+  --border: #9a9a9a;
+  --border-strong: #5c5c5c;
+  --text: #000000;
+  --text-secondary: #2a2a2a;
+  --text-faint: #454545;
+  --accent: #0047b3;
+  --accent-hover: #003a93;
+  --accent-soft: rgba(0, 71, 179, 0.14);
+  --accent-text: #003a93;
+  --success: #00663f;
+  --warn: #6b4a00;
+  --danger: #9c1f14;
+  --danger-soft: rgba(156, 31, 20, 0.12);
+  --success-soft: rgba(0, 102, 63, 0.12);
+  --add-bg: rgba(0, 102, 63, 0.12);
+  --del-bg: rgba(156, 31, 20, 0.12);
+  --mark-bg: rgba(160, 110, 0, 0.3);
+  --on-accent: #ffffff;
+  --scrim: rgba(0, 0, 0, 0.5);
 }
 
 :root[data-theme="light"] {
@@ -406,6 +467,88 @@ svg {
   font-family: var(--mono);
 }
 
+/* Tasks pane: the same row rhythm as the checkpoint list, with the state as a
+   dot in the left gutter and one action on the right. */
+.tasks-root {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+}
+
+.tasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.task-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+  font-family: var(--sans);
+  font-size: var(--text-sm);
+}
+
+.task-row:hover {
+  background: var(--surface);
+}
+
+.task-state {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex: 0 0 auto;
+}
+
+.task-state.running {
+  background: var(--accent);
+}
+
+.task-state.done {
+  background: var(--success);
+}
+
+.task-state.failed,
+.task-state.stopped {
+  background: var(--danger);
+}
+
+.task-label {
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-meta {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+}
+
+.subagent-stop {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.subagent-stop:hover {
+  color: var(--danger);
+}
+
+.checkpoint-turn {
+  margin: 10px 0 2px;
+  padding: 0 6px;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 .checkpoint-row {
   display: flex;
   align-items: center;
@@ -660,6 +803,65 @@ svg {
   top: 0;
 }
 
+/* A diff shown under the tool row that produced it. Same line tokens as the
+   Changes pane; only the container differs, because this one is in the flow of
+   the conversation and must not look like a second pane. */
+.inline-diff {
+  margin: -2px 0 10px 30px;
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+}
+
+.inline-diff-toggle {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 0;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.inline-diff-toggle:hover {
+  color: var(--text);
+}
+
+.inline-diff-toggle .add {
+  color: var(--success);
+}
+
+.inline-diff-toggle .del {
+  color: var(--danger);
+}
+
+.inline-diff-path {
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inline-diff-body {
+  margin-top: 4px;
+  max-height: 360px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+}
+
+.inline-diff-body .diff-gutter {
+  width: 62px;
+  line-height: 18px;
+}
+
+.inline-diff-body .diff-text {
+  font-size: var(--text-xs);
+  line-height: 18px;
+  white-space: pre;
+}
+
 .diff-line {
   display: flex;
   min-height: 19px;
@@ -675,6 +877,19 @@ svg {
   white-space: pre;
   font-size: var(--text-xs);
   line-height: 19px;
+}
+
+/* Word-level highlight inside a changed line. Only the differing words get a
+   stronger tint, so a one-token edit on a long line is visible without reading
+   the whole line. */
+.diff-line .word-add {
+  background: color-mix(in srgb, var(--success) 26%, transparent);
+  border-radius: 2px;
+}
+
+.diff-line .word-del {
+  background: color-mix(in srgb, var(--danger) 26%, transparent);
+  border-radius: 2px;
 }
 
 .diff-text {
@@ -866,6 +1081,36 @@ svg {
 
 .session-item.active {
   background: var(--surface-hover);
+}
+
+/* A visible entry to the session actions. It stays out of the way until the
+   row is hovered or focused, and is always reachable by keyboard. */
+.session-more {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-left: auto;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.session-item:hover .session-more,
+.session-item:focus-within .session-more {
+  display: flex;
+}
+
+.session-more:hover {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.session-more:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .session-search {
@@ -1272,6 +1517,17 @@ svg {
   line-height: 14px;
   text-align: center;
   font-family: var(--mono);
+}
+
+/* While a turn is running the badge pulses once per change, so a file being
+   edited right now reads differently from one edited an hour ago. */
+.icon-badge.live {
+  animation: badge-pulse 900ms var(--ease) infinite alternate;
+}
+
+@keyframes badge-pulse {
+  from { opacity: 1; }
+  to { opacity: 0.55; }
 }
 
 .topbar-sidebar-toggle {
@@ -2017,8 +2273,158 @@ mark.find-hit.current {
   word-break: break-word;
 }
 
+/* ---------- in-window confirmation ---------- */
+
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 60%, transparent);
+}
+
+.confirm-dialog {
+  width: min(380px, calc(100vw - 40px));
+  padding: 18px 20px 14px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-popover);
+}
+
+.confirm-text {
+  font-family: var(--sans);
+  font-size: var(--text-base);
+  line-height: 1.55;
+  color: var(--text);
+  margin-bottom: 16px;
+  white-space: pre-wrap;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirm-actions button {
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.confirm-actions button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.confirm-actions .confirm-ok {
+  border-color: var(--accent);
+  color: var(--accent-text, var(--text));
+}
+
+.confirm-actions .confirm-ok.danger {
+  background: var(--danger-soft, var(--surface));
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.confirm-actions button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .notice.warn {
   color: var(--warn);
+}
+
+/* A recovered goal is a notice with rows, not a sentence: each row is one
+   session and one action, and the same tokens as every other notice. */
+/* First-run checklist: a notice with rows, in the same voice as recovery. */
+.notice.setup {
+  border-left: 2px solid var(--accent);
+  padding-left: 12px;
+}
+
+.setup-head {
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.setup-row {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.setup-row:last-of-type {
+  border-bottom: none;
+}
+
+.setup-label {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.setup-detail {
+  color: var(--text-faint);
+}
+
+.setup-hint {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: var(--surface);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
+.notice.recovery {
+  border-left: 2px solid var(--warn);
+  padding-left: 12px;
+}
+
+.recovery-head {
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.recovery-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.recovery-row:last-child {
+  border-bottom: none;
+}
+
+.recovery-title {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.recovery-note {
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recovery-actions {
+  margin-left: auto;
 }
 
 .notice.error {
@@ -2198,6 +2604,32 @@ mark.find-hit.current {
 
 .composer:focus-within {
   border-color: var(--border-strong);
+}
+
+/* A next-step suggestion sits above the textarea as ghost text, not in it: the
+   draft the user is typing must never be overwritten by a hint. */
+.composer-suggestion {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 10px 4px;
+  font-family: var(--sans);
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+.composer-suggestion-text {
+  color: var(--text-secondary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-suggestion-hint {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
 }
 
 .composer-input-row {
@@ -2769,6 +3201,41 @@ mark.find-hit.current {
   color: var(--text-faint);
   max-height: 132px;
   overflow-y: auto;
+}
+
+/* Expanded is the same card, unclipped. The line text wraps instead of
+   truncating because the reason a child is stuck is usually the tail of a
+   long path or command. */
+.subagent.expanded .subagent-activities {
+  max-height: none;
+  overflow-y: visible;
+}
+
+.subagent.expanded .subagent-line {
+  white-space: pre-wrap;
+  text-overflow: clip;
+}
+
+.subagent-toggle {
+  margin-left: auto;
+  padding: 1px 6px;
+  font-family: var(--sans);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.subagent-toggle:hover {
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+}
+
+.subagent-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .subagent-line {
@@ -4278,4 +4745,27 @@ mark.find-hit.current {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* A model question uses the permission bar, with its own option layout. */
+.ask-note {
+  width: 100%;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.ask-preview {
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
 }

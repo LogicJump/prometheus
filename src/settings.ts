@@ -38,6 +38,19 @@ export interface UiSettings {
   outputStyle?: "default" | "concise" | "explanatory";
   /** Archive sessions untouched for this many days; 0 disables. */
   archiveAfterDays?: number;
+  /**
+   * Open every new session in an isolated worktree.
+   *
+   * Per-workspace by nature (a worktree needs a repository), so it is a
+   * preference read where the workspace is known rather than a global switch.
+   */
+  isolateByDefault?: boolean;
+  /** Reopen the conversation this window was in when it restarts. */
+  restartSession?: boolean;
+  /** Offer a next-step suggestion in an empty composer. */
+  suggestions?: boolean;
+  /** Check for updates in the background at launch. */
+  updateCheck?: boolean;
 }
 
 const UI_FILE = join(CONFIG_HOME, "ui.json");
@@ -69,6 +82,10 @@ export interface EditableConfig {
   contextWindow?: number;
   fallbackModels?: string[];
   board?: BoardSelection | null;
+  /** Ceilings a user can set from Settings; null clears one. */
+  maxBudgetUsd?: number | null;
+  sessionTokenBudget?: number | null;
+  goalBudgetUsd?: number | null;
 }
 
 /**

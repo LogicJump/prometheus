@@ -22,6 +22,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -307,8 +308,36 @@ export function saveToken(server: string, token: TokenSet): void {
   try {
     mkdirSync(CONFIG_HOME, { recursive: true });
     writeFileSync(TOKEN_FILE, JSON.stringify(all, null, 2), { encoding: "utf8", mode: 0o600 });
+    restrictTokenFile();
   } catch {
     /* a token that cannot be written still works for this session */
+  }
+}
+
+/**
+ * Tighten the token file's ACL on Windows.
+ *
+ * `mode: 0o600` is honored on POSIX and ignored on Windows, where the file
+ * inherits the profile's permissions — readable by any process running as the
+ * same user, including a shell the agent itself started. `icacls` is the
+ * built-in answer: remove inherited rights and grant only this account.
+ *
+ * A failure is not fatal: the token is still no more exposed than any other
+ * file in the profile, and refusing to save it would break authorization for a
+ * hardening step that could not run.
+ */
+function restrictTokenFile(): void {
+  if (process.platform !== "win32") return;
+  try {
+    const user = process.env.USERNAME;
+    if (!user) return;
+    execFileSync("icacls", [TOKEN_FILE, "/inheritance:r", "/grant:r", `${user}:F`], {
+      windowsHide: true,
+      timeout: 10_000,
+      stdio: "ignore",
+    });
+  } catch {
+    /* the token is written either way */
   }
 }
 

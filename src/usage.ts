@@ -21,6 +21,8 @@ export interface UsageRecord {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  /** Input tokens written to the prompt cache, when the gateway reports them. */
+  cacheWriteTokens?: number;
   /** Estimated US dollars for the turn; absent when the model has no price. */
   cost?: number | null;
   /**
@@ -30,7 +32,7 @@ export interface UsageRecord {
    * answer "was delegate worth it". Older records have no field and are read
    * as `main`.
    */
-  source?: "main" | "subagent" | "background";
+  source?: "main" | "subagent" | "background" | "goal";
 }
 
 export interface UsageDay {
@@ -53,12 +55,20 @@ export interface UsageSummary {
   totals: { inputTokens: number; outputTokens: number; cachedTokens: number; turns: number; cost: number };
   models: UsageModel[];
   /** Cost by who spent it, so delegation has a price tag. */
-  sources: { source: "main" | "subagent" | "background"; inputTokens: number; outputTokens: number; cost: number }[];
+  sources: { source: "main" | "subagent" | "background" | "goal"; inputTokens: number; outputTokens: number; cost: number }[];
 }
 
 const FILE = join(CONFIG_HOME, "usage.jsonl");
 
+/** Set by `--ephemeral`: accounting still happens in memory, nothing on disk. */
+let ephemeral = false;
+
+export function setUsageEphemeral(value: boolean): void {
+  ephemeral = value;
+}
+
 export function recordUsage(record: Omit<UsageRecord, "at"> & { at?: string }): void {
+  if (ephemeral) return;
   const inputTokens = Math.max(0, Math.round(record.inputTokens || 0));
   const outputTokens = Math.max(0, Math.round(record.outputTokens || 0));
   if (inputTokens === 0 && outputTokens === 0) return;
@@ -72,6 +82,7 @@ export function recordUsage(record: Omit<UsageRecord, "at"> & { at?: string }): 
       inputTokens,
       outputTokens,
       cachedTokens: Math.max(0, Math.round(record.cachedTokens || 0)),
+      ...(record.cacheWriteTokens ? { cacheWriteTokens: Math.max(0, Math.round(record.cacheWriteTokens)) } : {}),
       ...(record.source ? { source: record.source } : {}),
     };
     entry.cost = costOf(entry.model, entry);
@@ -130,7 +141,7 @@ export function usageSummary(days = 30): UsageSummary {
 
   const totals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, turns: 0, cost: 0 };
   const models = new Map<string, UsageModel>();
-  const sources = new Map<string, { source: "main" | "subagent" | "background"; inputTokens: number; outputTokens: number; cost: number }>();
+  const sources = new Map<string, { source: "main" | "subagent" | "background" | "goal"; inputTokens: number; outputTokens: number; cost: number }>();
 
   for (const record of records) {
     const at = new Date(record.at);

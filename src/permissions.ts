@@ -5,11 +5,24 @@ import { join, relative, isAbsolute, resolve, basename, dirname } from "node:pat
 import { homedir } from "node:os";
 import type { Config, PermissionDetail, PermissionManager, PermissionMode, Tool } from "./types.ts";
 import type { TerminalUi } from "./ui.ts";
-import { CONFIG_HOME } from "./config.ts";
+import { CONFIG_HOME, SESSIONS_DIR } from "./config.ts";
 import { classifyCommand, type SandboxPolicy } from "./sandbox.ts";
-import { matchRule, ruleFromChoice, rulesFor, type ApprovalRule } from "./rules.ts";
+import { globMatch, matchRuleAgainst, matchRule, parseRuleSpec, ruleFromChoice, rulesFor, type ApprovalRule } from "./rules.ts";
 
 /** The scope answers `ui.ask` offers after "always allow". */
+/**
+ * `networkPolicy: "proxy"` is a documented value with no implementation.
+ *
+ * It is rejected at load time rather than carried to the sandbox, where it
+ * would surface as a confirm on the first fetch — a setting that looks like a
+ * working allowlist and only reveals itself later. The loader maps it to off,
+ * so a config written for it behaves as the safer policy.
+ */
+export const UNIMPLEMENTED_NETWORK_POLICY: "proxy" | null = "proxy";
+
+/** Tools that change files, for the `acceptEdits` mode. */
+const FILE_MUTATORS = new Set(["write_file", "edit_file"]);
+
 export const REMEMBER_SCOPE_OPTIONS = [
   { value: "always-detail", label: "Only this exact call" },
   { value: "always-tool", label: "Every call of this tool" },
@@ -88,6 +101,51 @@ function commandTargets(text: string): string[] {
     .filter((token) => Boolean(token) && !token.startsWith("-"));
 }
 
+/**
+ * The argument a saved rule is written against, per tool.
+ *
+ * The approval prompt shows a summary (path, or command plus a prose hint);
+ * the rule has to look at the value the user actually typed into it.
+ */
+function ruleArgument(toolName: string, input: Record<string, unknown>): string | undefined {
+  if (toolName === "bash") return typeof input.command === "string" ? input.command : undefined;
+  if (typeof input.path === "string") return String(input.path);
+  // MCP tools are named `mcp__<server>__<tool>`; a rule on the server prefix
+  // matches every tool it serves.
+  if (toolName.startsWith("mcp__")) {
+    const server = toolName.split("__")[1];
+    return server ? `mcp__${server}__` : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Files whose content is a credential or a secret.
+ *
+ * There is no rule that makes reading `.env` routine: the content goes into
+ * the model's context and out to the endpoint. Read-only tools skip the
+ * approval prompt entirely, so the check has to run before that shortcut.
+ * A saved rule can still grant it deliberately.
+ */
+const SENSITIVE_FILE = /^(?:\.env(?:\..*)?|\.npmrc|\.netrc|id_(?:rsa|ed25519|ecdsa|dsa)(?:\.pub)?|[^/\\]+\.(?:pem|pfx|p12|key|keystore|jks))$/i;
+
+function isSensitiveFile(target: string): boolean {
+  const name = basename(target);
+  if (SENSITIVE_FILE.test(name)) return true;
+  const parts = resolve(target).split(/[\\/]/).filter(Boolean);
+  return parts.some((part) => part === ".ssh" || part === ".gnupg" || part === ".aws" || part === ".docker");
+}
+
+/** Whether a `Tool(specifier)` entry names this call. */
+function matchesSpec(spec: string, toolName: string, summary: string, argument: string | undefined): boolean {
+  const parsed = parseRuleSpec(spec);
+  if (!parsed) return false;
+  if (parsed.tool !== "*" && parsed.tool !== toolName) return false;
+  if (!parsed.match) return true;
+  const candidate = argument ?? summary;
+  return globMatch(parsed.match, candidate) || globMatch(parsed.match, summary);
+}
+
 export class Permissions implements PermissionManager {
   mode: PermissionMode;
   /**
@@ -101,6 +159,15 @@ export class Permissions implements PermissionManager {
   private readonly always = new Set<string>();
   private readonly rules: ApprovalRule[];
   private readonly logPath: string;
+
+  /**
+   * Where an approval came from, when this manager belongs to a sub-agent.
+   *
+   * A prompt that says only "bash: npm test" gives the user no way to tell
+   * whether their own turn is asking or a child spawned three levels down is.
+   * The label travels with the prompt and is stored in the audit log.
+   */
+  source = "";
 
   constructor(config: Config, ui: TerminalUi) {
     this.config = config;
@@ -123,6 +190,32 @@ export class Permissions implements PermissionManager {
       return { allowed: false, reason: "plan mode: only read-only tools are allowed" };
     }
 
+    // `bypassPermissions` is the explicit "I mean it" mode. It still respects
+    // plan mode above (which is a stronger statement about what may run) and
+    // the critical-command breakers below, but it does not ask.
+    if (this.mode === "bypassPermissions") {
+      return this.allow(tool.name, summary);
+    }
+
+    // A credential file is data the model would send to the endpoint. Reading
+    // one is a decision, not a routine read, and a read-only tool would
+    // otherwise never prompt for it.
+    if (typeof input.path === "string" && isSensitiveFile(resolvePath(input.path))) {
+      if (!tool.readonly || this.mode === "ask") {
+        this.audit(tool.name, summary, "sensitive file");
+        return this.prompt(tool.name, `${summary} (credential file - its contents reach the model)`, detail, "credential file");
+      }
+    }
+
+    // `--disallowed-tools` is a hard refusal, evaluated before every mode and
+    // every saved rule. It is how a CI run says "never run this" alongside the
+    // grants that say "these are fine".
+    const forbidden = (this.config.disallowedTools ?? []).some((spec) => matchesSpec(spec, tool.name, summary, ruleArgument(tool.name, input)));
+    if (forbidden) {
+      this.audit(tool.name, summary, "denied by --disallowed-tools");
+      return { allowed: false, reason: `${tool.name} is on the disallowed list for this run` };
+    }
+
     // The machine-wide circuit breakers run before any mode, rule, or saved
     // approval: they exist precisely for the case where everything else says yes.
     if (tool.name === "bash") {
@@ -137,11 +230,40 @@ export class Permissions implements PermissionManager {
       // Read-only tools may inspect these paths; only mutation is gated.
       if (!tool.readonly) {
         this.audit(tool.name, summary, "protected path");
-        return this.prompt(tool.name, `${summary} (protected path — this can change how the agent itself runs)`, detail);
+        return this.prompt(tool.name, `${summary} (protected path — this can change how the agent itself runs)`, detail, "protected path");
       }
     }
 
+    // Read-only tools are always safe to run. `dontAsk` is the one mode that
+    // turns a would-be prompt into a refusal, so it is checked before this
+    // shortcut only for mutating tools; reads never ask in the first place.
     if (tool.readonly) return this.allow(tool.name, summary);
+
+    // `acceptEdits` is the common workflow that the three-mode model could not
+    // express: file edits go through, shell commands still ask. The edit tools
+    // are exactly the built-in pair; `bash` and MCP tools are not.
+    if (this.mode === "acceptEdits" && !tool.name.startsWith("mcp__") && FILE_MUTATORS.has(tool.name)) {
+      const rule = matchRuleAgainst(this.rules, tool.name, summary, ruleArgument(tool.name, input));
+      if (rule?.action === "deny") {
+        this.audit(tool.name, summary, "denied by rule");
+        return { allowed: false, reason: `a saved rule denies ${tool.name} for "${summary}"` };
+      }
+      return this.allow(tool.name, summary);
+    }
+
+    // A standing grant has to be read before the mode branches, not after
+    // them. `--mode auto --dont-ask` puts "*" in `autoApprove`, but the auto
+    // branch asked a person about sandbox `confirm` commands first, and with
+    // stdin closed that question could only be answered "no". The result was
+    // that the one combination built for CI could not run `npm install`.
+    // `--allowed-tools` accepts the same `Tool(specifier)` shape as a saved
+    // rule, so a CI job can grant `Bash(git *)` without granting every command.
+    const preApproved =
+      this.always.has(tool.name) ||
+      this.always.has("*") ||
+      (this.config.autoApprove ?? []).some(
+        (spec) => spec.includes("(") && matchesSpec(spec, tool.name, summary, ruleArgument(tool.name, input)),
+      );
 
     if (this.mode === "auto") {
       if (tool.name === "bash") {
@@ -151,13 +273,19 @@ export class Permissions implements PermissionManager {
           this.audit(tool.name, summary, `denied by sandbox: ${verdict.reason}`);
           return { allowed: false, reason: `the command sandbox blocked this: ${verdict.reason}` };
         }
-        if (verdict.class === "confirm") return this.prompt(tool.name, `${summary} (${verdict.reason})`, detail);
+        if (verdict.class === "confirm" && !preApproved) {
+          return this.prompt(tool.name, `${summary} (${verdict.reason})`, detail, `auto mode asks for this one: ${verdict.reason}`);
+        }
       }
       return this.allow(tool.name, summary);
     }
 
     // Saved rules apply to every mode below plan; a deny beats a prompt.
-    const rule = matchRule(this.rules, tool.name, summary);
+    // The rule is matched against the argument it was written for — the
+    // command line for bash, the path for file tools, the tool name for an
+    // MCP server prefix — because the summary carries the model's prose
+    // description after the real text and a scoped rule would miss its call.
+    const rule = matchRuleAgainst(this.rules, tool.name, summary, ruleArgument(tool.name, input));
     if (rule) {
       if (rule.action === "deny") {
         this.audit(tool.name, summary, "denied by rule");
@@ -167,11 +295,18 @@ export class Permissions implements PermissionManager {
       return { allowed: true };
     }
 
-    if (this.always.has(tool.name) || this.always.has("*")) return this.allow(tool.name, summary);
+    if (preApproved) return this.allow(tool.name, summary);
     // A saved rule can only see the summary, so a tool whose arguments vary
     // (bash) still needs a person on each call. An unattended run has nobody
     // to ask, and the old code answered "no" for every such tool: CI could
     // never run a build. Refuse with the grant that would have worked instead.
+    if (this.mode === "dontAsk") {
+      this.audit(tool.name, summary, "denied (dontAsk mode)");
+      return {
+        allowed: false,
+        reason: `dontAsk mode refuses ${tool.name} rather than prompting. Add a rule or switch mode if it should run.`,
+      };
+    }
     if (this.config.unattended) {
       this.deniedWithoutApproval += 1;
       this.audit(tool.name, summary, "denied (no grant)");
@@ -183,13 +318,19 @@ export class Permissions implements PermissionManager {
           `or use a tool that needs no approval.`,
       };
     }
-    return this.prompt(tool.name, summary, detail);
+    return this.prompt(
+      tool.name,
+      summary,
+      detail,
+      this.mode === "ask" ? "ask mode: this tool is not in a saved rule" : "not covered by a rule",
+    );
   }
   private sandboxPolicy(): SandboxPolicy {
     return {
       mode: this.config.sandbox ?? "enforce",
       network: this.config.networkPolicy ?? "off",
       allowedDirs: this.config.allowedDirs ?? [],
+      ...(this.config.sandboxCredentials ? { credentials: this.config.sandboxCredentials } : {}),
     };
   }
 
@@ -198,7 +339,12 @@ export class Permissions implements PermissionManager {
     return { allowed: true };
   }
 
-  private async prompt(tool: string, summary: string, detail?: PermissionDetail): Promise<{ allowed: boolean; reason?: string }> {
+  private async prompt(
+    tool: string,
+    summary: string,
+    detail?: PermissionDetail,
+    why?: string,
+  ): Promise<{ allowed: boolean; reason?: string }> {
     // A run with no person behind it cannot answer a prompt. Refusing is right,
     // but the reason has to say which of the two things happened: a policy
     // said no, or nobody was there to say yes. "The user denied this tool
@@ -218,7 +364,8 @@ export class Permissions implements PermissionManager {
     // No leading newline: the terminal UI writes its own blank line before the
     // prompt, and the desktop bar rendered the separator as an empty first
     // line above the tool name.
-    const answer = await this.ui.confirm(`${tool}: ${summary}\nAllow?`, detail);
+    const question = this.source ? `${tool}: ${summary} — ${this.source}\nAllow?` : `${tool}: ${summary}\nAllow?`;
+    const answer = await this.ui.confirm(question, detail);
     if (answer === "no") {
       this.audit(tool, summary, "denied");
       return { allowed: false, reason: "the user denied this tool call" };
@@ -282,7 +429,10 @@ export class Permissions implements PermissionManager {
 
   private audit(tool: string, summary: string, verdict: string): void {
     try {
-      appendFileSync(this.logPath, `${new Date().toISOString()}\t${verdict}\t${tool}\t${summary}\n`, "utf8");
+      // The origin is part of the record: an audit that cannot say which
+      // child asked for a command is not an audit of a delegated run.
+      const origin = this.source ? `${this.source} ` : "";
+      appendFileSync(this.logPath, `${new Date().toISOString()}\t${verdict}\t${origin}${tool}\t${summary}\n`, "utf8");
     } catch {
       /* auditing must never break the run */
     }
@@ -336,6 +486,33 @@ export function resolveSafePath(inputPath: string, cwd: string, allowedDirs: str
     throw new Error(`path escapes the workspace: ${inputPath}`);
   }
   return target;
+}
+
+/**
+ * Read-only access to the session's own spilled tool output.
+ *
+ * A truncated result is written to `~/.prometheus/sessions/<id>/tool-results/`
+ * and the tool message names that path, but reading it back was refused as an
+ * escape from the workspace — the pointer was a dead end, and the model's only
+ * option was to re-run the command. These files are produced by the agent
+ * itself and live under the app's own directory, so reads there are allowed.
+ * Writes and deletes still go through the normal confinement check.
+ */
+export function resolveReadablePath(inputPath: string, cwd: string, allowedDirs: string[]): string {
+  const target = isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath);
+  if (isWorkspaceConfinedPath(target, cwd, allowedDirs) || isInsideToolResults(target)) return target;
+  throw new Error(`path escapes the workspace: ${inputPath}`);
+}
+
+/** True when the real path sits under the sessions root's `tool-results` subtree. */
+export function isInsideToolResults(target: string): boolean {
+  const root = realPathOfNearest(SESSIONS_DIR);
+  const real = realPathOfNearest(target);
+  const rel = relative(root, real);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return false;
+  // `<id>/tool-results/...` — anything else under sessions is not readable.
+  const parts = rel.split(/[\\/]/);
+  return parts.length >= 3 && parts[1] === "tool-results";
 }
 
 /** Lexical containment check for tools that need the relative form. */

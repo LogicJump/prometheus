@@ -24,7 +24,7 @@ import type { ChatMessage } from "./types.ts";
 import type { ApiTool, ChatClient } from "./llm.ts";
 import type { FallbackChatClient } from "./fallback.ts";
 import type { Config, Usage } from "./types.ts";
-import { compactWithModel, estimateTokens, needsCompaction, type CompactionLevel } from "./context.ts";
+import { BUDGET_RATIO, compactWithModel, estimateTokens, type CompactionLevel } from "./context.ts";
 import { classifyError, type ClassifiedError } from "./errors.ts";
 import type { ToolPipeline } from "./tools/pipeline.ts";
 
@@ -32,13 +32,23 @@ export type QueryEvent =
   | { type: "assistant_start" }
   | { type: "assistant_text"; text: string }
   | { type: "assistant_end" }
+  /**
+   * The consumer should drop text it already rendered for the current reply.
+   *
+   * A retried request streams again from the beginning. Without this event the
+   * user saw the first half twice, and a UI that appends deltas cannot tell
+   * the second attempt from a continuation.
+   */
+  | { type: "assistant_discard" }
   | { type: "thinking"; text: string }
+  /** Part of a tool call's arguments, as the endpoint streams them. */
+  | { type: "tool_delta"; index: number; name: string; text: string }
   | { type: "usage"; usage: Usage }
   | { type: "retry"; attempt: number; delayMs: number; message: string }
   | { type: "compacted"; removed: number; summary: string; before: number; after: number; level: CompactionLevel; kept: number }
   | { type: "queued_delivered"; texts: string[] }
   | { type: "warning"; text: string }
-  | { type: "turn_end"; reason: TurnEndReason }
+  | { type: "turn_end"; reason: TurnEndReason; partial?: boolean }
   | { type: "error"; error: ClassifiedError };
 
 export type TurnEndReason = "complete" | "aborted" | "max_turns" | "error";
@@ -62,6 +72,13 @@ export interface QueryOptions {
   drainQueue?: () => string[];
   /** How many recoverable failures to tolerate in one turn. */
   maxRetries?: number;
+  /**
+   * Tokens the request carries besides the messages: the system prompt and the
+   * tool schemas. The compactor only sees messages, so ignoring this made the
+   * trigger fire late by however large the tool catalogue was - forty MCP
+   * tools is roughly fifteen thousand tokens of headroom nobody counted.
+   */
+  overheadTokens?: () => number;
   /** Rebuilt state (plan, files in play, rules) to keep across compaction. */
   rehydrate?: () => string;
   /**
@@ -82,11 +99,15 @@ export interface QueryOptions {
 export interface QueryResult {
   usage: Usage;
   reason: TurnEndReason;
+  /** True when the turn stopped before the task was finished (turn cap). */
+  partial?: boolean;
 }
 
 const MAX_RETRIES = 3;
 /** How many empty / thinking-only replies are retried before the turn ends. */
 const MAX_EMPTY_RETRIES = 1;
+/** How many automatic compactions one turn may run before the breaker trips. */
+const MAX_COMPACT_ATTEMPTS = 3;
 /** How many times a `finish_reason: "length"` reply is continued. */
 const MAX_CONTINUATIONS = 2;
 
@@ -134,17 +155,33 @@ export async function* query(options: QueryOptions): AsyncGenerator<QueryEvent, 
   let emptyRetries = 0;
   let continuations = 0;
   let compactionBlocked = false;
+  // A conversation that refills the window immediately after every compaction
+  // would otherwise be summarized again on every iteration: the recap costs a
+  // model call, the request still goes out over budget, and the user sees
+  // "compacted" scroll past with nothing to show for it.
+  let compactAttempts = 0;
+  let thrashStopped = false;
 
   for (;;) {
     if (signal.aborted) return finish(usage, "aborted");
     if (turns++ >= config.maxTurns) {
-      yield { type: "warning", text: `Stopped after ${config.maxTurns} turns. Send another message to continue.` };
-      return finish(usage, "max_turns");
+      // A sub-agent that hits its cap is reporting an unfinished job; saying so
+      // is what stops the parent from treating the last paragraph as a
+      // conclusion. The main loop says the same, which is also the honest
+      // description of a turn that stopped mid-task.
+      yield {
+        type: "warning",
+        text: `Stopped after ${config.maxTurns} turns. Send another message to continue.`,
+      };
+      return finish(usage, "max_turns", true);
     }
 
     // compact: shrink the window before paying for a request
-    if (!compactionBlocked && needsCompaction(messages, config.contextWindow)) {
-      const before = estimateTokensOf(messages);
+    const overhead = Math.max(0, options.overheadTokens?.() ?? 0);
+    const overBudget = estimateTokensOf(messages) + overhead > Math.floor(config.contextWindow * BUDGET_RATIO);
+    if (!compactionBlocked && !thrashStopped && overBudget) {
+      const before = estimateTokensOf(messages) + overhead;
+      compactAttempts++;
       const verdict = (await options.beforeCompact?.({ before, trigger: "auto" })) ?? {};
       if (verdict.blocked) {
         // A PreCompact hook said no. Do not try again this turn: the hook was
@@ -164,6 +201,15 @@ export async function* query(options: QueryOptions): AsyncGenerator<QueryEvent, 
         });
         if (compaction) {
           messages.splice(0, messages.length, ...compaction.messages);
+          if (compactAttempts >= MAX_COMPACT_ATTEMPTS && estimateTokens(messages) > config.contextWindow * 0.9) {
+            thrashStopped = true;
+            yield {
+              type: "warning",
+              text:
+                `compacted ${compactAttempts} times and the context is still near the limit. ` +
+                `Automatic compaction is paused for this turn; start a new session or raise contextWindow.`,
+            };
+          }
           yield {
             type: "compacted",
             removed: compaction.removed,
@@ -188,6 +234,12 @@ export async function* query(options: QueryOptions): AsyncGenerator<QueryEvent, 
     // requesting -> streaming, with recoverable-error retries
     const result = yield* requestWithRetries(options, usage, maxRetries);
     if (result.kind === "failed") {
+      // The user watched part of an answer arrive before the connection died.
+      // Dropping it left the screen and the transcript disagreeing: the model
+      // believed the turn had said nothing and started over on the next
+      // message, repeating work the user had already read.
+      const partial = result.partial.trim();
+      if (partial) messages.push({ role: "assistant", content: partial });
       yield { type: "error", error: result.error };
       return finish(usage, "error");
     }
@@ -353,7 +405,7 @@ function estimateTokensOf(messages: ChatMessage[]): number {
 
 type RequestOutcome =
   | { kind: "ok"; value: Awaited<ReturnType<ChatClient["chat"]>> }
-  | { kind: "failed"; error: ClassifiedError }
+  | { kind: "failed"; error: ClassifiedError; partial: string }
   | { kind: "aborted"; partial: string };
 
 /**
@@ -376,6 +428,11 @@ async function* requestWithRetries(
   maxRetries: number,
 ): AsyncGenerator<QueryEvent, RequestOutcome> {
   const { messages, client, signal } = options;
+  // Text the consumer has already been shown across every attempt. It becomes
+  // part of the transcript if the turn ends in failure, so the model knows what
+  // it already said; a retry replaces it, because the second attempt streams
+  // the reply again from the start.
+  let streamedTotal = "";
 
   for (let attempt = 1; ; attempt++) {
     const channel = new Channel<QueryEvent>();
@@ -395,6 +452,7 @@ async function* requestWithRetries(
       },
       (delta) => channel.push({ type: "thinking", text: delta }),
       signal,
+      (index, name, text) => channel.push({ type: "tool_delta", index, name, text }),
     );
     // The request closes the channel when it settles, so this loop ends either
     // with the queue drained or with a result recorded below.
@@ -414,20 +472,30 @@ async function* requestWithRetries(
     for (let next = await channel.take(); next !== null; next = await channel.take()) yield next;
     await settled;
     if (started) yield { type: "assistant_end" };
+    // Everything this attempt put on screen, plus what earlier attempts did;
+    // the last complete stream wins so a retried reply is not the sum of both.
+    if (streamed) streamedTotal = streamed;
     if (success) return { kind: "ok", value: success };
-    if (signal.aborted) return { kind: "aborted", partial: streamed };
+    if (signal.aborted) return { kind: "aborted", partial: streamedTotal };
     const classified = classifyError(failure, attempt);
     if (classified.level === "terminal" || attempt >= maxRetries) {
-      return { kind: "failed", error: classified };
+      return { kind: "failed", error: classified, partial: streamedTotal };
     }
     yield { type: "retry", attempt, delayMs: classified.retryAfterMs, message: classified.message };
     await sleep(classified.retryAfterMs, signal);
-    if (signal.aborted) return { kind: "aborted", partial: streamed };
+    if (signal.aborted) return { kind: "aborted", partial: streamedTotal };
+    // The next attempt re-sends the request and streams from the first token.
+    // Tell the consumer to throw away what it rendered, or the user reads the
+    // opening sentence twice.
+    if (started) {
+      streamedTotal = "";
+      yield { type: "assistant_discard" };
+    }
   }
 }
 
-function finish(usage: Usage, reason: TurnEndReason): QueryResult {
-  return { usage, reason };
+function finish(usage: Usage, reason: TurnEndReason, partial?: boolean): QueryResult {
+  return partial ? { usage, reason, partial: true } : { usage, reason };
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

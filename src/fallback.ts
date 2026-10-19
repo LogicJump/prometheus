@@ -54,9 +54,19 @@ export class FallbackChatClient {
 
   private readonly options_: FallbackClientOptions;
 
+  /**
+   * The client that answered most recently in this request.
+   *
+   * This used to return the primary unconditionally, so a request served by a
+   * fallback was still billed and reported under the configured model. The
+   * symptom (the wrong model name in the usage log) looks cosmetic until the
+   * budget is computed from it.
+   */
+  private lastClient: ChatClient | null = null;
+
   /** The client currently answering, so callers can read `options.model`. */
   get active(): ChatClient {
-    return this.options_.primary;
+    return this.lastClient ?? this.options_.primary;
   }
 
   async chat(
@@ -65,6 +75,7 @@ export class FallbackChatClient {
     onText: (delta: string) => void,
     onThinking: (delta: string) => void,
     signal: AbortSignal,
+    onToolDelta?: (index: number, name: string, delta: string) => void,
   ): Promise<StreamResult> {
     let lastError: unknown;
     const chain = [this.options_.primary, ...this.options_.fallbacks()];
@@ -72,8 +83,8 @@ export class FallbackChatClient {
     for (let index = 0; index < chain.length; index++) {
       const client = chain[index];
       try {
-        const result = await client.chat(messages, tools, onText, onThinking, signal);
-
+        const result = await client.chat(messages, tools, onText, onThinking, signal, onToolDelta);
+        this.lastClient = client;
         return result;
       } catch (error) {
         lastError = error;

@@ -89,3 +89,68 @@ export function renderMarkdown(source, copyLabel = "copy") {
   flushParagraph();
   return out.join("");
 }
+
+/**
+ * Render a growing message one block at a time.
+ *
+ * Re-rendering the whole reply on every animation frame is O(n) per frame, so
+ * a long answer got slower the more of it existed — the scroll stuttered
+ * exactly while the user was waiting for it. A block is any run of markdown
+ * separated by a blank line (or an open fence); completed blocks are rendered
+ * once and cached, and only the block still receiving text is re-rendered.
+ *
+ * The cache is keyed by the block's source text rather than by index, so a
+ * retry that discards the reply simply stops matching and starts over.
+ */
+export class IncrementalRenderer {
+  constructor(copyLabel = "copy") {
+    this.copyLabel = copyLabel;
+    this.blocks = [];
+    this.lastSignature = "";
+  }
+
+  reset() {
+    this.blocks = [];
+    this.lastSignature = "";
+  }
+
+  /** Split on blank lines, but never inside an unclosed fence. */
+  static split(source) {
+    const lines = source.replace(/\r?\n/g, "\n").split("\n");
+    const blocks = [];
+    let current = [];
+    let fenced = false;
+    for (const line of lines) {
+      if (/^\s*```/.test(line)) fenced = !fenced;
+      if (!fenced && line.trim() === "") {
+        if (current.length > 0) blocks.push(current.join("\n"));
+        current = [];
+        continue;
+      }
+      current.push(line);
+    }
+    if (current.length > 0) blocks.push(current.join("\n"));
+    return blocks;
+  }
+
+  /** The full HTML for the source so far. */
+  render(source) {
+    const blocks = IncrementalRenderer.split(source);
+    const signature = blocks.join("\u0000");
+    if (signature === this.lastSignature) return this.html();
+    // Reuse the render of every block whose text did not change; only the
+    // tail block is usually different.
+    for (let index = 0; index < blocks.length; index++) {
+      const cached = this.blocks[index];
+      if (cached && cached.source === blocks[index]) continue;
+      this.blocks[index] = { source: blocks[index], html: renderMarkdown(blocks[index], this.copyLabel) };
+    }
+    this.blocks.length = blocks.length;
+    this.lastSignature = signature;
+    return this.html();
+  }
+
+  html() {
+    return this.blocks.map((block) => block.html).join("");
+  }
+}

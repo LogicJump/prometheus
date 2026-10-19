@@ -245,12 +245,140 @@ export function parsePyocdTargets(output: string): Target[] {
  * (Zephyr needs a west workspace, PlatformIO needs a project). When the agent
  * needs a name for a chip, this is the table to search.
  */
+/**
+ * Extra target sources, so "no pyOCD installed" does not mean no target table.
+ *
+ * Each ecosystem already ships a machine-readable list, and the projects this
+ * agent is pointed at are usually one of those three. pyOCD stays first
+ * because its table is the most detailed, but the others are enough to pick a
+ * chip name and they are the only option on a machine without Python tooling.
+ */
+export interface ExtraTargetSources {
+  west?: string;
+  pio?: string;
+  arduino?: string;
+  probeRs?: string;
+}
+
+async function targetsFromEcosystems(
+  available: Partial<Record<ProbeKind, string>>,
+  sources: ExtraTargetSources,
+): Promise<{ targets: Target[]; notes: string[] }> {
+  const targets: Target[] = [];
+  const notes: string[] = [];
+  const jobs: Promise<void>[] = [];
+
+  if (sources.pio) {
+    jobs.push(
+      (async () => {
+        const result = await run(sources.pio!, ["boards", "--json-output"], 40_000);
+        if (!result.ok) return;
+        try {
+          const boards = JSON.parse(result.out) as { id?: string; name?: string; platform?: string; mcu?: string }[];
+          for (const board of boards) {
+            if (!board.id) continue;
+            targets.push({
+              name: board.mcu ?? board.id,
+              vendor: board.platform ?? "platformio",
+              source: "pyocd",
+              ...(board.id ? { part: board.id } : {}),
+            });
+          }
+          notes.push(`platformio: ${boards.length} boards`);
+        } catch {
+          notes.push("platformio: board list was not valid JSON");
+        }
+      })(),
+    );
+  }
+
+  if (sources.arduino) {
+    jobs.push(
+      (async () => {
+        const result = await run(sources.arduino!, ["board", "listall", "--format", "json"], 40_000);
+        if (!result.ok) return;
+        try {
+          const boards = JSON.parse(result.out) as { boards?: { name?: string; fqbn?: string }[] };
+          for (const board of boards.boards ?? []) {
+            if (!board.name) continue;
+            targets.push({ name: board.name, vendor: "arduino", source: "pyocd", ...(board.fqbn ? { part: board.fqbn } : {}) });
+          }
+          notes.push(`arduino: ${(boards.boards ?? []).length} boards`);
+        } catch {
+          notes.push("arduino: board list was not valid JSON");
+        }
+      })(),
+    );
+  }
+
+  if (sources.west) {
+    jobs.push(
+      (async () => {
+        const result = await run(sources.west!, ["boards"], 40_000);
+        if (!result.ok) return;
+        // `west boards` prints a table; the first column is the board name.
+        const lines = result.out.split(/\r?\n/).filter((line) => line.trim() && !/^\s*-+\s*$/.test(line));
+        let count = 0;
+        for (const line of lines) {
+          const name = line.trim().split(/\s+/)[0];
+          if (!name || /^board$/i.test(name) || /^-/.test(name)) continue;
+          targets.push({ name, vendor: "zephyr", source: "pyocd" });
+          count++;
+        }
+        notes.push(`zephyr: ${count} boards`);
+      })(),
+    );
+  }
+
+  if (sources.probeRs) {
+    jobs.push(
+      (async () => {
+        const result = await run(sources.probeRs!, ["chip", "list"], 40_000);
+        if (!result.ok) return;
+        let count = 0;
+        for (const line of result.out.split(/\r?\n/)) {
+          const name = line.trim().split(/\s+/)[0];
+          if (!name || /^chip$/i.test(name)) continue;
+          targets.push({ name, vendor: "probe-rs", source: "probe-rs" });
+          count++;
+        }
+        notes.push(`probe-rs: ${count} chips`);
+      })(),
+    );
+  }
+
+  await Promise.all(jobs);
+  return { targets, notes };
+}
+
 export async function listTargets(
   available: Partial<Record<ProbeKind, string>>,
   options: { filter?: string; limit?: number } = {},
+  extra: ExtraTargetSources = {},
 ): Promise<TargetResult> {
   if (!available.pyocd) {
-    return { targets: [], notes: ["pyocd: not installed, no target table available"], total: 0 };
+    // Without pyOCD, fall back to whatever ecosystem CLI is present. A machine
+    // that builds Zephyr or PlatformIO already has a target list.
+    const fallback = await targetsFromEcosystems(available, extra);
+    const filter = options.filter?.toLowerCase();
+    const filtered = filter
+      ? fallback.targets.filter(
+          (target) => target.name.toLowerCase().includes(filter) || target.vendor.toLowerCase().includes(filter),
+        )
+      : fallback.targets;
+    if (filtered.length === 0) {
+      return {
+        targets: [],
+        notes: ["pyocd: not installed, and no other target list was available", ...fallback.notes],
+        total: 0,
+      };
+    }
+    const limit = options.limit ?? 0;
+    return {
+      targets: limit > 0 ? filtered.slice(0, limit) : filtered,
+      notes: [...fallback.notes, filter ? `${filtered.length} match "${options.filter}"` : `${filtered.length} targets`],
+      total: fallback.targets.length,
+    };
   }
   // The JSON subcommand is the machine interface; `list --targets -H` is the
   // fallback for pyOCD versions that predate it.

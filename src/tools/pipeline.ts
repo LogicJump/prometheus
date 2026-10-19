@@ -20,6 +20,24 @@ import { captureBefore } from "../checkpoints.ts";
 import { hooksFor, runHooks, type Hook } from "../hooks.ts";
 import { diffFile } from "../diff.ts";
 import { withSpillPointer } from "../spill.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
+
+function resolveForDiff(path: string, cwd: string): string | null {
+  try {
+    const abs = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+    // A path outside the workspace is not shown inline: the diff would name a
+    // file the Changes pane cannot open either.
+    const rel = relative(cwd, abs);
+    return rel.startsWith("..") || isAbsolute(rel) ? null : abs;
+  } catch {
+    return null;
+  }
+}
+
+function relativeForDiff(cwd: string, abs: string): string {
+  return relative(cwd, abs).split("\\").join("/");
+}
 
 export interface PipelineDeps {
   config: Config;
@@ -32,11 +50,19 @@ export interface PipelineDeps {
   /** Called before a mutating file tool runs. */
   onBeforeMutate?: ((toolName: string, input: Record<string, unknown>) => void) | null;
   /** Run a sub-task; only the top-level agent provides this. */
-  runSubagent: (prompt: string) => Promise<string>;
+  runSubagent: (prompt: string, options?: { context?: "none" | "summary" | "full" }) => Promise<string>;
   /** Run several sub-tasks concurrently (optional; falls back to serial). */
-  runSubagents?: (prompts: string[]) => Promise<{ ok: boolean; report: string }[]>;
+  runSubagents?: (prompts: string[], options?: { context?: "none" | "summary" | "full" }) => Promise<{ ok: boolean; report: string }[]>;
   /** Start a sub-task that outlives the call; false when the cap is reached. */
   runSubagentInBackground?: (prompt: string) => boolean;
+  /** A hook supplied context; the agent appends it to the conversation. */
+  onContext?: (text: string) => void;
+  subagents?: {
+    list(): { id: string; label: string; status: string; context: string; turns: number }[];
+    message(id: string, text: string): Promise<string>;
+    stop(id: string): boolean;
+    report(id: string): string | null;
+  };
   /** Conversation length right now, recorded on each checkpoint for rewind. */
   messageIndex?: () => number;
   /** Called with a path the tool touched, so scoped rules can load. */
@@ -75,6 +101,8 @@ const SILENT_UI: Ui = {
 export class ToolPipeline {
   private readonly tools: () => Tool[];
   private readonly deps: PipelineDeps;
+  /** Prior content of file writes in the current call, for the inline diff. */
+  private readonly diffBaseline = new Map<string, string | null>();
 
   constructor(tools: () => Tool[], deps: PipelineDeps) {
     this.tools = tools;
@@ -110,7 +138,9 @@ export class ToolPipeline {
       };
     }
 
-    ui.toolStart(name, safeSummarize(tool, input));
+    const callId = `tool-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const startedAt = new Date().toISOString();
+    ui.toolStart(name, safeSummarize(tool, input), { id: callId, input, at: startedAt });
     if (typeof input.path === "string") {
       try {
         this.deps.onTouch?.(input.path);
@@ -124,15 +154,46 @@ export class ToolPipeline {
       // A file edit is approved on what it does, not on the path it names.
       // The plan is computed here, before the write, with the same matching
       // code the tool will run, so the diff shown is the diff that lands.
-      const detail = name === "edit_file" ? await this.editDetail(input) : undefined;
+      const detail = name === "edit_file" ? await this.editDetail(input) : name === "write_file" ? await this.writeDetail(input) : undefined;
+      // A PermissionRequest hook answers on the user's behalf. This is the
+      // extension point for "this project's test command is always fine": it
+      // runs before the prompt, so an `allow` decision costs no dialog.
+      let hookDecision;
+      const permissionHooks = hooksFor(this.deps.hooks, "PermissionRequest", name);
+      if (permissionHooks.length > 0) {
+        const results = await runHooks(permissionHooks, "PermissionRequest", { tool: name, input, detail }, this.deps.cwd);
+        for (const result of results) {
+          if (result.permissionDecision && result.permissionDecision !== "ask") {
+            hookDecision = result.permissionDecision;
+            break;
+          }
+        }
+        const context = results
+          .map((result) => result.additionalContext)
+          .filter(Boolean)
+          .join("\n");
+        if (context) this.deps.onContext?.(context);
+        const blocked = results.find((result) => result.blocked);
+        if (blocked) {
+          ui.toolEnd(name, false, `blocked by hook: ${blocked.output.slice(0, 120)}`, { id: callId, at: new Date().toISOString() });
+          return { ok: false, content: `Error: a PermissionRequest hook blocked this call: ${blocked.output}` };
+        }
+      }
+      if (hookDecision === "deny") {
+        ui.toolEnd(name, false, "denied by a PermissionRequest hook", { id: callId, at: new Date().toISOString() });
+        return { ok: false, content: "Error: a PermissionRequest hook denied this call. Do not retry; adjust your approach." };
+      }
       try {
-        const verdict = await this.deps.permissions.check(tool, input, detail);
+        const verdict =
+          hookDecision === "allow"
+            ? { allowed: true }
+            : await this.deps.permissions.check(tool, input, detail);
         if (!verdict.allowed) {
-          ui.toolEnd(name, false, verdict.reason ?? "denied");
+          ui.toolEnd(name, false, verdict.reason ?? "denied", { id: callId, at: new Date().toISOString() });
           return { ok: false, content: `Error: ${verdict.reason ?? "permission denied"}. Do not retry; adjust your approach.` };
         }
       } catch (err) {
-        ui.toolEnd(name, false, (err as Error).message);
+        ui.toolEnd(name, false, (err as Error).message, { id: callId, at: new Date().toISOString() });
         return { ok: false, content: `Error: permission check failed: ${(err as Error).message}` };
       }
 
@@ -142,7 +203,7 @@ export class ToolPipeline {
         const blocked = results.find((result) => result.blocked);
         if (blocked) {
           const reason = blocked.output || `hook exited with code ${blocked.code}`;
-          ui.toolEnd(name, false, `blocked by hook: ${reason.slice(0, 120)}`);
+          ui.toolEnd(name, false, `blocked by hook: ${reason.slice(0, 120)}`, { id: callId, at: new Date().toISOString() });
           return { ok: false, content: `Error: a PreToolUse hook blocked this call: ${reason}` };
         }
         const noise = results.map((result) => result.output).filter(Boolean).join("\n");
@@ -165,6 +226,16 @@ export class ToolPipeline {
         /* checkpointing must never block a tool */
       }
     }
+    // The inline diff needs the before side, captured at the moment the tool
+    // is about to run; after it returns the file already holds the new text.
+    if (MUTATING_FILE_TOOLS.has(name) && typeof input.path === "string") {
+      try {
+        const abs = resolveForDiff(input.path, this.deps.cwd);
+        if (abs) this.diffBaseline.set(input.path, existsSync(abs) ? readFileSync(abs, "utf8") : null);
+      } catch {
+        /* no inline diff for this call */
+      }
+    }
     try {
       this.deps.onBeforeMutate?.(name, input);
     } catch {
@@ -183,6 +254,7 @@ export class ToolPipeline {
       runSubagent: this.deps.runSubagent,
       ...(this.deps.runSubagents ? { runSubagents: this.deps.runSubagents } : {}),
       ...(this.deps.runSubagentInBackground ? { runSubagentInBackground: this.deps.runSubagentInBackground } : {}),
+      ...(this.deps.subagents ? { subagents: this.deps.subagents } : {}),
     };
     let result: ToolResult;
     try {
@@ -190,13 +262,13 @@ export class ToolPipeline {
     } catch (err) {
       // 5. settle (failure path)
       const message = (err as Error).message ?? String(err);
-      ui.toolEnd(name, false, message.slice(0, 160));
+      ui.toolEnd(name, false, message.slice(0, 160), { id: callId, at: new Date().toISOString() });
       ui.toolOutput?.(name, message);
       return { ok: false, content: `Error: ${message}` };
     }
 
     // 5. settle
-    ui.toolEnd(name, !result.isError, result.display ?? "");
+    ui.toolEnd(name, !result.isError, result.display ?? "", { id: callId, at: new Date().toISOString() });
     ui.toolOutput?.(name, result.content);
     // A tool that may produce a very long result keeps the whole thing on disk
     // and names the file, so a truncated message is not a dead end.
@@ -204,20 +276,62 @@ export class ToolPipeline {
     if (tool.persistOutput && this.deps.sessionId) {
       content = withSpillPointer(result, this.deps.sessionId, name, result.content).content;
     }
+    // The diff a file write produced, so the transcript can show it in place
+    // rather than making the user open the Changes pane to see what changed.
+    // The baseline was captured above, before the tool ran; reading the file
+    // now gives the after side, and the pair is the same diff the pane shows.
+    if (MUTATING_FILE_TOOLS.has(name) && typeof input.path === "string") {
+      try {
+        const hadBaseline = this.diffBaseline.has(input.path);
+        const before = this.diffBaseline.get(input.path) ?? null;
+        // A missing baseline means the file could not be read (permissions, a
+        // directory); showing a full-file addition would be a lie.
+        if (hadBaseline) {
+          const abs = resolveForDiff(input.path, this.deps.cwd);
+          const after = abs && existsSync(abs) ? readFileSync(abs, "utf8") : null;
+          if (abs) {
+            const summary = diffFile(relativeForDiff(this.deps.cwd, abs), before, after);
+            if (summary.additions || summary.deletions || summary.status !== "modified") {
+              ui.toolDetail?.(name, {
+                change: {
+                  path: summary.path,
+                  status: summary.status,
+                  additions: summary.additions,
+                  deletions: summary.deletions,
+                  hunks: summary.hunks,
+                },
+              });
+            }
+          }
+        }
+      } catch {
+        /* an inline diff is a nicety; the Changes pane still has the change */
+      } finally {
+        this.diffBaseline.delete(input.path);
+      }
+    }
     // A structured result goes to a UI that can render it; the transcript text
     // above is still what the model reads, so this is additive and optional.
     if (result.data !== undefined) ui.toolDetail?.(name, result.data);
     if (!this.deps.trusted) {
-      const postHooks = hooksFor(this.deps.hooks, "PostToolUse", name);
+      // A failed call has its own event: a hook that wants to suggest a fix or
+      // record the failure could only guess from a successful one before.
+      const postEvent = result.isError ? "PostToolUseFailure" : "PostToolUse";
+      const postHooks = hooksFor(this.deps.hooks, postEvent, name);
       if (postHooks.length > 0) {
         const results = await runHooks(
           postHooks,
-          "PostToolUse",
-          { tool: name, input, output: result.content },
+          postEvent,
+          { tool: name, input, output: result.content, ...(result.isError ? { error: result.content } : {}) },
           this.deps.cwd,
         );
         const noise = results.map((entry) => entry.output).filter(Boolean).join("\n");
         if (noise) ui.toolOutput?.(name, noise);
+        // A hook may replace an MCP tool's answer (a cache, a redaction).
+        const replaced = results.find((entry) => entry.updatedMCPToolOutput !== undefined);
+        if (replaced?.updatedMCPToolOutput !== undefined) content = replaced.updatedMCPToolOutput;
+        const extra = results.map((entry) => entry.additionalContext).filter(Boolean).join("\n");
+        if (extra) this.deps.onContext?.(extra);
       }
     }
     return { ok: !result.isError, content: result.isError ? `Error: ${content}` : content };
@@ -229,6 +343,28 @@ export class ToolPipeline {
    * Absent when it cannot be computed; the approval then falls back to the
    * plain summary and the tool reports its own error after the answer.
    */
+  /**
+   * The diff a `write_file` approval is about.
+   *
+   * `edit_file` showed its change and `write_file` only named the path, so
+   * approving an overwrite of a file that already existed meant approving a
+   * blank form. The content is already in the arguments; building the diff is
+   * a read and a diff, nothing is written.
+   */
+  private async writeDetail(input: Record<string, unknown>): Promise<PermissionDetail | undefined> {
+    try {
+      const { resolveSafePath } = await import("../permissions.ts");
+      const path = resolveSafePath(String(input.path ?? ""), this.deps.cwd, this.deps.config.allowedDirs ?? []);
+      const before = existsSync(path) ? readFileSync(path, "utf8") : null;
+      const after = String(input.content ?? "");
+      if (before === after) return undefined;
+      const summary = diffFile(path, before, after);
+      return { path, before, after, additions: summary.additions, deletions: summary.deletions };
+    } catch {
+      return undefined;
+    }
+  }
+
   private async editDetail(input: Record<string, unknown>): Promise<PermissionDetail | undefined> {
     try {
       const { planEdit } = await import("./fileTools.ts");

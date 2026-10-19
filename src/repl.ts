@@ -12,6 +12,15 @@ import { Permissions } from "./permissions.ts";
 import { listSessions, loadSession, newSessionId, saveSession, ForeignSessionWriter, type SessionFile } from "./sessions.ts";
 import { acquireSessionLock, releaseSessionLock, lockConflictMessage } from "./sessionLock.ts";
 import { CONFIG_HOME, ALLOWED_MODELS } from "./config.ts";
+import { existsSync } from "node:fs";
+
+function existsSyncSafe(path: string): boolean {
+  try {
+    return existsSync(path);
+  } catch {
+    return false;
+  }
+}
 import { ALL_TOOLS } from "./tools/index.ts";
 import { discoverModels } from "./models.ts";
 import { recordUsage } from "./usage.ts";
@@ -31,10 +40,12 @@ const HELP = `${style.bold("Commands")}
   /yolo                shortcut for /mode auto (no confirmation prompts)
   /clear               reset the conversation
   /compact [focus]     compact the conversation; focus guides the recap
-  /cost                token usage for this session
+  /cost                token usage and dollars for this session
+  /budget              how much of the configured ceiling is used
   /context             context window usage
   /sessions            list saved sessions
   /resume <id>         load a saved session
+  /rewind [n]          undo the last n turns, restoring the files they changed
   /memory              show the memory and instruction files in use
   /init                create a PROMETHEUS.md for this project
   /exit                quit (also Ctrl-D)
@@ -53,6 +64,8 @@ export class Repl {
   private pendingLines: string[] = [];
   private readonly options: ReplOptions;
   private interrupted = false;
+  /** The directory the terminal was opened in, before any worktree switch. */
+  private startedIn = process.cwd();
 
   constructor(options: ReplOptions) {
     this.options = options;
@@ -74,7 +87,7 @@ export class Repl {
       completer: (line: string) => {
         const commands = [
           "/help", "/model", "/models", "/mode", "/effort", "/plan", "/yolo", "/clear", "/compact", "/cost",
-          "/context", "/sessions", "/resume", "/memory", "/init", "/exit",
+          "/context", "/sessions", "/resume", "/rewind", "/memory", "/init", "/exit",
         ];
         if (!line.startsWith("/")) return [[], line];
         return [commands.filter((c) => c.startsWith(line)), line];
@@ -100,7 +113,12 @@ export class Repl {
 
   private buildAgent(messages: ChatMessage[]): Agent {
     const permissions = new Permissions(this.config, this.ui);
-    return new Agent(this.config, this.ui, this.client, ALL_TOOLS, permissions, messages);
+    const agent = new Agent(this.config, this.ui, this.client, ALL_TOOLS, permissions, messages);
+    // Without this the terminal wrote no checkpoints at all: the id stayed ""
+    // and the pipeline skips capture when it is empty, so `rewind` and the
+    // checkpoint commands had nothing to restore in a CLI session.
+    agent.sessionId = this.sessionId;
+    return agent;
   }
 
   /** Rebuild the agent in place, preserving history and refreshing the system prompt. */
@@ -132,10 +150,15 @@ export class Repl {
       sandbox: this.config.sandbox,
       networkPolicy: this.config.networkPolicy,
       board: this.config.board,
+      ...(process.cwd() !== this.startedIn ? { worktree: { path: process.cwd(), branch: `prometheus/${this.sessionId}` } } : {}),
     };
   }
 
   async start(): Promise<void> {
+    // The terminal had no session lifecycle at all: a hook configured for
+    // SessionStart or Stop silently never ran, so the CLI and the desktop
+    // disagreed about when a session begins.
+    void this.agent.fireSessionHooks("SessionStart", { sessionId: this.sessionId });
     this.printBanner();
     void this.listModels(false);
 
@@ -167,6 +190,9 @@ export class Repl {
       if (this.shouldExit) break;
     }
     saveSession(this.sessionFile());
+    // The counterpart to SessionStart: cleanup hooks run while the session id
+    // is still meaningful, before the lock is released.
+    await this.agent.fireSessionHooks("SessionEnd", { sessionId: this.sessionId });
     this.ui.dim(`Session saved as ${this.sessionId}. Resume with: prometheus --resume ${this.sessionId}`);
     releaseSessionLock(this.sessionId);
     this.ui.detachReadline();
@@ -225,6 +251,18 @@ export class Repl {
 
     this.ui.echoUser(full);
 
+    // The desktop host persists mid-turn; the terminal waited for the turn to
+    // end, so a kill during a long build lost everything the agent had done.
+    // A five-second cadence is cheap (the writer appends only new messages).
+    const autosave = setInterval(() => {
+      try {
+        saveSession(this.sessionFile());
+      } catch {
+        /* a transient write failure must not interrupt the turn */
+      }
+    }, 5000);
+    autosave.unref?.();
+
     const usageBefore = { ...this.agent.usage };
     const beforeBySource = {
       subagent: { ...this.agent.usageBySource.subagent },
@@ -235,6 +273,7 @@ export class Repl {
     } catch (err) {
       this.ui.error(formatError(err));
     } finally {
+      clearInterval(autosave);
       // The interactive CLI used to account for nothing, so every terminal
       // session was invisible in the Usage page while the desktop recorded
       // itself. One line per source per turn, the same shape the host writes.
@@ -243,6 +282,7 @@ export class Repl {
           inputTokens: this.agent.usage.inputTokens - usageBefore.inputTokens,
           outputTokens: this.agent.usage.outputTokens - usageBefore.outputTokens,
           cachedTokens: this.agent.usage.cachedTokens - usageBefore.cachedTokens,
+          cacheWriteTokens: (this.agent.usage.cacheWriteTokens ?? 0) - (usageBefore.cacheWriteTokens ?? 0),
         };
         if (delta.inputTokens !== 0 || delta.outputTokens !== 0) {
           recordUsage({ sessionId: this.sessionId, cwd: process.cwd(), model: this.agent.lastUsedModel || this.config.model, ...delta });
@@ -253,6 +293,7 @@ export class Repl {
             inputTokens: spent.inputTokens - beforeBySource[kind].inputTokens,
             outputTokens: spent.outputTokens - beforeBySource[kind].outputTokens,
             cachedTokens: spent.cachedTokens - beforeBySource[kind].cachedTokens,
+            cacheWriteTokens: (spent.cacheWriteTokens ?? 0) - (beforeBySource[kind].cacheWriteTokens ?? 0),
           };
           if (part.inputTokens !== 0 || part.outputTokens !== 0) {
             recordUsage({ sessionId: this.sessionId, cwd: process.cwd(), model: this.agent.lastUsedModel || this.config.model, ...part, source: kind });
@@ -290,8 +331,11 @@ export class Repl {
         this.ui.warn("auto mode: mutating tools now run without confirmation");
         return;
       case "clear":
-        this.agent = this.buildAgent([]);
         this.sessionId = newSessionId();
+        // The old order built the agent first, so the new agent carried the
+        // previous session's id and checkpointed into the wrong history.
+        this.agent = this.buildAgent([]);
+        acquireSessionLock(this.sessionId, "terminal");
         this.ui.dim("conversation cleared");
         return;
       case "model":
@@ -340,11 +384,31 @@ export class Repl {
         this.rebuildAgent();
         this.ui.dim("plan mode: read-only investigation. Use /mode ask to allow edits.");
         return;
+      case "budget": {
+        const u = this.agent.usage;
+        const total = u.inputTokens + u.outputTokens;
+        const spent = this.agent.sessionCost();
+        const money = this.config.maxBudgetUsd;
+        const tokens = this.config.sessionTokenBudget;
+        const lines = [
+          `spent: ${spent === null ? "unknown (model has no price)" : `$${spent.toFixed(4)}`}` +
+            (money ? ` of $${money.toFixed(2)}` : " (no money ceiling)"),
+          `tokens: ${total.toLocaleString()}${tokens ? ` of ${tokens.toLocaleString()}` : " (no token ceiling)"}`,
+        ];
+        this.ui.info(lines.join("\n"));
+        return;
+      }
       case "cost": {
         const u = this.agent.usage;
         const total = u.inputTokens + u.outputTokens;
+        // Dollars are what a budget is expressed in, so the answer to "what
+        // did this cost" has to include them; the command used to report only
+        // tokens, which left the user doing the multiplication themselves.
+        const spent = this.agent.sessionCost();
         this.ui.info(
-          `tokens: ${u.inputTokens.toLocaleString()} in (${u.cachedTokens.toLocaleString()} cached), ${u.outputTokens.toLocaleString()} out, ${total.toLocaleString()} total`,
+          `tokens: ${u.inputTokens.toLocaleString()} in (${u.cachedTokens.toLocaleString()} cached), ${u.outputTokens.toLocaleString()} out, ${total.toLocaleString()} total` +
+            `
+cost: ${spent === null ? "unknown (model has no price)" : `$${spent.toFixed(4)}`}`,
         );
         return;
       }
@@ -358,7 +422,16 @@ export class Repl {
         try {
           // The model writes the recap and the argument is passed through as
           // the focus, so `/compact keep the API decisions` means something.
-          const result = await this.agent.compactNow(arg ? { focus: arg } : {});
+          // Two optional parts: a focus for the summary and a number of
+          // recent messages to keep verbatim. Both are free-form, so they are
+          // pulled out of the argument text by their shape.
+          const keepMatch = /(?:^|\s)--keep(?:=|\s+)(\d+)/.exec(arg);
+          const keepRecent = keepMatch ? Number(keepMatch[1]) : undefined;
+          const focus = arg.replace(/(?:^|\s)--keep(?:=|\s+)\d+/, "").trim();
+          const result = await this.agent.compactNow({
+            ...(focus ? { focus } : {}),
+            ...(keepRecent ? { keepRecent } : {}),
+          });
           if (!result) this.ui.dim("nothing to compact");
           else this.ui.dim(`compacted (${result.level}, ~${before} -> ~${this.agent.contextUsage().tokens} tokens)`);
         } catch (err) {
@@ -402,9 +475,58 @@ export class Repl {
         if (session.effort) this.config = { ...this.config, thinkingEffort: session.effort };
         this.client.options.model = session.model;
         if (session.effort) this.client.options.reasoningEffort = session.effort;
+        // A worktree session is only meaningful inside its worktree; entering
+        // it here keeps the resumed conversation pointed at the files it edited.
+        if (session.worktree && existsSyncSafe(session.worktree.path)) {
+          process.chdir(session.worktree.path);
+        } else {
+          // Resuming outside the worktree it was created in must not leave the
+          // next save claiming the current folder is that worktree.
+          this.startedIn = process.cwd();
+        }
+        if (session.board) this.config = { ...this.config, board: session.board };
         this.agent = this.buildAgent(session.messages);
         const restored = [session.mode ? `${session.mode} mode` : "", session.effort ? `${session.effort} effort` : ""].filter(Boolean);
         this.ui.dim(`resumed ${session.id} (${session.messages.length} messages${restored.length ? `, ${restored.join(", ")}` : ""})`);
+        return;
+      }
+      case "rewind": {
+        // Undo the last turn: drop the messages it added and restore the files
+        // those turns changed. The terminal had no rewind at all, while the
+        // desktop did, so the same mistake cost more here.
+        const removedText = arg.trim();
+        if (!removedText) {
+          this.ui.warn("usage: /rewind [number-of-user-turns]  (default 1)");
+          return;
+        }
+        if (this.agent.busy) {
+          this.ui.warn("stop the running turn first (Esc)");
+          return;
+        }
+        const count = Math.max(1, Math.min(20, Number(removedText) || 1));
+        // Find the user turn to rewind to, counting backwards from the end.
+        let index = this.agent.messages.length;
+        for (let found = 0; found < count && index > 0; found++) {
+          index -= 1;
+          while (index > 0 && this.agent.messages[index].role !== "user") index -= 1;
+        }
+        if (index <= 0) {
+          this.ui.warn("nothing to rewind");
+          return;
+        }
+        const { restoreAfterMessage } = await import("./checkpoints.ts");
+        const files = restoreAfterMessage(this.sessionId, index);
+        this.agent.messages = this.agent.messages.slice(0, index);
+        try {
+          saveSession(this.sessionFile());
+        } catch {
+          /* the in-memory rewind already happened; the next save will retry */
+        }
+        this.ui.dim(
+          `rewound ${count} turn(s)` +
+            (files.restored.length ? `, restored ${files.restored.length} file(s)` : "") +
+            (files.errors.length ? `; ${files.errors.join("; ")}` : ""),
+        );
         return;
       }
       case "memory": {

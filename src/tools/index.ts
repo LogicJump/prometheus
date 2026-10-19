@@ -9,7 +9,10 @@ import {
   searchCodeTool,
 } from "./fileTools.ts";
 import { bashTool, todoTool } from "./shellTools.ts";
+import { askUserTool } from "./askUser.ts";
 import { embeddedTools } from "./embeddedTools.ts";
+import { workerTool, workerLogTool } from "./workerTools.ts";
+import { browserTools } from "./browserTools.ts";
 import { saveMemory } from "../memory.ts";
 
 const memoryTool: Tool = {
@@ -48,6 +51,19 @@ export const subagentTool: Tool = {
   parameters: {
     type: "object",
     properties: {
+      action: {
+        type: "string",
+        enum: ["run", "list", "message", "stop", "report"],
+        description:
+          "run (default) starts a task; list shows sub-agents; message sends one of them another instruction; stop cancels one; report returns its latest full report.",
+      },
+      id: { type: "string", description: "Sub-agent id, for message/stop/report" },
+      context: {
+        type: "string",
+        enum: ["none", "summary", "full"],
+        description:
+          "How much of this conversation the child starts with. none (default) keeps its context small; summary carries a digest; full forks the recent transcript.",
+      },
       prompt: { type: "string", description: "Self-contained task description, including what to return" },
       prompts: {
         type: "array",
@@ -68,12 +84,47 @@ export const subagentTool: Tool = {
     return String(input.prompt ?? "").slice(0, 100);
   },
   async execute(input, ctx) {
+    const action = String(input.action ?? "run");
+    const context = (String(input.context ?? "none") as "none" | "summary" | "full");
+    if (action !== "run") {
+      const registry = ctx.subagents;
+      if (!registry) return { isError: true, content: "sub-agent management is not available in this session" };
+      const id = String(input.id ?? "").trim();
+      if (action === "list") {
+        const rows = registry.list();
+        return {
+          content: rows.length
+            ? rows
+                .map((row) => `${row.id}  ${row.status.padEnd(7)} ${row.context.padEnd(7)} ${row.turns} turns  ${row.label}`)
+                .join("\n")
+            : "No sub-agents have been started in this session.",
+          display: `${rows.length} sub-agents`,
+        };
+      }
+      if (!id) return { isError: true, content: `action "${action}" needs an id; use action list to see them` };
+      if (action === "report") {
+        const report = registry.report(id);
+        return report === null
+          ? { isError: true, content: `no sub-agent with id ${id}` }
+          : { content: report || "(no report yet)", display: id };
+      }
+      if (action === "stop") {
+        return registry.stop(id)
+          ? { content: `Stopped ${id}.`, display: "stopped" }
+          : { isError: true, content: `no running sub-agent with id ${id}` };
+      }
+      // message
+      const text = String(input.prompt ?? "").trim();
+      if (!text) return { isError: true, content: "action message needs a prompt" };
+      const report = await registry.message(id, text);
+      return { content: report, display: `${id} replied` };
+    }
     const prompts = Array.isArray(input.prompts) ? input.prompts.map(String).filter(Boolean).slice(0, 4) : [];
     if (prompts.length > 0) {
       if (!ctx.runSubagents) {
         return { isError: true, content: "parallel sub-agents are not available in this session" };
       }
-      const results = await ctx.runSubagents(prompts);
+      const results = await ctx.runSubagents(prompts, { context });
       const sections = results.map((result, index) => {
         const header = `## Sub-task ${index + 1}${result.ok ? "" : " (failed)"}`;
         return `${header}\n${result.report}`;
@@ -95,7 +146,7 @@ export const subagentTool: Tool = {
       if (!started) return { isError: true, content: "too many background sub-agents are already running" };
       return { content: "Started in the background. Its report will be delivered when it finishes.", display: "background" };
     }
-    const report = await ctx.runSubagent(single);
+    const report = await ctx.runSubagent(single, { context });
     return { content: report, display: "sub-agent finished" };
   },
 };
@@ -124,8 +175,12 @@ export const ALL_TOOLS: Tool[] = [
   bashTool,
   todoTool,
   memoryTool,
+  workerTool,
+  workerLogTool,
+  ...browserTools,
   subagentTool,
   ...embeddedTools,
+  askUserTool,
 ];
 
 export function toolByName(name: string): Tool | undefined {

@@ -49,6 +49,8 @@ export interface SvdRegister {
   access?: string;
   resetValue?: number;
   description?: string;
+  /** Another register whose fields this one copies. */
+  derivedFrom?: string;
   fields: SvdField[];
 }
 
@@ -255,32 +257,127 @@ function parseFields(registerXml: string): SvdField[] {
   return fields.sort((a, b) => a.bitOffset - b.bitOffset);
 }
 
+/**
+ * Expand a `<dim>`-repeated element into its instances.
+ *
+ * An array register is declared once with `<dim>4</dim>`, `<dimIncrement>4`
+ * and optionally `<dimIndex>A,B,C,D</dimIndex>`. Reading only the base entry
+ * hid every instance after the first, which for the nRF series and several ST
+ * families is most of the peripheral: `CC[0]` exists and `CC[1..3]` silently
+ * did not. The expansion happens here so every caller (the index, the
+ * detail view, the memory map) sees the same list.
+ */
+function expandDims(
+  block: string,
+  build: (name: string, offset: number) => SvdRegister | null,
+): SvdRegister[] {
+  const baseName = tag(block, "name");
+  const baseOffset = num(tag(block, "addressOffset"));
+  if (!baseName || baseOffset === undefined) return [];
+  const dim = num(tag(block, "dim"));
+  const increment = num(tag(block, "dimIncrement"));
+  if (!dim || increment === undefined || dim < 1) {
+    const single = build(baseName, baseOffset);
+    return single ? [single] : [];
+  }
+  const labels = tag(block, "dimIndex");
+  const names = dimensionNames(baseName, dim, labels);
+  const out: SvdRegister[] = [];
+  for (let index = 0; index < dim; index++) {
+    const value = build(names[index] ?? `${baseName}${index}`, baseOffset + increment * index);
+    if (value) out.push(value);
+  }
+  return out;
+}
+
+/**
+ * The instance names for a dimension.
+ *
+ * `dimIndex` may be `A,B,C`, a range (`0-3` or `A-D`) or a `%s` placeholder
+ * form; the CMSIS schema allows all three, and a name that already contains
+ * `[%s]` or `%s` takes the index verbatim.
+ */
+export function dimensionNames(baseName: string, dim: number, dimIndex: string | undefined): string[] {
+  const placeholder = /\[%s\]|%s/.exec(baseName);
+  const fill = (value: string): string =>
+    placeholder ? baseName.replace(/\[%s\]|%s/, value) : placeholder ? baseName : `${baseName}[${value}]`;
+  const list = dimIndex?.trim();
+  if (list) {
+    if (list.includes(",")) {
+      const parts = list.split(",").map((part) => part.trim()).filter(Boolean);
+      if (parts.length === dim) return parts.map(fill);
+    }
+    const range = /^(.+?)-(\d+)$/.exec(list);
+    if (range) {
+      const start = Number(range[1]);
+      const end = Number(range[2]);
+      if (Number.isFinite(start) && end >= start && end - start + 1 === dim) {
+        return Array.from({ length: dim }, (_, index) => fill(String(start + index)));
+      }
+    }
+    const letters = /^([A-Za-z])-([A-Za-z])$/.exec(list);
+    if (letters) {
+      const start = letters[1].charCodeAt(0);
+      const end = letters[2].charCodeAt(0);
+      if (end >= start && end - start + 1 === dim) {
+        return Array.from({ length: dim }, (_, index) => fill(String.fromCharCode(start + index)));
+      }
+    }
+  }
+  return Array.from({ length: dim }, (_, index) => fill(String(index)));
+}
+
 function parseRegisters(xml: string, depth = 0): SvdRegister[] {
   const registers: SvdRegister[] = [];
   // Registers that live inside a nested cluster are handled by the cluster
   // branch below, with that cluster's offset added. Taking them here too would
   // count every nested register twice.
   for (const block of directBlocks(xml, "register")) {
-    const name = tag(block, "name");
-    const offset = num(tag(block, "addressOffset"));
-    if (!name || offset === undefined) continue;
-    registers.push({
+    const fields = parseFields(block);
+    const size = num(tag(block, "size")) ?? 32;
+    const access = tag(block, "access");
+    const resetValue = num(tag(block, "resetValue"));
+    const description = tag(block, "description");
+    const derived = attr(block.slice(0, block.indexOf(">") + 1), "derivedFrom");
+    const build = (name: string, offset: number): SvdRegister => ({
       name,
       offset,
-      size: num(tag(block, "size")) ?? 32,
-      ...(tag(block, "access") ? { access: tag(block, "access") } : {}),
-      ...(num(tag(block, "resetValue")) !== undefined ? { resetValue: num(tag(block, "resetValue")) } : {}),
-      ...(tag(block, "description") ? { description: tag(block, "description")!.replace(/\s+/g, " ").slice(0, 200) } : {}),
-      fields: parseFields(block),
+      size,
+      ...(access ? { access } : {}),
+      ...(resetValue !== undefined ? { resetValue } : {}),
+      ...(description ? { description: description.replace(/\s+/g, " ").slice(0, 200) } : {}),
+      ...(derived ? { derivedFrom: derived } : {}),
+      fields,
     });
+    for (const register of expandDims(block, build)) registers.push(register);
   }
   // Clusters nest registers and further clusters; flatten their offsets.
   if (depth < 4) {
     for (const block of directBlocks(xml, "cluster")) {
       // The cluster's own offset, not the first nested register's.
       const clusterOffset = num(ownTag(block, "addressOffset")) ?? 0;
-      for (const register of parseRegisters(block, depth + 1)) {
-        registers.push({ ...register, offset: register.offset + clusterOffset });
+      // A dim-repeated cluster is the same shape one level up: several copies
+      // of a register group at a stride, with the index in the name.
+      const clusterName = tag(block, "name") ?? "cluster";
+      const dim = num(tag(block, "dim"));
+      const increment = num(tag(block, "dimIncrement"));
+      const names =
+        dim && increment !== undefined
+          ? dimensionNames(clusterName, dim, tag(block, "dimIndex"))
+          : [clusterName];
+      const copies = dim && increment !== undefined ? dim : 1;
+      for (let copy = 0; copy < copies; copy++) {
+        const copyOffset = clusterOffset + (increment ?? 0) * copy;
+        const suffix = names[copy] ?? clusterName;
+        for (const register of parseRegisters(block, depth + 1)) {
+          registers.push({
+            ...register,
+            // Inside a dimensioned cluster, the register's own name repeats;
+            // prefixing the instance keeps the names unique in the flat list.
+            name: copies > 1 ? `${suffix}.${register.name}` : register.name,
+            offset: register.offset + copyOffset,
+          });
+        }
       }
     }
   }
@@ -411,8 +508,11 @@ export function resolveDerivation(peripherals: SvdPeripheral[]): SvdPeripheral[]
     const peripheral = byName.get(name);
     if (!peripheral) return undefined;
     if (!peripheral.derivedFrom) {
-      resolved.set(name, peripheral);
-      return peripheral;
+      // Still resolve register-level references inside a standalone
+      // peripheral; they are the common case in the array registers.
+      const standalone: SvdPeripheral = { ...peripheral, registers: mergeRegisters(peripheral.registers, []) };
+      resolved.set(name, standalone);
+      return standalone;
     }
     if (seen.has(name)) return peripheral; // a cycle: stop rather than recurse
     seen.add(name);
@@ -420,7 +520,11 @@ export function resolveDerivation(peripherals: SvdPeripheral[]): SvdPeripheral[]
     const parent = resolveOne(peripheral.derivedFrom, seen);
     const merged: SvdPeripheral = {
       ...peripheral,
-      registers: peripheral.registers.length > 0 ? peripheral.registers : (parent?.registers ?? []),
+      // A derived peripheral keeps its own registers and *adds* the parent's
+      // missing ones; a register-level `derivedFrom` (for example
+      // `CC[1].derivedFrom = "CC[0]"`) is resolved first, so an inherited
+      // register carries the parent's fields instead of arriving empty.
+      registers: mergeRegisters(peripheral.registers, parent?.registers ?? []),
       ...(parent?.interrupts && !peripheral.interrupts ? { interrupts: parent.interrupts } : {}),
       ...(parent?.groupName && !peripheral.groupName ? { groupName: parent.groupName } : {}),
     };
@@ -429,6 +533,50 @@ export function resolveDerivation(peripherals: SvdPeripheral[]): SvdPeripheral[]
   };
 
   return peripherals.map((peripheral) => resolveOne(peripheral.name, new Set()) ?? peripheral);
+}
+
+/**
+ * Resolve register-level `derivedFrom` and merge in a parent peripheral's
+ * registers.
+ *
+ * The schema allows a register to copy another's fields (`<register
+ * derivedFrom="CC[0]">`), and vendors use it heavily for the array instances
+ * this parser now expands: the base entry carries the bitfields and the rest
+ * are empty shells. Without this step an expanded `CC[1]` is a name and an
+ * offset with nothing inside it, which is worse than not expanding at all.
+ */
+function mergeRegisters(own: SvdRegister[], inherited: SvdRegister[]): SvdRegister[] {
+  const byName = new Map<string, SvdRegister>();
+  // Parent first, then own: an own register with the same name overrides it.
+  for (const register of inherited) byName.set(register.name, register);
+  for (const register of own) byName.set(register.name, register);
+  const pool = [...byName.values()];
+
+  const final = new Map<string, SvdRegister>();
+  const resolveOne = (register: SvdRegister, seen: Set<string>): SvdRegister => {
+    if (!register.derivedFrom) return register;
+    if (seen.has(register.name)) return register;
+    seen.add(register.name);
+    const parent = byName.get(register.derivedFrom) ?? byName.get(deriveName(register.derivedFrom));
+    if (!parent) return register;
+    const parentResolved = resolveOne(parent, seen);
+    return {
+      ...register,
+      // Fields are the reason for the reference; everything else the child
+      // already states itself and must win.
+      fields: register.fields.length > 0 ? register.fields : parentResolved.fields,
+      ...(register.size ? {} : { size: parentResolved.size }),
+      ...(register.access ? {} : parentResolved.access ? { access: parentResolved.access } : {}),
+      ...(register.resetValue !== undefined
+        ? {}
+        : parentResolved.resetValue !== undefined
+          ? { resetValue: parentResolved.resetValue }
+          : {}),
+    };
+  };
+
+  for (const register of pool) final.set(register.name, resolveOne(register, new Set()));
+  return [...final.values()];
 }
 
 /** Parse an SVD file or an SVD document string. */

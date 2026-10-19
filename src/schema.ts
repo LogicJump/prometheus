@@ -29,8 +29,40 @@ export interface SchemaCheck {
   error?: string;
 }
 
+export class SchemaFileError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SchemaFileError";
+  }
+}
+
+/**
+ * Read a schema file, turning every failure into one line.
+ *
+ * `readFileSync` and `JSON.parse` throw with a stack trace, so a mistyped
+ * `--output-schema` path printed thirty lines of Node internals before the
+ * message that mattered. The caller prints this error and exits non-zero.
+ */
 export function readSchema(file: string): SchemaNode {
-  return JSON.parse(readFileSync(file, "utf8")) as SchemaNode;
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new SchemaFileError(`schema file not found: ${file}`);
+    if (code === "EACCES") throw new SchemaFileError(`schema file is not readable: ${file}`);
+    throw new SchemaFileError(`could not read schema file ${file}: ${(err as Error).message}`);
+  }
+  try {
+    const parsed = JSON.parse(text) as SchemaNode;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new SchemaFileError(`schema file ${file} must contain a JSON object at the top level`);
+    }
+    return parsed;
+  } catch (err) {
+    if (err instanceof SchemaFileError) throw err;
+    throw new SchemaFileError(`schema file ${file} is not valid JSON: ${(err as Error).message}`);
+  }
 }
 
 /** Parse the model's final text, then check it against the schema. */

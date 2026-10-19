@@ -337,14 +337,39 @@ export function openPort(path: string, baud: number, options: { assertDtr?: bool
   const assertDtr = options.assertDtr ?? false;
   const inner = process.platform === "win32" ? openWindowsPort(path, baud, assertDtr) : openPosixPort(path, baud);
   activePorts.add(key);
+  const writers = openWriters.get(key) ?? [];
   return {
     onData: (listener) => inner.onData(listener),
     onExit: (listener) => inner.onExit?.(listener),
+    ...(writers.length > 0 ? { write: (text: string) => writers[0](text) } : {}),
     close() {
       activePorts.delete(key);
+      openWriters.delete(key);
+      recentLines.delete(key);
       inner.close();
     },
   };
+}
+
+/**
+ * Write channels for ports this process opened through the monitor.
+ *
+ * The reader is a spawned PowerShell process; writing needs its own one-shot
+ * command against the same port, which is only safe while the monitor holds
+ * the handle. The monitor registers the writer when it opens a port, and the
+ * tool uses it rather than fighting for exclusive access.
+ */
+const openWriters = new Map<string, ((text: string) => Promise<void>)[]>();
+
+export function registerPortWriter(path: string, write: (text: string) => Promise<void>): void {
+  const key = portKey(path);
+  const list = openWriters.get(key) ?? [];
+  list.push(write);
+  openWriters.set(key, list);
+}
+
+export function clearPortWriter(path: string): void {
+  openWriters.delete(portKey(path));
 }
 
 /**
@@ -497,7 +522,47 @@ export interface PortHandle {
   onData(listener: (chunk: string) => void): void;
   /** Fired once when the reader stops, with the reason when there is one. */
   onExit?(listener: (info: { code: number | null; error?: string }) => void): void;
+  /**
+   * Write text to the port.
+   *
+   * Many consoles are interactive (a bootloader prompt, a shell, an AT
+   * command set), and reading without being able to answer left the agent
+   * watching a prompt it could not satisfy. Absent on readers that were opened
+   * without a write channel.
+   */
+  write?(text: string): Promise<void>;
   close(): void;
+}
+
+/**
+ * The most recent lines seen on each open port, shared with anything in this
+ * process that wants them.
+ *
+ * The desktop's Serial pane and `embed_serial` are the same process. Without a
+ * shared buffer, having the monitor open made the tool fail with "already
+ * open" — the user could see the log but the agent could not, which breaks the
+ * loop exactly when it matters. The ring is per port, capped, and cleared when
+ * the port closes.
+ */
+const recentLines = new Map<string, string[]>();
+const RECENT_CAP = 400;
+
+export function rememberLine(path: string, line: string): void {
+  const key = portKey(path);
+  const ring = recentLines.get(key) ?? [];
+  ring.push(line);
+  if (ring.length > RECENT_CAP) ring.splice(0, ring.length - RECENT_CAP);
+  recentLines.set(key, ring);
+}
+
+/** The last `limit` lines seen on a port this process has open. */
+export function recentPortLines(path: string, limit = 200): string[] {
+  return (recentLines.get(portKey(path)) ?? []).slice(-Math.max(1, Math.min(RECENT_CAP, limit)));
+}
+
+/** True when this process currently holds the port open. */
+export function isPortOpen(path: string): boolean {
+  return activePorts.has(portKey(path));
 }
 
 export function capture(

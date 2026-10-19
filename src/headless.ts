@@ -37,9 +37,19 @@ export class JsonUi implements Ui {
    */
   readonly canPrompt = false;
 
-  constructor(options: { stream?: boolean; out?: NodeJS.WriteStream } = {}) {
+  constructor(options: { stream?: boolean; out?: NodeJS.WriteStream; sessionId?: string; model?: string } = {}) {
     this.stream = Boolean(options.stream);
     this.out = options.out ?? process.stdout;
+    // A consumer needs the session id before the first turn: it is the handle
+    // for resuming, for the worker log, and for correlating a stream from a
+    // job runner. Emitting it only in the final result meant a run that hung
+    // or was killed left nothing to attach to.
+    this.emit({
+      type: "init",
+      sessionId: options.sessionId ?? null,
+      model: options.model ?? null,
+      at: new Date().toISOString(),
+    });
   }
 
   private emit(event: HeadlessEvent): void {
@@ -78,13 +88,13 @@ export class JsonUi implements Ui {
     this.thought = "";
   }
 
-  toolStart(name: string, summary: string): void {
+  toolStart(name: string, summary: string, meta?: { id: string; input: Record<string, unknown>; at: string }): void {
     this.assistantEnd();
-    this.emit({ type: "tool_start", name, summary });
+    this.emit({ type: "tool_start", name, summary, ...(meta ? { id: meta.id, input: meta.input, at: meta.at } : {}) });
   }
 
-  toolEnd(name: string, ok: boolean, summary: string): void {
-    this.emit({ type: "tool_end", name, ok, summary });
+  toolEnd(name: string, ok: boolean, summary: string, meta?: { id: string; at: string }): void {
+    this.emit({ type: "tool_end", name, ok, summary, ...(meta ? { id: meta.id, at: meta.at } : {}) });
   }
 
   toolOutput(name: string, content: string): void {
@@ -95,8 +105,8 @@ export class JsonUi implements Ui {
     this.emit({ type: "plan", items });
   }
 
-  subagentStart(prompt: string): void {
-    this.emit({ type: "subagent_start", prompt });
+  subagentStart(prompt: string, meta?: { id: string }): void {
+    this.emit({ type: "subagent_start", prompt, ...(meta ? { id: meta.id } : {}) });
   }
 
   subagentActivity(kind: "tool" | "text", text: string): void {

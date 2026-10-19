@@ -31,7 +31,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { SESSIONS_DIR } from "./config.ts";
 import { sessionLockHolder, type SessionHolder } from "./sessionLock.ts";
-import type { BoardSelection, ChatMessage } from "./types.ts";
+import type { BoardSelection, PermissionMode, ChatMessage } from "./types.ts";
 
 export interface SessionFile {
   id: string;
@@ -57,12 +57,33 @@ export interface SessionFile {
    * style was forgotten. Only values the user actually set are stored; the
    * caller decides whether to apply them.
    */
-  mode?: "ask" | "auto" | "plan";
+  /**
+   * A persisted mode from an older version may name one that no longer
+   * exists; the reader validates it before applying.
+   */
+  mode?: PermissionMode;
   effort?: "auto" | "low" | "medium" | "high";
   sandbox?: "off" | "enforce";
   networkPolicy?: "off" | "proxy" | "open";
   /** Board selection in force when the session was last used. */
   board?: BoardSelection;
+  /**
+   * A goal or task loop that was running when the session was last used.
+   *
+   * The loop lived only in the host's memory, so a crash lost it along with
+   * the work; a resumed session now knows a run was in flight and can offer to
+   * continue it instead of silently dropping the goal. `history` is the
+   * driver's round log, so a resumed loop does not redo rounds it already did.
+   */
+  goal?: {
+    kind: "goal" | "loop";
+    text: string;
+    round: number;
+    maxRounds: number;
+    history?: string[];
+  };
+  /** The isolated worktree this session was opened in, when it was. */
+  worktree?: { path: string; branch: string };
 }
 
 /**
@@ -88,11 +109,17 @@ export interface SessionMeta {
   /** Hash of the last stored message, so an append can verify its prefix in O(1). */
   lastHash?: string;
   status?: SessionStatus;
-  mode?: "ask" | "auto" | "plan";
+  /**
+   * A persisted mode from an older version may name one that no longer
+   * exists; the reader validates it before applying.
+   */
+  mode?: PermissionMode;
   effort?: "auto" | "low" | "medium" | "high";
   sandbox?: "off" | "enforce";
   networkPolicy?: "off" | "proxy" | "open";
   board?: BoardSelection;
+  goal?: { kind: "goal" | "loop"; text: string; round: number; maxRounds: number; history?: string[] };
+  worktree?: { path: string; branch: string };
 }
 
 function hashMessage(message: ChatMessage): string {
@@ -344,6 +371,8 @@ function sessionSettings(session: SessionFile): Partial<SessionMeta> {
   if (session.sandbox !== undefined) out.sandbox = session.sandbox;
   if (session.networkPolicy !== undefined) out.networkPolicy = session.networkPolicy;
   if (session.board !== undefined) out.board = session.board;
+  if (session.goal !== undefined) out.goal = session.goal;
+  if (session.worktree !== undefined) out.worktree = session.worktree;
   return out;
 }
 
@@ -381,6 +410,8 @@ export function loadSession(idOrPrefix: string): SessionFile | null {
       sandbox: meta.sandbox,
       networkPolicy: meta.networkPolicy,
       board: meta.board,
+      goal: meta.goal,
+      worktree: meta.worktree,
     };
   }
 
@@ -419,12 +450,27 @@ export interface SessionSummary {
   pinned?: boolean;
   archived?: boolean;
   status?: SessionStatus;
+  /**
+   * The goal loop that was running when the process died.
+   *
+   * Carried on the summary rather than fetched per row so startup recovery can
+   * decide which sessions to offer without loading every transcript.
+   */
+  goal?: { kind: "goal" | "loop"; text: string; round: number; maxRounds: number; history?: string[] };
 }
 
 /** Rewrite flags on a saved session without touching its messages. */
 export function updateSessionFlags(
   id: string,
-  patch: { title?: string | null; pinned?: boolean; archived?: boolean; status?: SessionStatus },
+  patch: {
+    title?: string | null;
+    pinned?: boolean;
+    archived?: boolean;
+    status?: SessionStatus;
+    /** `null` clears a goal that finished; an object records the running one. */
+    goal?: SessionMeta["goal"] | null;
+    worktree?: SessionMeta["worktree"] | null;
+  },
 ): SessionFile | null {
   const session = loadSession(id);
   if (!session) return null;
@@ -434,6 +480,8 @@ export function updateSessionFlags(
     if (patch.pinned !== undefined) meta.pinned = patch.pinned;
     if (patch.archived !== undefined) meta.archived = patch.archived;
     if (patch.status !== undefined) meta.status = patch.status;
+    if (patch.goal !== undefined) meta.goal = patch.goal ?? undefined;
+    if (patch.worktree !== undefined) meta.worktree = patch.worktree ?? undefined;
     meta.updatedAt = new Date().toISOString();
     writeMeta(meta);
     return loadSession(session.id);
@@ -443,6 +491,8 @@ export function updateSessionFlags(
   if (patch.pinned !== undefined) session.pinned = patch.pinned;
   if (patch.archived !== undefined) session.archived = patch.archived;
   if (patch.status !== undefined) session.status = patch.status;
+  if (patch.goal !== undefined) session.goal = patch.goal ?? undefined;
+  if (patch.worktree !== undefined) session.worktree = patch.worktree ?? undefined;
   saveSession(session);
   return session;
 }
@@ -489,6 +539,7 @@ export function listSessions(cwdOnly: boolean, includeArchived = false): Session
       pinned: meta.pinned,
       archived: meta.archived,
       status: meta.status,
+      goal: meta.goal,
     });
   }
 
@@ -523,4 +574,46 @@ export function listSessions(cwdOnly: boolean, includeArchived = false): Session
 /** Hash used for project-scoped config/memory lookups. */
 export function projectKey(dir = process.cwd()): string {
   return createHash("sha1").update(dir).digest("hex").slice(0, 12);
+}
+
+/** One session's metadata, read directly, without loading its transcript. */
+export function sessionMeta(id: string): SessionMeta | null {
+  return readMeta(id);
+}
+
+/**
+ * Search every saved session, not just the ones the sidebar has loaded.
+ *
+ * The renderer used to filter the page it already had in memory, so a query
+ * that matched the 81st session found nothing and the empty state claimed no
+ * such conversation existed. This walks every meta and every turn on disk; a
+ * hit carries a one-line excerpt around the match so the result list can show
+ * why it matched without a second read.
+ */
+export function searchSessions(
+  query: string,
+  options: { cwdOnly?: boolean; includeArchived?: boolean; limit?: number } = {},
+): (SessionSummary & { matches: { role: string; excerpt: string }[] })[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+  const limit = Math.max(1, Math.min(200, options.limit ?? 40));
+  const out: (SessionSummary & { matches: { role: string; excerpt: string }[] })[] = [];
+  for (const summary of listSessions(Boolean(options.cwdOnly), Boolean(options.includeArchived))) {
+    const matches: { role: string; excerpt: string }[] = [];
+    const titleHit = `${summary.title ?? ""} ${summary.summary}`.toLowerCase().includes(needle);
+    const messages = loadMessages(summary.id);
+    for (const message of messages) {
+      if (matches.length >= 3) break;
+      const text = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+      const at = text.toLowerCase().indexOf(needle);
+      if (at < 0) continue;
+      const start = Math.max(0, at - 60);
+      const excerpt = text.slice(start, at + needle.length + 80).replace(/\s+/g, " ").trim();
+      matches.push({ role: message.role, excerpt });
+    }
+    if (matches.length === 0 && !titleHit) continue;
+    out.push({ ...summary, matches });
+    if (out.length >= limit) break;
+  }
+  return out;
 }

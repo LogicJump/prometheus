@@ -194,11 +194,45 @@ export async function createPullRequest(cwd, { title, body, base, draft }) {
   return { ok: true, url: result.stdout.trim() };
 }
 
-/** Re-run failed checks on a PR. */
+/**
+ * Re-run the failed checks on a pull request.
+ *
+ * `gh pr checks --watch` is the human loop; a script wants the rerun itself.
+ * Only failed runs are re-triggered: re-running passing work spends minutes of
+ * CI for nothing.
+ */
 export async function rerunFailedChecks(cwd, number) {
-  const result = await gh(cwd, ["pr", "checks", String(number), "--json", "name,state"]);
-  void result;
-  const rerun = await gh(cwd, ["run", "rerun", "--failed"], 60_000);
-  if (!rerun.ok) return { ok: false, error: rerun.stderr || "could not rerun checks" };
-  return { ok: true };
+  if (!Number.isFinite(Number(number))) return { ok: false, error: "no pull request number" };
+  const result = await gh(cwd, ["pr", "checks", String(number), "--json", "name,state,link"], 30_000);
+  if (!result.ok) return { ok: false, error: result.stderr || "could not read checks" };
+  let checks;
+  try {
+    checks = JSON.parse(result.stdout);
+  } catch {
+    return { ok: false, error: "could not parse gh output" };
+  }
+  const failed = checks.filter((check) => /FAILURE|ERROR|CANCELLED|TIMED_OUT/i.test(String(check.state ?? "")));
+  if (failed.length === 0) return { ok: true, rerun: 0 };
+  const rerun = await gh(cwd, ["run", "rerun", "--failed"], 30_000);
+  if (!rerun.ok) return { ok: false, error: rerun.stderr || "gh run rerun failed", rerun: 0 };
+  return { ok: true, rerun: failed.length, failed: failed.map((check) => check.name) };
+}
+
+/** The failure log of the first failing check, for handing to the agent. */
+export async function failedCheckLog(cwd, number, limit = 12_000) {
+  const list = await gh(cwd, ["pr", "checks", String(number), "--json", "name,state,link"], 30_000);
+  if (!list.ok) return { ok: false, error: list.stderr || "could not read checks" };
+  let checks;
+  try {
+    checks = JSON.parse(list.stdout);
+  } catch {
+    return { ok: false, error: "could not parse gh output" };
+  }
+  const failed = checks.find((check) => /FAILURE|ERROR|TIMED_OUT/i.test(String(check.state ?? "")));
+  if (!failed) return { ok: false, error: "no failing check to read" };
+  const log = await gh(cwd, ["run", "view", "--log-failed", "--limit", "500"], 60_000);
+  if (!log.ok) return { ok: false, error: log.stderr || "could not read the failed log", name: failed.name };
+  const text = String(log.stdout ?? "");
+  return { ok: true, name: failed.name, log: text.length > limit ? `${text.slice(0, limit)}
+… (truncated)` : text };
 }

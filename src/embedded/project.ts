@@ -234,17 +234,31 @@ export function buildCommand(
       };
     }
     case "platformio": {
+      // A platformio.ini with several `[env:...]` sections is common; without
+      // `-e` the CLI builds the first one, which is not necessarily the one
+      // the user is working on. The selected env is threaded through the same
+      // `target` field that names a Zephyr board.
+      const args = ["run"];
+      if (options.target) args.push("-e", options.target);
       return {
         kind: "platformio",
         program: toolchains.pio ?? "pio",
-        args: ["run"],
+        args,
         cwd: root,
-        artifactHint: join(root, ".pio", "build", "firmware.elf"),
-        artifactPatterns: [".pio/build/*/firmware.elf", ".pio/build/*/firmware.bin", ".pio/build/*/firmware.hex"],
+        artifactHint: join(root, ".pio", "build", options.target ?? "firmware", "firmware.elf"),
+        artifactPatterns: [
+          ".pio/build/*/firmware.elf",
+          ".pio/build/*/firmware.bin",
+          ".pio/build/*/firmware.hex",
+        ],
       };
     }
     case "arduino": {
-      const args = ["compile"];
+      // Without --build-path the CLI writes to a temp directory that it does
+      // not tell anyone about, so the .hex was simply not where the flash step
+      // looked. Naming the directory makes the artifact discoverable.
+      const outputDir = options.buildDir ?? join(root, "build");
+      const args = ["compile", "--build-path", outputDir];
       if (options.target) args.push("--fqbn", options.target);
       args.push(root);
       return {
@@ -279,10 +293,14 @@ export function buildCommand(
           artifactPatterns: ["build/*.elf", "build/*.bin", "build/*.hex", "build/**/*.elf"],
         };
       }
+      // No preset and no existing cache: `--build` on an unconfigured tree
+      // fails with "could not load cache" and no hint that a configure step
+      // is missing. Configure into the same directory first.
+      const configured = existsSync(join(buildDir, "CMakeCache.txt"));
       return {
         kind: "cmake",
         program: cmake,
-        args: ["--build", buildDir],
+        args: configured ? ["--build", buildDir] : ["-S", root, "-B", buildDir],
         cwd: root,
         artifactPatterns: ["build/*.elf", "build/*.bin", "build/*.hex", "build/**/*.elf"],
       };

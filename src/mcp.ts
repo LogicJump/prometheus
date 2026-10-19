@@ -29,7 +29,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
 import {
@@ -106,6 +106,8 @@ export interface McpClient {
   callTool(name: string, args: Record<string, unknown>): Promise<ToolResult>;
   /** Optional: servers that expose resources or prompts are not required to. */
   listResources?(): Promise<McpResource[]>;
+  /** Ask for update notifications about one resource. */
+  subscribeResource?(uri: string): Promise<void>;
   readResource?(uri: string): Promise<string>;
   listPrompts?(): Promise<McpPrompt[]>;
   /** Fetch one prompt with its messages. Servers that list prompts usually have it. */
@@ -396,6 +398,17 @@ export class StdioMcpClient implements McpClient {
     return paginate((method, params) => this.request(method, params), "resources/list", "resources");
   }
 
+  /**
+   * Ask the server to push `notifications/resources/updated`.
+   *
+   * The notification was already routed to the handler; without the
+   * subscription the server has no reason to send one, so the channel existed
+   * and was never opened.
+   */
+  async subscribeResource(uri: string): Promise<void> {
+    await this.request("resources/subscribe", { uri });
+  }
+
   async readResource(uri: string): Promise<string> {
     const result = (await this.request("resources/read", { uri }, 60_000)) as {
       contents?: { text?: string; uri?: string; blob?: string; mimeType?: string }[];
@@ -680,6 +693,17 @@ export class HttpMcpClient implements McpClient {
     return paginate((method, params) => this.request(method, params), "resources/list", "resources");
   }
 
+  /**
+   * Ask the server to push `notifications/resources/updated`.
+   *
+   * The notification was already routed to the handler; without the
+   * subscription the server has no reason to send one, so the channel existed
+   * and was never opened.
+   */
+  async subscribeResource(uri: string): Promise<void> {
+    await this.request("resources/subscribe", { uri });
+  }
+
   async readResource(uri: string): Promise<string> {
     const result = (await this.request("resources/read", { uri }, 60_000)) as {
       contents?: { text?: string; uri?: string; blob?: string; mimeType?: string }[];
@@ -759,26 +783,56 @@ function toToolResult(result: {
 }
 
 /** User scope first, then project scope (project overrides by name). */
-export function readMcpConfig(cwd: string): Record<string, McpServerConfig & { scope: McpScope }> {
-  const merged: Record<string, McpServerConfig & { scope: McpScope }> = {};
-  const scopes: [McpScope, string][] = [
-    ["user", join(CONFIG_HOME, "mcp.json")],
-    ["project", join(cwd, ".prometheus", "mcp.json")],
+export function readMcpConfig(cwd: string): Record<string, McpServerConfig & { scope: McpScope; pending?: boolean }> {
+  const merged: Record<string, McpServerConfig & { scope: McpScope; pending?: boolean }> = {};
+  // `.mcp.json` is the format Claude Code and other clients write, so a
+  // repository that already declares servers should not need a second copy.
+  // It is read from the project scope only, and its servers start disabled:
+  // opening a cloned repository must not execute a command it names.
+  const scopes: [McpScope, string, boolean][] = [
+    ["user", join(CONFIG_HOME, "mcp.json"), false],
+    ["project", join(cwd, ".prometheus", "mcp.json"), false],
+    ["project", join(cwd, ".mcp.json"), true],
   ];
-  for (const [scope, file] of scopes) {
+  const approved = readApprovedProjectServers(cwd);
+  for (const [scope, file, needsApproval] of scopes) {
     if (!existsSync(file)) continue;
     try {
       const parsed = JSON.parse(readFileSync(file, "utf8")) as McpConfigFile;
       for (const [name, server] of Object.entries(parsed.servers ?? {})) {
         if (!server) continue;
         if (typeof server.command !== "string" && typeof server.url !== "string") continue;
-        merged[name] = { ...server, scope };
+        const pending = needsApproval && !approved.has(name);
+        merged[name] = { ...server, scope, ...(pending ? { pending: true } : {}) };
       }
     } catch {
       /* an unreadable config file should not stop the session */
     }
   }
   return merged;
+}
+
+/** The `.mcp.json` servers the user has enabled for this folder. */
+function approvedFile(cwd: string): string {
+  return join(cwd, ".prometheus", "mcp-approved.json");
+}
+
+export function readApprovedProjectServers(cwd: string): Set<string> {
+  try {
+    const parsed = JSON.parse(readFileSync(approvedFile(cwd), "utf8")) as { servers?: unknown };
+    return new Set(Array.isArray(parsed.servers) ? parsed.servers.filter((name) => typeof name === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Enable or disable one of the repository's `.mcp.json` servers. */
+export function setProjectServerApproved(cwd: string, name: string, approved: boolean): void {
+  const current = readApprovedProjectServers(cwd);
+  if (approved) current.add(name);
+  else current.delete(name);
+  mkdirSync(join(cwd, ".prometheus"), { recursive: true });
+  writeFileSync(approvedFile(cwd), JSON.stringify({ servers: [...current].sort() }, null, 2), "utf8");
 }
 
 export function createClient(name: string, config: McpServerConfig): McpClient {
@@ -802,6 +856,8 @@ export interface LoadedMcp {
    * restarted.
    */
   onRefresh?: (server: string, kind: "tools" | "resources" | "prompts") => void;
+  /** A subscribed resource changed. */
+  onResourceUpdated?: (server: string) => void;
   /** True when the tool set was large enough to defer; `tool_search` unlocks them. */
   deferred?: boolean;
 }
@@ -883,6 +939,12 @@ export async function loadMcpTools(
   await Promise.all(
     Object.entries(configs).map(async ([name, config]) => {
       if (config.disabled) return;
+      // A server declared by the repository itself starts only after the user
+      // enables it: opening a cloned folder must not run a command it names.
+      if ((config as { pending?: boolean }).pending) {
+        errors.push(`${name}: declared in .mcp.json; enable it in Settings to start it`);
+        return;
+      }
       let client: McpClient;
       try {
         client = createClient(name, config);
@@ -901,6 +963,7 @@ export async function loadMcpTools(
             : method === "notifications/prompts/list_changed" ? "prompts"
             : null;
           if (kind) result.onRefresh?.(name, kind);
+          if (method === "notifications/resources/updated") result.onResourceUpdated?.(name);
         });
         if (elicitation) client.onElicitation?.((request) => elicitation(name, request));
         // OAuth is installed before initialize for the same reason: the first
@@ -949,7 +1012,18 @@ export async function loadMcpTools(
   }
   result.deferred = deferred;
 
-  if (resources.length > 0) tools.push(resourceTool(byServer, resources));
+  // Subscribing is best effort: a server that does not implement
+  // `resources/subscribe` answers with an error, and the read tool still works.
+  for (const entry of resources) {
+    const client = byServer.get(entry.server);
+    void client?.subscribeResource?.(entry.resource.uri).catch(() => {});
+  }
+  if (resources.length > 0) {
+    tools.push(resourceTool(byServer, resources));
+    // More than one page means the description cannot hold the catalogue, so
+    // the paging tool is the only way to reach the rest.
+    if (resources.length > 20) tools.push(resourceListTool(resources));
+  }
   return result;
 }
 
@@ -968,13 +1042,19 @@ function resourceTool(
   byServer: Map<string, McpClient>,
   resources: { server: string; resource: McpResource }[],
 ): Tool {
-  const catalogue = resources
-    .slice(0, 60)
+  // The catalogue used to be the first sixty entries glued into the tool
+  // description: past that the rest were invisible, and every request paid for
+  // the text whether or not it read a resource. The description now names the
+  // count and a page of the list; `mcp_list_resources` pages through all of it.
+  const page = resources
+    .slice(0, 20)
     .map((entry) => `${entry.resource.uri} — ${entry.resource.name ?? entry.resource.description ?? entry.server}`)
     .join("\n");
+  const more =
+    resources.length > 20 ? `\n... and ${resources.length - 20} more; use mcp_list_resources with offset.` : "";
   return {
     name: "mcp_read_resource",
-    description: `Read a resource exposed by an MCP server. Available resources:\n${catalogue}`,
+    description: `Read a resource exposed by an MCP server (${resources.length} available). First page:\n${page}${more}`,
     readonly: true,
     parameters: {
       type: "object",
@@ -997,6 +1077,51 @@ function resourceTool(
       } catch (err) {
         return { isError: true, content: `could not read ${uri}: ${(err as Error).message}` };
       }
+    },
+  };
+}
+
+/**
+ * Page through the resource catalogue.
+ *
+ * The read tool carries a first page so the model can act without a second
+ * call; this tool exists for the case where what it wants is past that page.
+ */
+function resourceListTool(resources: { server: string; resource: McpResource }[]): Tool {
+  return {
+    name: "mcp_list_resources",
+    description: `List MCP resources (${resources.length} total), paged. Each entry is "<uri> — <name> (<server>)".`,
+    readonly: true,
+    parameters: {
+      type: "object",
+      properties: {
+        offset: { type: "integer", description: "0-based index to start from", minimum: 0 },
+        limit: { type: "integer", description: "How many to return (default 50, max 100)", minimum: 1, maximum: 100 },
+        server: { type: "string", description: "Only resources from this server" },
+      },
+      additionalProperties: false,
+    },
+    summarize: (input) => `resources from ${String(input.offset ?? 0)}`,
+    async execute(input) {
+      const filtered = input.server
+        ? resources.filter((entry) => entry.server === String(input.server))
+        : resources;
+      const offset = Math.max(0, Number(input.offset ?? 0));
+      const limit = Math.min(100, Math.max(1, Number(input.limit ?? 50)));
+      const slice = filtered.slice(offset, offset + limit);
+      if (slice.length === 0) {
+        return { content: `No resources at offset ${offset} (${filtered.length} total).`, display: "0" };
+      }
+      const lines = slice.map(
+        (entry) => `${entry.resource.uri} — ${entry.resource.name ?? entry.resource.description ?? ""} (${entry.server})`,
+      );
+      const next = offset + slice.length;
+      return {
+        content:
+          lines.join("\n") +
+          (next < filtered.length ? `\n\n[next offset ${next} of ${filtered.length}]` : `\n\n[end of ${filtered.length}]`),
+        display: `${slice.length}/${filtered.length}`,
+      };
     },
   };
 }

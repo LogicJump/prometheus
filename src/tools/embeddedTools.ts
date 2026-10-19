@@ -23,6 +23,23 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { build } from "../embedded/build.ts";
 import { flash, type FlasherKind } from "../embedded/flash.ts";
+import { recordFlash, readFlashHistory, formatFlashHistory } from "../embedded/flashHistory.ts";
+import { findFlasherArgs } from "../embedded/espIdf.ts";
+import { findDeviceInPacks, packRoots as packRootsFor } from "../embedded/cmsisPack.ts";
+import { runtimeTools } from "./embeddedRuntimeTools.ts";
+import { installHintLines } from "../embedded/installHints.ts";
+import { checkServerPort } from "../embedded/serverPort.ts";
+import { isPortOpen, recentPortLines } from "../embedded/serial.ts";
+import { decodeFault, faultAddressValidity, faultReadCommands, formatFault, parseMemoryBytes, type FaultWords } from "../embedded/fault.ts";
+import {
+  decodeValue,
+  encodeValue,
+  getSession,
+  putSession,
+  readMemory,
+  sessionKey,
+  writeMemory,
+} from "../embedded/debugSession.ts";
 import { capture, listSerialPorts, openPort } from "../embedded/serial.ts";
 import { listProbes, listTargets, matchTarget } from "../embedded/probe.ts";
 import { detectToolchains } from "../embedded/toolchain.ts";
@@ -32,6 +49,7 @@ import { analyze, parseStackUsage } from "../embedded/analyze.ts";
 import {
   MiSession,
   type MiRecord,
+  openocdConfigsFor,
   parseStackFrames,
   parseStopReason,
   parseVariables,
@@ -161,13 +179,24 @@ const targetsTool: Tool = {
   },
   summarize: (input) => (input.filter ? `targets matching ${input.filter}` : "embedded inventory"),
   async execute(input, ctx): Promise<ToolResult> {
-    const report = await detectToolchains();
-    const { paths } = await flasherPaths();
+    const { paths, report } = await flasherPaths();
     const project = detectProject(ctx.cwd);
+    // Build/board CLIs are not flashers, so they are not in `paths`; the
+    // target fallback needs them and they are already detected in `report`.
+    const byKind = new Map(report.tools.map((entry) => [entry.kind, entry.path]));
     const [probes, ports, targets] = await Promise.all([
       listProbes({ pyocd: paths.pyocd, "probe-rs": paths["probe-rs"], jlink: paths.jlink }),
       listSerialPorts(),
-      listTargets({ pyocd: paths.pyocd }, { filter: input.filter ? String(input.filter) : undefined, limit: input.include_targets ? 0 : 20 }),
+      listTargets(
+        { pyocd: paths.pyocd },
+        { filter: input.filter ? String(input.filter) : undefined, limit: input.include_targets ? 0 : 20 },
+        {
+          ...(byKind.get("pio") ? { pio: byKind.get("pio") } : {}),
+          ...(byKind.get("west") ? { west: byKind.get("west") } : {}),
+          ...(byKind.get("arduino-cli") ? { arduino: byKind.get("arduino-cli") } : {}),
+          ...(paths["probe-rs"] ? { probeRs: paths["probe-rs"] } : {}),
+        },
+      ),
     ]);
 
     const lines: string[] = [];
@@ -176,7 +205,10 @@ const targetsTool: Tool = {
 
     lines.push("", `toolchains: ${report.tools.length} found, ${report.missing.length} missing`);
     for (const entry of report.tools) lines.push(`  ${entry.kind}: ${entry.version || "installed"} (${entry.path})`);
-    if (report.missing.length) lines.push(`  missing: ${report.missing.join(", ")}`);
+    if (report.missing.length) {
+      lines.push(`  missing: ${report.missing.join(", ")}`);
+      lines.push(...installHintLines(report.missing).filter((line) => line.trim()));
+    }
 
     lines.push("", `probes: ${probes.probes.length}`);
     for (const probe of probes.probes) {
@@ -231,13 +263,19 @@ const flashTool: Tool = {
       programmer: { type: "string", description: "avrdude programmer id (`-c`), e.g. `arduino` or `usbasp`. Required for avrdude" },
       part: { type: "string", description: "avrdude part id (`-p`), e.g. `atmega328p`. Required for avrdude" },
       port: { type: "string", description: "Serial port for a flasher that programs over one (avrdude, esptool), e.g. `COM3`" },
+      history: { type: "boolean", description: "Return the recorded flash history for this session instead of flashing" },
     },
-    required: ["firmware"],
+    required: [],
     additionalProperties: false,
   },
   summarize: (input) => String(input.firmware ?? ""),
   async execute(input, ctx): Promise<ToolResult> {
     const board = selectedBoard(ctx);
+    if (input.history === true) {
+      const records = readFlashHistory(ctx.sessionId ?? "");
+      return { content: formatFlashHistory(records), display: `${records.length} flashes`, data: { records } };
+    }
+    if (!input.firmware) return { isError: true, content: "firmware is required (or pass history: true to list past flashes)" };
     const { paths } = await flasherPaths();
     const requestedFlasher = useBoard(input.flasher ? String(input.flasher) : undefined, board.flasher);
     const kind = chooseFlasher(requestedFlasher, paths);
@@ -270,10 +308,26 @@ const flashTool: Tool = {
 
     const target = useBoard(input.target ? String(input.target) : undefined, board.target);
     const probe = useBoard(input.probe ? String(input.probe) : undefined, board.probe);
+
+    // An ESP-IDF build is several images at fixed offsets; the file next to
+    // the application describes all of them. Flashing the application alone
+    // produced a board that did not boot while the tool reported success.
+    let espImages: { path: string; offset: number }[] | undefined;
+    let espNote = "";
+    if (kind === "esptool") {
+      const plan = findFlasherArgs(String(input.firmware));
+      if (typeof plan === "string") espNote = `\nnote: ${plan}`;
+      else if (plan) {
+        espImages = plan.images;
+        espNote = `\nimages (from ${plan.source}): ` + plan.images.map((image) => `0x${image.offset.toString(16)} ${image.path}`).join(", ");
+      }
+    }
+
     const result = await flash({
       kind,
       program,
       firmware: String(input.firmware),
+      ...(espImages ? { images: espImages } : {}),
       ...(target ? { target } : {}),
       ...(input.address !== undefined ? { address: Number(input.address) } : {}),
       ...(probe ? { probe } : {}),
@@ -285,8 +339,20 @@ const flashTool: Tool = {
       ...((input.port ? String(input.port) : board.port) ? { port: String(input.port ?? board.port) } : {}),
     });
 
+    // Every flash is recorded, successful or not: "what was on the board last
+    // time this worked" is the question a regression actually asks, and the
+    // transcript cannot answer it after a compaction.
+    const recorded = ctx.sessionId
+      ? recordFlash(ctx.sessionId, result, {
+          firmware: String(input.firmware),
+          ...(target ? { target } : {}),
+          flasher: kind,
+        })
+      : null;
     const lines = [result.detail];
     if (result.reason && result.reason !== result.detail) lines.push(`reason: ${result.reason}`);
+    if (recorded?.hash) lines.push(`image: ${recorded.hash}`);
+    if (espNote) lines.push(...espNote.trim().split("\n"));
     if (result.command) lines.push(`command: ${result.command}`);
     if (result.verified !== undefined) lines.push(`verified: ${result.verified ? "yes" : "no"}`);
     lines.push(`elapsed: ${(result.durationMs / 1000).toFixed(1)}s`);
@@ -323,6 +389,11 @@ const serialTool: Tool = {
       until: { type: "string", description: "Stop as soon as a received line matches this regular expression" },
       max_lines: { type: "integer", description: "Stop after this many lines, default 2000" },
       only_errors: { type: "boolean", description: "Return only lines parsed as error or warning level" },
+      write: { type: "string", description: "Text to send to the port after reading (no line ending is added)" },
+      from_monitor: {
+        type: "boolean",
+        description: "Read what the Serial pane has already captured instead of opening the port; use when the monitor owns it",
+      },
     },
     required: [],
     additionalProperties: false,
@@ -373,6 +444,31 @@ const serialTool: Tool = {
 
     const timeoutMs = Math.min(60_000, Math.max(100, Number(input.timeout_ms ?? 5000)));
     const baud = Number(useBoard(input.baud !== undefined ? Number(input.baud) : undefined, board.baud) ?? 115200);
+
+    // The Serial pane and this tool are the same process. When the monitor
+    // holds the port, opening it again fails with an access error that reads
+    // like a hardware problem; reading its ring is the honest answer, and it
+    // is also what the user is looking at.
+    if (input.from_monitor === true || isPortOpen(port)) {
+      const recent = recentPortLines(port, Number(input.max_lines ?? 200));
+      if (recent.length === 0) {
+        return {
+          content:
+            `${port} is open in the Serial pane but has captured nothing yet. ` +
+            `Start the monitor (or reset the board) and try again.`,
+          display: "monitor buffer empty",
+        };
+      }
+      const filtered = input.only_errors
+        ? recent.filter((line) => /\b(ERR|ERROR|WARN|WARNING|FATAL)\b/i.test(line))
+        : recent;
+      return {
+        content: `${port}: ${filtered.length} line(s) from the Serial pane buffer\n${filtered.slice(-500).join("\n")}`,
+        display: `${filtered.length} line(s)`,
+        data: { port, baud, lines: filtered.length, matched: false, timedOut: false, source: "monitor" },
+      };
+    }
+
     // Never assert DTR: a read must not reset the board, and the tool is
     // marked read-only so neither plan mode nor an auto-approval asks first.
     const result = await capture((path, rate) => openPort(path, rate, { assertDtr: false }), port, {
@@ -381,6 +477,23 @@ const serialTool: Tool = {
       ...(until ? { until } : {}),
       ...(input.max_lines !== undefined ? { maxLines: Number(input.max_lines) } : {}),
     });
+
+    // A write is a separate open of the same port, which the OS will refuse
+    // while the reader above still holds it. The reader has closed by the time
+    // `capture` resolves, so the write opens its own short-lived handle.
+    if (input.write !== undefined && String(input.write) !== "") {
+      const text = String(input.write);
+      if (process.platform === "win32") {
+        try {
+          await writePortText(port, baud, text);
+          result.lines.push({ text: `(sent ${JSON.stringify(text)})`, raw: `(sent ${JSON.stringify(text)})` });
+        } catch (err) {
+          result.errors.push(`write failed: ${(err as Error).message}`);
+        }
+      } else {
+        result.errors.push("serial write is implemented for Windows only");
+      }
+    }
 
     let lines = result.lines;
     if (input.only_errors) lines = lines.filter((line) => line.level === "error" || line.level === "warn");
@@ -487,19 +600,54 @@ const debugTool: Tool = {
       breakpoints: { type: "array", items: { type: "string" }, description: "Functions or file:line locations to break at before running" },
       action: {
         type: "string",
-        enum: ["run", "backtrace", "variables", "continue", "step"],
+        enum: [
+          "run",
+          "backtrace",
+          "variables",
+          "continue",
+          "step",
+          "fault",
+          "read",
+          "write",
+          "breakpoints",
+          "breakpoint_delete",
+          "watch",
+          "threads",
+          "close",
+        ],
         description: "What to do once attached: run to the first breakpoint, read a backtrace, read variables, continue, or step one line. Default `run`.",
       },
       remote: { type: "string", description: "An already-running GDB server endpoint, e.g. `localhost:3333`. Skips starting a server." },
+      probe: { type: "string", description: "Probe serial/uid, when several are attached" },
+      address: { type: "integer", description: "For read/write: the memory or register address" },
+      width: { type: "string", enum: ["u8", "u16", "u32"], description: "For read/write: access width (default u32)" },
+      value: { type: "integer", description: "For write: the value to store" },
+      count: { type: "integer", description: "For read: how many words to read (default 1)" },
+      location: { type: "string", description: "For breakpoint_delete/watch: the breakpoint number or the watched expression" },
     },
-    required: ["elf"],
+    required: [],
     additionalProperties: false,
   },
   summarize: (input) => String(input.action ?? "debug"),
   async execute(input, ctx): Promise<ToolResult> {
     const board = selectedBoard(ctx);
     const target = useBoard(input.target ? String(input.target) : undefined, board.target);
-    const elf = String(input.elf);
+    const probe = useBoard(input.probe ? String(input.probe) : undefined, board.probe);
+    const action = (input.action as string | undefined) ?? "run";
+    // An attach that only reads memory, registers or a fault status needs no
+    // symbols. Requiring an ELF for a field investigation was the difference
+    // between "look at the stuck board" and "go back and get the build output".
+    const SYMBOL_FREE = new Set(["fault", "read", "write", "breakpoints", "threads", "close"]);
+    const elf = input.elf ? String(input.elf) : "";
+    if (!elf && !SYMBOL_FREE.has(action)) {
+      return {
+        isError: true,
+        content:
+          `this action needs an \`elf\` for symbols; pass one, or use one of ${[...SYMBOL_FREE].join(", ")} ` +
+          `to work on the target without symbols.`,
+        display: "no elf",
+      };
+    }
     const { paths } = await flasherPaths();
     const gdb = await gdbPath();
     if (!gdb) {
@@ -522,9 +670,14 @@ const debugTool: Tool = {
       if (!program) {
         return { isError: true, content: `${serverKind} is not installed.`, display: "no server" };
       }
+      // Derive the OpenOCD target config from the chip name when the caller
+      // did not name one; otherwise "tell me the chip and attach" cannot work.
+      const derived =
+        serverKind === "openocd" ? openocdConfigsFor(target) : {};
       const command = serverCommand(serverKind, program, {
         ...(target ? { target } : {}),
         ...(elf ? { elf } : {}),
+        ...(probe ? { probe } : {}),
         ...(input.interface_config ? { interfaceConfig: String(input.interface_config) } : {}),
         ...(input.target_config ? { targetConfig: String(input.target_config) } : {}),
       });
@@ -539,6 +692,17 @@ const debugTool: Tool = {
         };
       }
 
+      // Something on the port is either the server this session wants or a
+      // program fighting for the probe. Starting a second one fails with a USB
+      // error that names neither.
+      const conflict = await checkServerPort(command.port);
+      if (conflict.open) {
+        return {
+          isError: true,
+          content: conflict.message,
+          display: "port busy",
+        };
+      }
       const started = await startServer(command);
       if (!started.ok) {
         return { isError: true, content: started.reason, display: "server failed" };
@@ -606,14 +770,166 @@ const debugTool: Tool = {
         }
       }
 
+      if (action === "fault") {
+        const words = await readFaultWords(session);
+        if (!words) {
+          sections.push("could not read the fault registers; is the target a Cortex-M and stopped?");
+        } else {
+          sections.push(formatFault(decodeFault(words), words));
+        }
+      }
+
+      if (action === "read") {
+        const address = Number(input.address);
+        if (!Number.isFinite(address)) {
+          return { isError: true, content: "read needs an `address`", display: "missing address" };
+        }
+        const width = (input.width as "u8" | "u16" | "u32" | undefined) ?? "u32";
+        const size = width === "u8" ? 1 : width === "u16" ? 2 : 4;
+        const count = Math.max(1, Math.min(64, Number(input.count ?? 1)));
+        const bytes = await readMemory(session, address, size * count);
+        if (!bytes) {
+          sections.push(`could not read ${count} ${width} at 0x${address.toString(16)}`);
+        } else {
+          sections.push(`memory at 0x${address.toString(16)} (${width} x${count}):`);
+          for (let index = 0; index < count; index++) {
+            const slice = bytes.slice(index * size, index * size + size);
+            if (slice.length < size) break;
+            const value = decodeValue(slice, width);
+            sections.push(`  0x${(address + index * size).toString(16)} = ${value} (0x${value.toString(16)})`);
+          }
+        }
+      }
+
+      if (action === "write") {
+        const address = Number(input.address);
+        if (!Number.isFinite(address)) {
+          return { isError: true, content: "write needs an `address`", display: "missing address" };
+        }
+        const value = Number(input.value);
+        if (!Number.isFinite(value)) {
+          return { isError: true, content: "write needs a `value`", display: "missing value" };
+        }
+        const width = (input.width as "u8" | "u16" | "u32" | undefined) ?? "u32";
+        const outcome = await writeMemory(session, address, encodeValue(value, width));
+        sections.push(outcome.detail);
+        if (outcome.readBack) {
+          sections.push(`read back: ${outcome.readBack.map((byte) => byte.toString(16).padStart(2, "0")).join(" ")}`);
+        }
+      }
+
+      if (action === "breakpoints") {
+        const list = await session.send("-break-list");
+        sections.push(list.body || "(no breakpoints)");
+      }
+
+      if (action === "breakpoint_delete") {
+        const number = Number(String(input.location ?? "").replace(/^#/, ""));
+        if (!Number.isFinite(number)) {
+          return { isError: true, content: "breakpoint_delete needs the breakpoint `location` number", display: "missing number" };
+        }
+        const result = await session.send(`-break-delete ${number}`);
+        sections.push(result.ok ? `deleted breakpoint ${number}` : `could not delete ${number}: ${result.body}`);
+      }
+
+      if (action === "watch") {
+        const expression = String(input.location ?? "").trim();
+        if (!expression) {
+          return { isError: true, content: "watch needs an expression in `location`", display: "missing expression" };
+        }
+        const result = await session.send(`-break-watch ${JSON.stringify(expression).slice(1, -1)}`);
+        sections.push(result.ok ? `watching ${expression}` : `could not watch ${expression}: ${result.body}`);
+      }
+
+      if (action === "threads") {
+        const result = await session.send("-thread-info");
+        const threads = parseThreads(result.body);
+        sections.push(threads.length ? "threads:" : "the target reports no threads (bare-metal, or no RTOS awareness)");
+        for (const thread of threads) sections.push(`  #${thread.id} ${thread.name ?? ""}`);
+      }
+
+      if (action === "close") sections.push("debug session closed");
+
+      // Keep the session alive between calls unless asked to close it. The
+      // server holds the probe and the breakpoints, so re-attaching on every
+      // call threw away exactly the state debugging is about.
+      const key = sessionKey(remote, target, elf);
+      if (action !== "close") {
+        putSession({ key, session, ...(server ? { server } : {}), remote, events, openedAt: Date.now() });
+        sections.push("", `session: ${key} (kept open; pass action "close" to release the probe)`);
+      }
       return { content: sections.join("\n"), display: `debug: ${action}` };
     } finally {
-      await session.close();
-      // The GDB server holds the probe; leaving it running blocks the next flash.
-      server?.kill();
+      // A session that was stored stays open; a closed or failed one is torn
+      // down here, because its server would otherwise hold the probe.
+      const key = sessionKey(remote, target, elf);
+      const kept = getSession(key);
+      if (!kept) {
+        await session.close();
+        server?.kill();
+      }
     }
   },
 };
+
+/**
+ * Send text to a COM port on Windows.
+ *
+ * The same PowerShell serialisation the reader uses; a separate, short-lived
+ * open because the writer cannot share the reader's handle.
+ */
+async function writePortText(port: string, baud: number, text: string): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  const payload = Buffer.from(text, "utf8").toString("base64");
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    `$p=New-Object System.IO.Ports.SerialPort '${port.replace(/'/g, "''")}',${baud || 115200}`,
+    "$p.Open()",
+    "$bytes=[Convert]::FromBase64String($env:PROM_WRITE)",
+    "$p.Write($bytes,0,$bytes.Length)",
+    "Start-Sleep -Milliseconds 80",
+    "$p.Close()",
+  ].join("\n");
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", "-"], {
+      env: { ...toolEnv(), PROM_WRITE: payload },
+      windowsHide: true,
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+    child.on("error", reject);
+    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(stderr.trim() || `write failed (${code})`))));
+    child.stdin.end(script);
+  });
+}
+
+/** Read CFSR/HFSR/MMFAR/BFAR through the live session. */
+async function readFaultWords(session: MiSession): Promise<FaultWords | null> {
+  const [cfsr, hfsr, mmfar, bfar] = await Promise.all(faultReadCommands().map((command) => session.send(command)));
+  const cfsrValue = parseMemoryBytes(cfsr.body);
+  const hfsrValue = parseMemoryBytes(hfsr.body);
+  if (cfsrValue === null || hfsrValue === null) return null;
+  const validity = faultAddressValidity(cfsrValue);
+  return {
+    cfsr: cfsrValue,
+    hfsr: hfsrValue,
+    ...(validity.mmfarValid ? { mmfar: parseMemoryBytes(mmfar.body) ?? 0 } : {}),
+    ...(validity.bfarValid ? { bfar: parseMemoryBytes(bfar.body) ?? 0 } : {}),
+    ...validity,
+  };
+}
+
+/** Parse `-thread-info` into a short list. */
+function parseThreads(body: string): { id: string; name?: string }[] {
+  const out: { id: string; name?: string }[] = [];
+  const pattern = /id="([^"]+)"(?:[^}]*?name="([^"]+)")?/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(body)) !== null) {
+    out.push({ id: match[1], ...(match[2] ? { name: match[2] } : {}) });
+  }
+  return out;
+}
 
 /** The Arm GDB, falling back to a plain gdb for host-side emulator runs. */
 async function gdbPath(): Promise<string | null> {
@@ -723,12 +1039,9 @@ export function svdSearchDirs(cwd: string): string[] {
   };
   for (const entry of (process.env.PROMETHEUS_SVD_DIRS ?? "").split(delimiter)) push(entry);
   push(join(cwd, ".prometheus", "svd"));
-  const packRoots = [
-    process.env.CMSIS_PACK_ROOT,
-    process.env.USERPROFILE ? join(process.env.USERPROFILE, ".cache", "cmsis-pack-manager") : undefined,
-    process.env.HOME ? join(process.env.HOME, ".cache", "cmsis-pack-manager") : undefined,
-    process.env.HOME ? join(process.env.HOME, ".cache", "cmsis-pack-manager", "cmsis") : undefined,
-  ];
+  // The roots the CMSIS pack tools actually use, on every platform the
+  // project runs on; the pack module owns the list so the two cannot drift.
+  const packRoots = packRootsFor(cwd);
   for (const root of packRoots) {
     if (!root) continue;
     push(root);
@@ -863,7 +1176,11 @@ const registersTool: Tool = {
   summarize: (input) => String(input.register ?? input.peripheral ?? input.device ?? "registers"),
   async execute(input, ctx): Promise<ToolResult> {
     const dirs = svdSearchDirs(ctx.cwd);
+    // The board the user selected is the first source: they said which part
+    // is on the desk, which beats any inference from project files.
+    const board = selectedBoard(ctx);
     const hints = chipHintsFromProject(ctx.cwd);
+    if (board.target && !hints.includes(board.target)) hints.unshift(board.target);
     const explicit = input.device ? String(input.device) : null;
     // The explicit name first, then whatever the project implies. Guessing a
     // name is only acceptable if the file it names actually exists; the
@@ -877,6 +1194,18 @@ const registersTool: Tool = {
       svdPath = found;
       deviceName = candidate;
       break;
+    }
+    if (!svdPath) {
+      // A pack already installed on this machine is the vendor-neutral last
+      // resort: its `.pdsc` names the SVD for the part.
+      for (const candidate of candidates) {
+        const packed = findDeviceInPacks(candidate, ctx.cwd);
+        if (packed?.svdPath) {
+          svdPath = packed.svdPath;
+          deviceName = candidate;
+          break;
+        }
+      }
     }
     if (!svdPath) {
       if (!explicit && hints.length === 0) {
@@ -1046,4 +1375,5 @@ export const embeddedTools: Tool[] = [
   debugTool,
   registersTool,
   analyzeTool,
+  ...runtimeTools,
 ];

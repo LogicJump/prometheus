@@ -53,6 +53,14 @@ export interface GoalDriverOptions {
   goal: string;
   maxRounds?: number;
   signal?: AbortSignal;
+  /**
+   * Rounds already run before this call, from a session resumed after a crash.
+   *
+   * Without it a resumed loop starts from round 1 and repeats the work; the
+   * round limit also has to count the rounds already spent, or resuming would
+   * quietly raise the ceiling.
+   */
+  resume?: { round: number; history: string[] };
   /** Runs one full turn. The driver supplies the prompt for it. */
   runRound: (prompt: string, context: RoundContext) => Promise<RoundOutcome>;
   /** Decides whether the goal has been met. Pure, so it can be stubbed. */
@@ -110,17 +118,20 @@ export function clampMaxRounds(value: number | undefined): number {
  */
 export async function runGoal(options: GoalDriverOptions): Promise<LoopRunResult> {
   const maxRounds = clampMaxRounds(options.maxRounds);
-  const history: string[] = [];
+  const history: string[] = [...(options.resume?.history ?? [])];
+  // The first round the loop runs is the one after whatever the session had
+  // already completed when its process died.
+  const firstRound = Math.max(1, Math.min(maxRounds + 1, (options.resume?.round ?? 0) + 1));
   let lastOutcome = "";
   let repeatCount = 0;
 
-  for (let round = 1; round <= maxRounds; round++) {
+  for (let round = firstRound; round <= maxRounds; round++) {
     if (options.signal?.aborted) {
       return { rounds: round - 1, stop: "cancelled", detail: "Stopped at your request.", history };
     }
 
     options.onRound?.({ round, phase: "start" });
-    const prompt = roundPrompt(options.goal, round, history);
+    const prompt = roundPrompt(options.goal, history.length === 0 ? 1 : round, history);
     let outcome: RoundOutcome;
     try {
       outcome = await options.runRound(prompt, { round, maxRounds, history });
@@ -177,6 +188,13 @@ export async function runGoal(options: GoalDriverOptions): Promise<LoopRunResult
 export interface TaskLoopOptions {
   maxRounds?: number;
   signal?: AbortSignal;
+  /**
+   * The task list survived the process, so do not plan again.
+   *
+   * A resumed loop that re-planned would discard the progress recorded in the
+   * list and start the work over; the list *is* the state.
+   */
+  resume?: boolean;
   /** Runs one turn with the given prompt. */
   runRound: (prompt: string, context: RoundContext) => Promise<RoundOutcome>;
   /** Reads the current task list. The list is the model's own plan. */
@@ -206,19 +224,23 @@ export async function runTaskLoop(options: TaskLoopOptions): Promise<LoopRunResu
   }
 
   // ---- planning ----
-  options.onRound?.({ round: 1, phase: "start" });
-  let planned: RoundOutcome;
-  try {
-    planned = await options.plan({ round: 1, maxRounds, history: [] });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { rounds: 1, stop: "failed", detail: `Planning failed: ${message}`, history: [`planning failed — ${message}`] };
+  // A resumed loop already has its plan, and re-planning would throw away the
+  // completed steps the list records.
+  if (!options.resume) {
+    options.onRound?.({ round: 1, phase: "start" });
+    let planned: RoundOutcome;
+    try {
+      planned = await options.plan({ round: 1, maxRounds, history: [] });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { rounds: 1, stop: "failed", detail: `Planning failed: ${message}`, history: [`planning failed — ${message}`] };
+    }
+    if (!planned.ok) {
+      return { rounds: 1, stop: "failed", detail: "Planning did not complete.", history };
+    }
+    history.push(`plan: ${planned.summary ?? "planned"}`);
+    options.onRound?.({ round: 1, phase: "end", summary: planned.summary });
   }
-  if (!planned.ok) {
-    return { rounds: 1, stop: "failed", detail: "Planning did not complete.", history };
-  }
-  history.push(`plan: ${planned.summary ?? "planned"}`);
-  options.onRound?.({ round: 1, phase: "end", summary: planned.summary });
 
   const tasks = options.readTasks();
   if (tasks.length === 0) {

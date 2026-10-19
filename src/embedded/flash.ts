@@ -54,6 +54,15 @@ export interface FlashRequest {
   part?: string;
   /** Extra arguments, passed through unchanged. */
   extraArgs?: string[];
+  /**
+   * Additional images written at their own offsets in the same esptool call.
+   *
+   * An ESP-IDF image is not one file: the bootloader, the partition table and
+   * the application each go to a different offset, and `flasher_args.json`
+   * names all three. Writing only the application at 0x0 produced a board
+   * that did not boot, with a flash that reported success.
+   */
+  images?: { path: string; offset: number }[];
 }
 
 export interface FlashResult {
@@ -240,10 +249,16 @@ export function commandFor(request: FlashRequest): string[] {
     case "esptool": {
       const args = ["--chip", "auto", "--baud", String(request.baud ?? 460800)];
       if (request.port) args.push("--port", request.port);
+      // A single image is a list of one: the same code path, and the single
+      // file keeps its documented default offset.
+      const images =
+        request.images && request.images.length > 0
+          ? request.images
+          : [{ path: request.firmware, offset: request.address ?? 0 }];
       args.push("write_flash");
-      if (request.address !== undefined) args.push("0x" + request.address.toString(16));
-      else args.push("0x0");
-      args.push(request.firmware);
+      for (const image of images) {
+        args.push("0x" + image.offset.toString(16), image.path);
+      }
       return [...args, ...extra];
     }
     case "st-flash": {
@@ -278,6 +293,10 @@ export function commandFor(request: FlashRequest): string[] {
  */
 export function validate(request: FlashRequest): string | null {
   if (!existsSync(request.firmware)) return `firmware not found: ${request.firmware}`;
+  for (const image of request.images ?? []) {
+    if (!existsSync(image.path)) return `image not found: ${image.path} (offset 0x${image.offset.toString(16)})`;
+    if (image.offset < 0 || !Number.isFinite(image.offset)) return `image ${image.path} has an invalid offset`;
+  }
   let size = 0;
   try {
     size = statSync(request.firmware).size;

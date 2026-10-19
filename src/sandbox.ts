@@ -26,6 +26,8 @@ export interface SandboxPolicy {
   mode: "off" | "enforce";
   network: "off" | "proxy" | "open";
   allowedDirs: string[];
+  /** Environment variables injected without entering the model's context. */
+  credentials?: Record<string, string>;
 }
 
 export interface CommandVerdict {
@@ -70,6 +72,15 @@ const RULES: Rule[] = [
   { class: "confirm", pattern: /\b(apt|apt-get|brew|choco|winget|scoop)\s+(install|upgrade|remove)\b/i, reason: "changing system packages" },
   { class: "confirm", pattern: /\b(sudo|runas|Start-Process\s+.*-Verb\s+RunAs)\b/i, reason: "elevating privileges" },
   { class: "confirm", pattern: /&\s*$|\bnohup\b|\bstart\s+\/b\b/i, reason: "starting a background process" },
+  // In-place edits and bulk deletes destroy content without matching any shape
+  // above. Each is one command that can rewrite every file it matches or
+  // remove a tree, so they are confirms rather than routine work.
+  { class: "confirm", pattern: /\bsed\s+(-[a-zA-Z]*i|--in-place)\b/i, reason: "editing files in place" },
+  { class: "confirm", pattern: /\b(find|fd)\b[^|;&]*\s-(delete|exec\s+rm)\b/i, reason: "deleting files by search" },
+  { class: "confirm", pattern: /\btruncate\s+(-s\s*0|--size[= ]0)\b/i, reason: "truncating a file" },
+  { class: "confirm", pattern: /\bgit\s+push\b[^|;&]*(--mirror|--all)\b/i, reason: "pushing every ref" },
+  { class: "confirm", pattern: /\bgit\s+(filter-branch|filter-repo)\b/i, reason: "rewriting repository history" },
+  { class: "confirm", pattern: />\s*\S*\.(env|pem|key|pfx)\b/i, reason: "writing over a credential file" },
 ];
 
 const NETWORK_FETCHERS = /\b(curl|wget|Invoke-WebRequest|Invoke-RestMethod|iwr|irm|git\s+clone|ssh|scp|sftp|nc|ncat|telnet)\b/i;
@@ -150,10 +161,10 @@ export function classifyCommand(command: string, cwd: string, policy: SandboxPol
     }
   }
 
-  // `proxy` is a documented policy value with no implementation behind it.
-  // Treating it as `off` silently would make the setting look like it works;
-  // an explicit confirm says what it actually does today. It is checked before
-  // the path scan so a refused-by-path command still reports the stronger rule.
+  // `proxy` never reached classification: `loadConfig` rejects it and writes
+  // `off` instead, because the only honest behaviour is the one the user can
+  // predict. The branch stays for callers that build a policy by hand (tests,
+  // a future implementation) and must not silently look implemented.
   if (policy.network === "proxy" && NETWORK_FETCHERS.test(command)) {
     return {
       class: "confirm",
@@ -267,6 +278,14 @@ export function pathsOutsideWorkspace(command: string, cwd: string, allowedDirs:
 }
 
 /** Minimal environment for sandboxed commands; secrets are not inherited. */
+/**
+ * Variables a sandboxed command may see, plus credentials the user injected.
+ *
+ * `sandbox.credentials` exists so a build can authenticate without the value
+ * ever entering the model's context: the user stores it in settings, the
+ * sandbox receives it as an environment variable, and the transcript only ever
+ * shows the variable name.
+ */
 export function sandboxEnv(policy: SandboxPolicy): NodeJS.ProcessEnv {
   if (policy.mode === "off") return { ...process.env };
 
@@ -290,6 +309,14 @@ export function sandboxEnv(policy: SandboxPolicy): NodeJS.ProcessEnv {
     env.APPDATA = process.env.APPDATA ?? "";
     env.LOCALAPPDATA = process.env.LOCALAPPDATA ?? "";
     env.ProgramFiles = process.env.ProgramFiles ?? "";
+  }
+  // Values the user explicitly injected. They are added last so a credential
+  // named PATH cannot replace the toolchain path, and never logged: the
+  // transcript names the variable, not the secret.
+  for (const [name, value] of Object.entries(policy.credentials ?? {})) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+    if (name === "PATH" || name === "SystemRoot") continue;
+    env[name] = value;
   }
   if (policy.network === "off") {
     env.HTTP_PROXY = "http://127.0.0.1:9";

@@ -256,6 +256,17 @@ function applyUiPreference(key, value) {
       document.documentElement.style.setProperty("--font-scale", String(value));
       localStorage.setItem("prometheus.fontScale", String(value));
       break;
+    case "restartSession":
+    case "suggestions":
+    case "updateCheck":
+    case "isolateByDefault":
+      localStorage.setItem(`prometheus.${key}`, value ? "1" : "0");
+      break;
+    case "uiScale":
+      state.uiScale = Number(value);
+      document.documentElement.style.setProperty("--ui-scale", String(value));
+      localStorage.setItem("prometheus.uiScale", String(value));
+      break;
     case "transcriptWidth":
       document.documentElement.dataset.width = value;
       localStorage.setItem("prometheus.width", value);
@@ -350,6 +361,38 @@ function buildGeneralPage() {
           onChange: (value) => applyPref("outputStyle", value),
         }),
       }),
+      sRow({
+        label: s.restartSession,
+        desc: s.restartSessionDesc,
+        control: sToggle({
+          checked: state.restartSession !== false,
+          onChange: (value) => applyPref("restartSession", value),
+        }),
+      }),
+      sRow({
+        label: s.suggestionsPref,
+        desc: s.suggestionsPrefDesc,
+        control: sToggle({
+          checked: state.suggestions !== false,
+          onChange: (value) => applyPref("suggestions", value),
+        }),
+      }),
+      sRow({
+        label: s.updateCheckPref,
+        desc: s.updateCheckPrefDesc,
+        control: sToggle({
+          checked: state.updateCheck !== false,
+          onChange: (value) => applyPref("updateCheck", value),
+        }),
+      }),
+      sRow({
+        label: s.isolateByDefault,
+        desc: s.isolateByDefaultDesc,
+        control: sToggle({
+          checked: Boolean(state.isolateByDefault),
+          onChange: (value) => applyPref("isolateByDefault", value),
+        }),
+      }),
     ]),
   );
   return pane;
@@ -372,6 +415,7 @@ function buildAppearancePage() {
             { value: "system", label: s.themeSystem, preview: "system" },
             { value: "light", label: s.themeLight, preview: "light" },
             { value: "dark", label: s.themeDark, preview: "dark" },
+            { value: "high-contrast", label: s.themeHighContrast, preview: "dark" },
           ],
           onChange: (value) => applyPref("theme", value),
         }),
@@ -454,6 +498,28 @@ function buildAppearancePage() {
         control: sToggle({
           checked: Boolean(state.reduceMotion),
           onChange: (value) => applyPref("reduceMotion", value),
+        }),
+      }),
+    ]),
+  );
+
+  // Interface scale is separate from the transcript's font size: it grows the
+  // sidebar, tabs, and dialogs too, which is what a user on a high-DPI display
+  // or with low vision actually needs.
+  pane.appendChild(
+    sGroup(s.groupInterface, [
+      sRow({
+        label: s.interfaceScale,
+        desc: s.interfaceScaleDesc,
+        control: sSegmented({
+          value: String(state.uiScale ?? 1),
+          options: [
+            { value: "0.9", label: "90%" },
+            { value: "1", label: "100%" },
+            { value: "1.1", label: "110%" },
+            { value: "1.25", label: "125%" },
+          ],
+          onChange: (value) => applyPref("uiScale", Number(value)),
         }),
       }),
     ]),
@@ -802,12 +868,15 @@ function buildBehaviorPage() {
       sRow({
         id: "setting-auto-approve",
         label: s.autoApprove,
-        desc: s.autoApproveDesc,
+        desc: s.autoApproveRulesHint,
         control: sText({
           id: "setting-auto-approve",
           value: (settings.autoApprove ?? []).join(", "),
           mono: true,
-          placeholder: "read_file, glob, grep",
+          // The same `Tool(specifier)` grammar saved rules use, so a CI grant
+          // and a standing approval are one language rather than two lists
+          // that disagree about what "bash" means.
+          placeholder: "read_file, Bash(git status), mcp__github__*",
           onChange: (value) => applyConfig({ autoApprove: value }),
         }),
       }),
@@ -936,6 +1005,29 @@ function buildMcpPage() {
     const foot = el("div", "settings-list-foot");
     foot.appendChild(sButton(s.mcpAdd, () => openMcpForm(null), { primary: true }));
     list.appendChild(foot);
+
+    // Vendor presets: the same entry the form writes, pre-filled with the
+    // command from the vendor's own documentation. Shown even when the tool
+    // is missing, with what to install — hiding it reads as "unsupported".
+    const presets = state.mcpPresets ?? [];
+    if (presets.length > 0) {
+      const group = el("div", "settings-group");
+      group.appendChild(el("div", "settings-group-title", s.mcpPresets));
+      for (const preset of presets) {
+        const row = el("div", "mcp-row");
+        const main = el("div", "mcp-main");
+        const title = el("div", "mcp-title");
+        title.appendChild(el("strong", "", preset.label));
+        main.appendChild(title);
+        main.appendChild(el("p", "settings-hint", preset.description));
+        if (preset.requires) main.appendChild(el("code", "mcp-command", preset.requires));
+        const actions = el("div", "mcp-actions");
+        actions.appendChild(sButton(s.mcpAddPreset, () => api.send({ cmd: "addMcpPreset", id: preset.id }), { quiet: true }));
+        row.append(main, actions);
+        group.appendChild(row);
+      }
+      list.appendChild(group);
+    }
   };
 
   const openMcpForm = (server) => {
@@ -1940,6 +2032,7 @@ function basename(path) {
         break;
       case "mcp_servers":
         state.mcpServers = message.servers ?? [];
+        state.mcpPresets = message.presets ?? state.mcpPresets ?? [];
         state.renderMcpPage?.();
         break;
       case "skills":

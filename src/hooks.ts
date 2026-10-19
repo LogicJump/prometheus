@@ -24,45 +24,72 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
+import { loadManagedSettings } from "./managed.ts";
 
 export type HookEvent =
   | "PreToolUse"
   | "PostToolUse"
+  | "PostToolUseFailure"
+  | "PermissionRequest"
   | "UserPromptSubmit"
   | "PreCompact"
   | "PostCompact"
   | "SubagentStart"
   | "SubagentStop"
   | "SessionStart"
-  | "Stop";
+  | "SessionEnd"
+  | "Stop"
+  | "Notification";
 
 /** Events whose non-zero exit blocks the action rather than only reporting. */
-const BLOCKING: HookEvent[] = ["PreToolUse", "UserPromptSubmit", "PreCompact"];
+const BLOCKING: HookEvent[] = ["PreToolUse", "UserPromptSubmit", "PreCompact", "PermissionRequest"];
+
+/**
+ * Exit code 2 is the documented "block" signal.
+ *
+ * Every non-zero exit still blocks, because a guard script that fails closed
+ * is the safe default and a change here would silently let a broken guard stop
+ * guarding. What was actually wrong is that the failure was indistinguishable
+ * from a decision: a hook that crashed on a typo vetoed the tool and its stack
+ * trace read as the reason. Exit 2 is reported as a decision; any other
+ * non-zero is labelled as a failed hook so the user can tell the two apart.
+ */
+const BLOCK_EXIT = 2;
 
 export interface Hook {
   event: HookEvent;
   matcher?: string;
   command: string;
   timeoutMs?: number;
+  /** "prompt" hooks ask the current model instead of running a command. */
+  type?: "command" | "prompt";
+  /** The instruction a prompt hook is given. */
+  prompt?: string;
 }
 
 interface HookFile {
-  hooks?: Partial<Record<HookEvent, { matcher?: string; command?: string; timeout_ms?: number }[]>>;
+  hooks?: Partial<
+    Record<HookEvent, ({ matcher?: string; command?: string; timeout_ms?: number; type?: string; prompt?: string })[]>
+  >;
 }
 
 const EVENTS: HookEvent[] = [
   "PreToolUse",
   "PostToolUse",
+  "PostToolUseFailure",
+  "PermissionRequest",
   "UserPromptSubmit",
   "PreCompact",
   "PostCompact",
   "SubagentStart",
   "SubagentStop",
   "SessionStart",
+  "SessionEnd",
   "Stop",
+  "Notification",
 ];
 
 export interface HookResult {
@@ -71,6 +98,17 @@ export interface HookResult {
   blocked: boolean;
   /** A replacement tool input (PreToolUse) or prompt (UserPromptSubmit). */
   replace?: unknown;
+  /**
+   * A structured decision, when the hook returned one.
+   *
+   * `allow` and `deny` answer the permission prompt on the user's behalf;
+   * `ask` leaves it to them. `additionalContext` is appended to the
+   * conversation so a hook can supply facts the model needs.
+   */
+  permissionDecision?: "allow" | "deny" | "ask";
+  additionalContext?: string;
+  /** Replacement output for an MCP tool, when the server's answer is not wanted. */
+  updatedMCPToolOutput?: string;
 }
 
 function readFile(file: string): Hook[] {
@@ -84,9 +122,17 @@ function readFile(file: string): Hook[] {
   const out: Hook[] = [];
   for (const event of EVENTS) {
     for (const entry of parsed.hooks?.[event] ?? []) {
-      if (!entry || typeof entry.command !== "string" || !entry.command.trim()) continue;
+      if (!entry) continue;
+      const type = entry.type === "prompt" ? "prompt" : "command";
+      if (type === "prompt") {
+        if (typeof entry.prompt !== "string" || !entry.prompt.trim()) continue;
+        out.push({ event, type: "prompt", prompt: entry.prompt, command: entry.prompt.slice(0, 80) });
+        continue;
+      }
+      if (typeof entry.command !== "string" || !entry.command.trim()) continue;
       out.push({
         event,
+        type: "command",
         matcher: typeof entry.matcher === "string" && entry.matcher !== "*" ? entry.matcher : undefined,
         command: entry.command,
         timeoutMs: Number.isFinite(entry.timeout_ms) ? Number(entry.timeout_ms) : 30_000,
@@ -98,6 +144,13 @@ function readFile(file: string): Hook[] {
 
 /** Global hooks first, then project hooks; both run. */
 export function loadHooks(cwd: string): Hook[] {
+  // A managed policy can pin hooks to its own file, so a repository cannot
+  // introduce one the administrator did not approve.
+  const managed = loadManagedSettings();
+  if (managed.allowManagedHooksOnly) {
+    const managedHooks = managed.source ? readFile(join(dirname(managed.source), "hooks.json")) : [];
+    return managedHooks;
+  }
   const global = readFile(join(CONFIG_HOME, "hooks.json"));
   // A cloned repository is not a trust decision. A project hook runs an
   // arbitrary command, so it stays dormant until the user has looked at this
@@ -144,8 +197,26 @@ function hashFile(file: string): string {
 export function projectHooksTrusted(cwd: string): boolean {
   const file = projectHooksFile(cwd);
   if (!existsSync(file)) return false;
-  const recorded = readTrust()[resolve(cwd)];
+  const recorded = readTrust()[canonicalDir(cwd)];
   return Boolean(recorded) && recorded === hashFile(file);
+}
+
+/**
+ * The key a folder's trust decision is stored under.
+ *
+ * `resolve()` alone is not stable on Windows: a temp directory is handed out
+ * by `mkdtemp` under an 8.3 short name (RUNNER~1) while process.cwd() reports
+ * the long name for the same folder. The two spellings never matched, so a
+ * trusted checkout's hooks silently stayed dormant - the exact failure this
+ * lookup exists to prevent, hidden behind an OS detail.
+ */
+function canonicalDir(cwd: string): string {
+  const absolute = resolve(cwd);
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    return absolute;
+  }
 }
 
 /** Accept this checkout's hooks as they are now. */
@@ -154,7 +225,7 @@ export function trustProjectHooks(cwd: string): void {
   const hash = hashFile(file);
   if (!hash) return;
   const trust = readTrust();
-  trust[resolve(cwd)] = hash;
+  trust[canonicalDir(cwd)] = hash;
   try {
     mkdirSync(CONFIG_HOME, { recursive: true });
     writeFileSync(trustFile(), JSON.stringify(trust, null, 2), "utf8");
@@ -166,7 +237,7 @@ export function trustProjectHooks(cwd: string): void {
 /** Withdraw a decision (the Settings page's "revoke" action). */
 export function revokeProjectHooks(cwd: string): void {
   const trust = readTrust();
-  delete trust[resolve(cwd)];
+  delete trust[canonicalDir(cwd)];
   try {
     writeFileSync(trustFile(), JSON.stringify(trust, null, 2), "utf8");
   } catch {
@@ -213,7 +284,30 @@ export function hooksFor(hooks: Hook[], event: HookEvent, toolName = ""): Hook[]
   });
 }
 
-function runOne(hook: Hook, payload: Record<string, unknown>, cwd: string): Promise<HookResult> {
+/**
+ * Runs a `type: "prompt"` hook through the current model.
+ *
+ * Set by the agent when it loads hooks: a prompt hook is a question about the
+ * event answered by the same model the session is using, which is cheaper to
+ * write than a script and can read the payload in prose.
+ */
+export type PromptHookRunner = (hook: Hook, payload: Record<string, unknown>) => Promise<string>;
+
+function runOne(
+  hook: Hook,
+  payload: Record<string, unknown>,
+  cwd: string,
+  promptRunner?: PromptHookRunner,
+): Promise<HookResult> {
+  if (hook.type === "prompt") {
+    if (!promptRunner) {
+      return Promise.resolve({ code: 0, output: "prompt hook skipped: no model available", blocked: false });
+    }
+    return promptRunner(hook, payload).then(
+      (answer) => interpretAnswer(hook, answer),
+      (err: unknown) => ({ code: 1, output: `prompt hook failed: ${(err as Error).message}`, blocked: false }),
+    );
+  }
   return new Promise((resolve) => {
     const shell = process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
     const args =
@@ -240,21 +334,50 @@ function runOne(hook: Hook, payload: Record<string, unknown>, cwd: string): Prom
     const settle = (exitCode: number) => {
       clearTimeout(timer);
       const output = (stdout.trim() || stderr.trim()).slice(0, 20_000);
-      // Exit code 2 is the explicit "block" signal; any other non-zero is a
-      // failure the user should see, but only blocking events act on it.
+      // Only exit 2 is a decision. Any other non-zero is a broken hook, which
+      // is a problem to report, not a veto to obey.
       const blocking = BLOCKING.includes(hook.event);
       const blocked = blocking && exitCode !== 0;
+      const broken = exitCode !== 0 && exitCode !== BLOCK_EXIT;
       let replace: unknown;
+      let permissionDecision: HookResult["permissionDecision"];
+      let additionalContext: string | undefined;
+      let updatedMCPToolOutput: string | undefined;
       if (stdout.trim().startsWith("{")) {
         try {
-          const parsed = JSON.parse(stdout.trim()) as { input?: unknown; prompt?: unknown };
+          const parsed = JSON.parse(stdout.trim()) as {
+            input?: unknown;
+            prompt?: unknown;
+            permissionDecision?: unknown;
+            additionalContext?: unknown;
+            updatedMCPToolOutput?: unknown;
+          };
           if (hook.event === "PreToolUse" && parsed.input && typeof parsed.input === "object") replace = parsed.input;
           if (hook.event === "UserPromptSubmit" && typeof parsed.prompt === "string") replace = parsed.prompt;
+          if (
+            parsed.permissionDecision === "allow" ||
+            parsed.permissionDecision === "deny" ||
+            parsed.permissionDecision === "ask"
+          ) {
+            permissionDecision = parsed.permissionDecision;
+          }
+          if (typeof parsed.additionalContext === "string") additionalContext = parsed.additionalContext.slice(0, 8_000);
+          if (typeof parsed.updatedMCPToolOutput === "string") {
+            updatedMCPToolOutput = parsed.updatedMCPToolOutput.slice(0, 100_000);
+          }
         } catch {
           /* stdout was prose, not a control message */
         }
       }
-      resolve({ code: exitCode, output, blocked, ...(replace !== undefined ? { replace } : {}) });
+      resolve({
+        code: exitCode,
+        output: broken ? `hook failed (exit ${exitCode}): ${output}` : output,
+        blocked,
+        ...(replace !== undefined ? { replace } : {}),
+        ...(permissionDecision ? { permissionDecision } : {}),
+        ...(additionalContext !== undefined ? { additionalContext } : {}),
+        ...(updatedMCPToolOutput !== undefined ? { updatedMCPToolOutput } : {}),
+      });
     };
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -271,14 +394,56 @@ export async function runHooks(
   event: HookEvent,
   payload: Record<string, unknown>,
   cwd: string,
+  options: { promptRunner?: PromptHookRunner; concurrency?: number } = {},
 ): Promise<HookResult[]> {
-  const results: HookResult[] = [];
-  for (const hook of hooks) {
-    const result = await runOne(hook, { event, cwd, ...payload }, cwd);
-    results.push(result);
+  // Hooks were strictly serial, so five of them cost five timeouts when one
+  // hung. They are independent observation scripts, so they run together; the
+  // results stay in declaration order and a blocking answer still wins.
+  const limit = Math.max(1, Math.min(8, options.concurrency ?? 8));
+  const results: HookResult[] = new Array(hooks.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= hooks.length) return;
+      const hook = hooks[index];
+      results[index] = await runOne(hook, { event, cwd, ...payload }, cwd, options.promptRunner);
+      // A blocker cannot cancel siblings that already started; the caller
+      // still stops at the first one in order, which is what matters.
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, hooks.length) }, () => worker()));
+  const ordered: HookResult[] = [];
+  for (const result of results) {
+    ordered.push(result);
     if (result.blocked) break;
   }
-  return results;
+  return ordered;
+}
+
+/** Turn a prompt hook's prose answer into a result. */
+function interpretAnswer(hook: Hook, answer: string): HookResult {
+  const text = answer.trim();
+  const lower = text.toLowerCase();
+  const decision = /^(allow|approve|yes)/.test(lower)
+    ? "allow"
+    : /^(deny|block|no)/.test(lower)
+      ? "deny"
+      : undefined;
+  if (!decision) {
+    return {
+      code: 0,
+      output: text.slice(0, 4_000),
+      blocked: false,
+      ...(text ? { additionalContext: text.slice(0, 8_000) } : {}),
+    };
+  }
+  return {
+    code: decision === "deny" && BLOCKING.includes(hook.event) ? BLOCK_EXIT : 0,
+    output: text.slice(0, 4_000),
+    blocked: decision === "deny" && BLOCKING.includes(hook.event),
+    permissionDecision: decision,
+  };
 }
 
 /**

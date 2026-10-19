@@ -21,6 +21,14 @@ import { loadProjectInstructions, loadRules, renderRules } from "./instructions.
 import { loadHooks, hooksFor, runHooks, applyPromptHooks, type Hook } from "./hooks.ts";
 import { ToolPipeline } from "./tools/pipeline.ts";
 import { query, type QueryEvent } from "./query.ts";
+import { SubagentRegistry, wrapReport } from "./subagents.ts";
+import * as pricingModule from "./pricing.ts";
+
+/** The last assistant message with text; the shape a sub-agent report takes. */
+function latestReport(child: Agent): string {
+  const text = [...child.messages].reverse().find((message) => message.role === "assistant" && message.content);
+  return typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
+}
 
 function toApiTools(tools: Tool[]): ApiTool[] {
   return tools.map((tool) => ({
@@ -88,6 +96,22 @@ export class Agent {
   };
   /** The model that produced the latest usage, as the client reports it. */
   lastUsedModel = "";
+  /**
+   * Tokens spent judging goals, kept apart from the conversation total.
+   *
+   * `assessGoal` is a real request and used to vanish from every accounting
+   * surface: a goal loop's true cost was invisible, and the Usage page showed
+   * a session that had run eight rounds as if it had run none of the checks.
+   */
+  readonly goalUsage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  /** Background workers this process owns, so the host can stop them on exit. */
+  detachAllowed = false;
+  private readonly detachController = new AbortController();
+
+  /** Aborts every detached worker; called from the host's shutdown path. */
+  stopDetached(): void {
+    this.detachController.abort();
+  }
   private subagentKind: "subagent" | "background" = "subagent";
   /** Set by the host so file mutations can be checkpointed per session. */
   sessionId = "";
@@ -117,6 +141,15 @@ export class Agent {
   private readonly touched = new Set<string>();
   /** Background sub-tasks still running; capped so a loop cannot spawn hundreds. */
   private readonly background = new Set<Promise<void>>();
+  /**
+   * Sub-agents that can still be addressed after their first report.
+   *
+   * Kept per parent agent: a child belongs to the conversation that spawned it,
+   * and a registry on the host would let one session message another's work.
+   */
+  readonly subagents = new SubagentRegistry();
+  /** Live children by id, so a later turn can talk to one. */
+  private readonly subagentAgents = new Map<string, Agent>();
   /** Hooks loaded at construction (PreToolUse can veto a tool). */
   private hooks: Hook[] = [];
   private readonly permissions: Permissions;
@@ -147,7 +180,10 @@ export class Agent {
     // carries exactly one.
     this.messages = messages.filter((message) => message.role !== "system");
     this.ui.setModelName?.(config.model);
-    if (!isSubagent) this.hooks = loadHooks(process.cwd());
+    // A sub-agent runs the same hooks as its parent: the audit trail and the
+    // project's guard scripts exist for every tool call, and a child that
+    // skipped them was invisible to both.
+    this.hooks = loadHooks(process.cwd());
     // The search tool is how a deferred schema becomes callable. It lives here
     // rather than in ALL_TOOLS because it needs this agent's own catalogue;
     // `syncSearchTool` adds or removes it so a session with no MCP server is
@@ -162,13 +198,27 @@ export class Agent {
    */
   private syncSearchTool(): void {
     const index = this.tools.findIndex((tool) => tool.name === "tool_search");
-    const wanted = this.tools.some((tool) => tool.deferred);
+    // An escape hatch for the case where deferring turned out to be wrong for
+    // a session: `PROMETHEUS_TOOL_SEARCH=off` sends every schema up front,
+    // `=on` defers even a single MCP tool.
+    const setting = (process.env.PROMETHEUS_TOOL_SEARCH ?? "auto").toLowerCase();
+    const wanted = setting === "off" ? false : setting === "on" ? this.tools.length > 0 && this.hasDeferrable() : this.tools.some((tool) => tool.deferred);
     if (wanted) {
       if (index >= 0) return;
       this.tools.push(this.searchTool());
       return;
     }
     if (index >= 0) this.tools.splice(index, 1);
+  }
+
+  /** True when at least one tool could be deferred. */
+  private hasDeferrable(): boolean {
+    return this.tools.some((tool) => tool.name.startsWith("mcp__"));
+  }
+
+  /** How many tools are hidden behind `tool_search` right now. */
+  deferredCount(): number {
+    return this.tools.filter((tool) => tool.deferred && !this.unlocked.has(tool.name)).length;
   }
 
   /** The `tool_search` definition, built once per call rather than stored. */
@@ -320,14 +370,51 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
 
   /** Fire the session-lifecycle hooks; callers do not await the Stop hook. */
   async fireSessionHooks(
-    event: "SessionStart" | "Stop" | "PreCompact" | "PostCompact",
+    event: "SessionStart" | "SessionEnd" | "Stop" | "PreCompact" | "PostCompact" | "Notification",
     extra: Record<string, unknown> = {},
   ): Promise<void> {
     const hooks = hooksFor(this.hooks, event);
     if (hooks.length === 0) return;
-    const results = await runHooks(hooks, event, extra, process.cwd());
+    // A prompt hook asks the current model; every other hook runs a command.
+    // The runner is shared so a hook file can mix the two.
+    const results = await runHooks(hooks, event, extra, process.cwd(), {
+      promptRunner: (hook, payload) => this.answerHookPrompt(hook, payload),
+    });
     const noise = results.map((result) => result.output).filter(Boolean).join("\n");
     if (noise) this.ui.dim(`[${event}] ${noise}`);
+    // A hook may attach context the next request needs (a branch name, a
+    // ticket id); it joins the queue as a user turn.
+    const context = results.map((result) => result.additionalContext).filter(Boolean).join("\n");
+    if (context) this.injectContext(context);
+  }
+
+  /**
+   * Answer a `type: "prompt"` hook with the session's own model.
+   *
+   * One request, no tools, capped output: a hook question is short and its
+   * answer decides whether something runs, so it must not become a second
+   * agent loop.
+   */
+  private async answerHookPrompt(hook: Hook, payload: Record<string, unknown>): Promise<string> {
+    const question =
+      `${hook.prompt ?? ""}\n\nEvent: ${String(payload.event ?? "")}\n` +
+      `Payload: ${JSON.stringify(payload).slice(0, 6_000)}\n\n` +
+      `Answer with ALLOW or DENY on the first line, then one sentence of reasoning.`;
+    const result = await this.client.chat(
+      [{ role: "user", content: question }],
+      [],
+      () => {},
+      () => {},
+      new AbortController().signal,
+    );
+    return result.content;
+  }
+
+  /** Append hook-supplied context to the conversation as a user turn. */
+  private injectContext(text: string): void {
+    const body = text.trim();
+    if (!body) return;
+    this.queued.push(`[context supplied by a hook]\n${body.slice(0, 8_000)}`);
   }
 
   /**
@@ -454,6 +541,9 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
 
   /** Stream one assistant turn and execute any tool calls until the model stops. */
   async run(text: string): Promise<void> {
+    this.lastActivityAt = Date.now();
+    this.idleCompacted = false;
+    this.checkBudget();
     const prompt = await this.applyPromptHooks(text);
     if (prompt === null) return;
     this.pushUser(prompt);
@@ -486,11 +576,20 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         permissions: this.permissions,
         todos: this.todos,
         hooks: this.hooks,
+        onContext: (text) => this.injectContext(text),
         sessionId: this.sessionId,
         onBeforeMutate: this.onBeforeMutate,
-        runSubagent: (prompt) => this.runSubagent(prompt, this.abortController?.signal ?? new AbortController().signal),
-        runSubagents: (prompts) => this.runSubagents(prompts, this.abortController?.signal ?? new AbortController().signal),
+        runSubagent: (prompt, options) =>
+          this.runSubagent(prompt, this.abortController?.signal ?? new AbortController().signal, options ?? {}),
+        runSubagents: (prompts, options) =>
+          this.runSubagents(prompts, this.abortController?.signal ?? new AbortController().signal, options ?? {}),
         runSubagentInBackground: (prompt) => this.startBackgroundSubagent(prompt),
+        subagents: {
+          list: () => this.subagents.list(),
+          message: (id, text) => this.messageSubagent(id, text),
+          stop: (id) => this.stopSubagent(id),
+          report: (id) => this.subagentReport(id),
+        },
         messageIndex: () => this.messages.length,
         onTouch: (path) => this.noteTouched(path),
         // A sub-agent is not a grant. Its permission layer runs the same checks
@@ -502,8 +601,104 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     );
   }
 
+  /** True when the most recent run stopped at the turn cap instead of finishing. */
+  lastRunPartial = false;
+  /** Set when a session budget or money ceiling stops the next turn. */
+  budgetExhausted: "tokens" | "money" | "goal" | null = null;
+  /** How many turns the most recent run used. */
+  lastRunTurns = 0;
+  /** Turns across every run in this agent's life; a sub-agent's work measure. */
+  turnCount = 0;
+  /** Wall clock of the last activity, for idle compaction. */
+  private lastActivityAt = Date.now();
+  /** Set once idle compaction ran, so it does not repeat while still idle. */
+  private idleCompacted = false;
+
+  /** Assistant turns this run, counted from the events the loop yields. */
+  private countTurnsThisRun = 0;
+
+  /**
+   * Refuse a turn that would exceed a configured ceiling.
+   *
+   * Checked between turns rather than mid-turn: interrupting a model request
+   * partway through a tool batch leaves the conversation without a matching
+   * tool result, and the user has already paid for it.
+   */
+  private checkBudget(): void {
+    const tokens = this.sessionTokens();
+    if (this.config.sessionTokenBudget && tokens >= this.config.sessionTokenBudget) {
+      this.budgetExhausted = "tokens";
+      throw new Error(
+        `session token budget reached (${tokens.toLocaleString()} of ${this.config.sessionTokenBudget.toLocaleString()}); ` +
+          `raise sessionTokenBudget or start a new session`,
+      );
+    }
+    const money = this.config.maxBudgetUsd;
+    if (money) {
+      const spent = this.sessionCost();
+      if (spent !== null && spent >= money) {
+        this.budgetExhausted = "money";
+        throw new Error(
+          `session budget reached ($${spent.toFixed(4)} of $${money.toFixed(2)}); raise maxBudgetUsd or start a new session`,
+        );
+      }
+    }
+    // A goal loop is many turns by construction. Without its own ceiling a
+    // single "keep going until done" request could spend a session's whole
+    // allowance before the user looked at it, so the loop stops at its own
+    // limit and says which limit fired.
+    const goalMoney = this.config.goalBudgetUsd;
+    if (goalMoney) {
+      const goalCost = this.loopCost();
+      if (goalCost !== null && goalCost >= goalMoney) {
+        this.budgetExhausted = "goal";
+        throw new Error(
+          `goal budget reached ($${goalCost.toFixed(4)} of $${goalMoney.toFixed(2)}); raise goalBudgetUsd or continue manually`,
+        );
+      }
+    }
+  }
+
+  /** Where the spend stood when the current goal loop started. */
+  private loopBaseline: Usage | null = null;
+
+  /** Called by the host before a goal/task loop starts a round. */
+  markLoopStart(): void {
+    this.loopBaseline = { ...this.usage };
+  }
+
+  /**
+   * Dollars spent by the current loop, or null when the model has no price.
+   *
+   * Measured from the loop's start rather than the session's, so a long
+   * conversation that then asks for one loop is not charged for the history.
+   */
+  loopCost(): number | null {
+    const baseline = this.loopBaseline;
+    const delta: Usage = baseline
+      ? {
+          inputTokens: Math.max(0, this.usage.inputTokens - baseline.inputTokens),
+          outputTokens: Math.max(0, this.usage.outputTokens - baseline.outputTokens),
+          cachedTokens: Math.max(0, this.usage.cachedTokens - baseline.cachedTokens),
+        }
+      : this.usage;
+    return pricingModule.costOf(this.lastUsedModel || this.config.model, delta);
+  }
+
+  /** Input + output tokens spent across every run of this agent. */
+  sessionTokens(): number {
+    return this.usage.inputTokens + this.usage.outputTokens;
+  }
+
+  /** Dollars spent so far, or null when the model has no price. */
+  sessionCost(): number | null {
+    const { costOf } = pricingModule;
+    return costOf(this.lastUsedModel || this.config.model, this.usage);
+  }
+
   private async loop(): Promise<void> {
     this.abortController = new AbortController();
+    this.countTurnsThisRun = 0;
     const signal = this.abortController.signal;
     // Tokens already spent before this run. `query()` counts from zero each
     // run, so the balance is carried across, not reset.
@@ -512,6 +707,18 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     this.reportedUsage.inputTokens = 0;
     this.reportedUsage.outputTokens = 0;
     this.reportedUsage.cachedTokens = 0;
+    // A model with no price row cannot enforce `maxBudgetUsd`, and a user who
+    // set a ceiling deserves to hear that once rather than discover it when
+    // the bill arrives.
+    if (!this.isSubagent && !this.warnedUnpriced && (this.config.maxBudgetUsd || this.config.goalBudgetUsd)) {
+      if (pricingModule.costOf(this.config.model, { inputTokens: 0, outputTokens: 0 }) === null) {
+        this.warnedUnpriced = true;
+        this.ui.warn(
+          `no price is known for ${this.config.model}; the budget ceilings cannot be enforced for it. ` +
+            `Set maxBudgetUsd only for models this build can price, or accept that the ceiling is advisory.`,
+        );
+      }
+    }
     if (this.config.contextWindowAssumed && !this.isSubagent && !this.warnedAssumedWindow) {
       // A guessed window that is too large means the first sign of trouble is
       // an endpoint 400 partway through a long task. One line at the start is
@@ -536,6 +743,11 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         drainQueue: () => this.queued.splice(0),
         summarize: (old, local, focus) => this.summarizeWithModel(old, local, signal, focus),
         rehydrate: () => this.rehydration(),
+        // The compactor reads `messages`; the system prompt and tool schemas
+        // are billed on the same request and were the missing part of the
+        // trigger's arithmetic.
+        overheadTokens: () =>
+          estimateTextTokens(this.requestSystemPrompt()) + toolSchemaTokens(this.visibleTools()),
         maxRetries: 3,
         beforeCompact: (info) => this.beforeCompact(info),
         afterCompact: (info) => {
@@ -547,9 +759,23 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         },
       });
 
-      for await (const event of events) {
-        this.onQueryEvent?.(event);
-        this.dispatch(event);
+      // Iterated by hand rather than with `for await`: the generator's return
+      // value says whether the turn finished or stopped at the cap, and a
+      // sub-agent has to pass that on so its report is not read as complete.
+      const iterator = events[Symbol.asyncIterator]();
+      let step = await iterator.next();
+      while (!step.done) {
+        this.onQueryEvent?.(step.value);
+        this.dispatch(step.value);
+        if (step.value.type === "usage") this.countTurnsThisRun++;
+        step = await iterator.next();
+      }
+      const outcome = step.value as { reason?: string; partial?: boolean } | undefined;
+      this.lastRunPartial = outcome?.partial === true;
+      this.lastRunTurns = this.countTurnsThisRun;
+      this.turnCount += this.countTurnsThisRun;
+      if (outcome?.partial && this.isSubagent) {
+        this.ui.warn("this sub-agent hit its turn limit; its report is incomplete");
       }
     } finally {
       this.ui.spinnerStop();
@@ -560,6 +786,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   }
 
   private warnedAssumedWindow = false;
+  private warnedUnpriced = false;
 
   /**
    * Compact on demand (`/compact` and the desktop's compact button).
@@ -569,7 +796,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
    * *better* recap produced the worst one. It now shares the model-backed path
    * with automatic compaction, accepts a focus, and fires the same hooks.
    */
-  async compactNow(options: { focus?: string } = {}): Promise<{
+  async compactNow(options: { focus?: string; keepRecent?: number } = {}): Promise<{
     removed: number;
     before: number;
     after: number;
@@ -578,7 +805,10 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   } | null> {
     if (this.busy) throw new Error("stop the current turn before compacting");
     const before = estimateTokens(this.messages);
-    const verdict = await this.beforeCompact({ before, trigger: "auto" });
+    // The hook can tell a user-requested compaction from a size-triggered one,
+    // which matters: a hook that stashes context is useful automatically and
+    // noise when the user just asked for a smaller transcript.
+    const verdict = await this.beforeCompact({ before, trigger: "manual" });
     if (verdict.blocked) throw new Error(`compaction was blocked by a PreCompact hook${verdict.reason ? `: ${verdict.reason}` : ""}`);
     const signal = new AbortController().signal;
     const result = await compactWithModel(this.messages, this.config.contextWindow, {
@@ -586,6 +816,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       signal,
       rehydrate: () => this.rehydration(),
       ...(options.focus ? { focus: options.focus } : {}),
+      ...(options.keepRecent ? { keepRecent: options.keepRecent } : {}),
       force: true,
     });
     if (!result) return null;
@@ -620,7 +851,9 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
    * hook that wanted to save context first always arrived too late. A hook
    * that exits non-zero now stops the compaction instead.
    */
-  private async beforeCompact(info: { before: number; trigger: "auto" }): Promise<{ blocked?: boolean; reason?: string }> {
+  private async beforeCompact(
+    info: { before: number; trigger: "auto" | "manual" },
+  ): Promise<{ blocked?: boolean; reason?: string }> {
     if (this.isSubagent) return {};
     const hooks = hooksFor(this.hooks, "PreCompact");
     if (hooks.length === 0) return {};
@@ -690,6 +923,15 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 45_000));
     const result = await Promise.race([request, timeout]);
     if (!result) return localSummary;
+    // The recap is a paid request like any other. It used to be missing from
+    // every counter, so a session that compacted five times under-reported its
+    // spend by five summarizer turns.
+    this.goalUsage.inputTokens += result.usage?.inputTokens ?? 0;
+    this.goalUsage.outputTokens += result.usage?.outputTokens ?? 0;
+    this.goalUsage.cachedTokens += result.usage?.cachedTokens ?? 0;
+    if (result.usage?.cacheWriteTokens) {
+      this.goalUsage.cacheWriteTokens = (this.goalUsage.cacheWriteTokens ?? 0) + result.usage.cacheWriteTokens;
+    }
     return result.content.trim() || localSummary;
   }
 
@@ -728,9 +970,53 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     const result = await Promise.race([request, timeout]).catch(() => null);
     if (!result) return { met: false, reason: "could not confirm the goal; treating it as unfinished" };
 
+    this.goalUsage.inputTokens += result.usage?.inputTokens ?? 0;
+    this.goalUsage.outputTokens += result.usage?.outputTokens ?? 0;
+    this.goalUsage.cachedTokens += result.usage?.cachedTokens ?? 0;
+    if (result.usage?.cacheWriteTokens) {
+      this.goalUsage.cacheWriteTokens = (this.goalUsage.cacheWriteTokens ?? 0) + result.usage.cacheWriteTokens;
+    }
+
     const text = result.content.trim();
     const met = /^MET\s*:/i.test(text);
     return { met, reason: text.replace(/^(NOT\s+)?MET\s*:\s*/i, "") || (met ? "The goal is met." : "Not yet.") };
+  }
+
+  /**
+   * A short title for the conversation, from its first exchange.
+   *
+   * Six words, no punctuation, plain language: it is a label in a list, not a
+   * summary. Failure returns null rather than inventing one — the sidebar
+   * already falls back to the first message, and a bad title is worse than the
+   * message itself.
+   *
+   * `cheap` asks for the smallest model the caller has; a title is not worth a
+   * frontier model, and the caller decides what "cheap" means here.
+   */
+  async proposeTitle(firstMessage: string, reply: string): Promise<string | null> {
+    const request = this.client.chat(
+      [
+        {
+          role: "system",
+          content:
+            "Give the conversation a title: at most six words, no quotes, no trailing punctuation, in the language the user wrote in. " +
+            "Describe what they are working on, not what they said. Answer with the title only.",
+        },
+        { role: "user", content: `User: ${firstMessage.slice(0, 1500)}
+
+Assistant: ${reply.slice(0, 1500)}` },
+      ],
+      [],
+      () => {},
+      () => {},
+      new AbortController().signal,
+    );
+    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000));
+    const result = await Promise.race([request, timeout]).catch(() => null);
+    if (!result) return null;
+    const title = result.content.trim().replace(/^["'#\s]+|["'\s.]+$/g, "").replace(/\s+/g, " ");
+    if (!title || title.length > 80) return null;
+    return title;
   }
 
   /** Translate a loop event into the terminal UI calls. */
@@ -743,12 +1029,24 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       case "assistant_text":
         ui.assistantText(event.text);
         break;
+      case "tool_delta":
+        // Long arguments (a whole file, a patch) are most of the time a
+        // request spends streaming. The UI shows progress from them; the tool
+        // still runs on the parsed result when the call is complete.
+        ui.toolDelta?.(event.name, event.text);
+        break;
+      case "assistant_discard":
+        // A retry restarts the reply. The UI throws away what it rendered so
+        // the second attempt does not appear as a continuation of the first.
+        ui.discardAssistant?.();
+        break;
       case "thinking":
         ui.spinnerStop();
         ui.thinking(event.text);
         break;
       case "retry":
         ui.spinnerStop();
+        ui.retryAttempt?.(event.attempt + 1, event.delayMs, event.message);
         ui.warn(`${event.message} - retrying in ${event.delayMs / 1000}s (attempt ${event.attempt + 1})`);
         break;
       // Both used to be fired from the `compacted` event, i.e. after the
@@ -791,17 +1089,28 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
           inputTokens: Math.max(0, event.usage.inputTokens - this.reportedUsage.inputTokens),
           outputTokens: Math.max(0, event.usage.outputTokens - this.reportedUsage.outputTokens),
           cachedTokens: Math.max(0, event.usage.cachedTokens - this.reportedUsage.cachedTokens),
+          cacheWriteTokens: Math.max(
+            0,
+            (event.usage.cacheWriteTokens ?? 0) - (this.reportedUsage.cacheWriteTokens ?? 0),
+          ),
         };
         this.reportedUsage = { ...event.usage };
         const main = this.usageBySource.main;
         main.inputTokens += delta.inputTokens;
         main.outputTokens += delta.outputTokens;
         main.cachedTokens += delta.cachedTokens;
+        if (delta.cacheWriteTokens > 0) {
+          main.cacheWriteTokens = (main.cacheWriteTokens ?? 0) + delta.cacheWriteTokens;
+        }
         this.lastUsedModel = this.activeModel();
         this.usage = {
           inputTokens: event.usage.inputTokens + this.usageBase.inputTokens + this.subagentUsage.inputTokens,
           outputTokens: event.usage.outputTokens + this.usageBase.outputTokens + this.subagentUsage.outputTokens,
           cachedTokens: event.usage.cachedTokens + this.usageBase.cachedTokens + this.subagentUsage.cachedTokens,
+          cacheWriteTokens:
+            (event.usage.cacheWriteTokens ?? 0) +
+            (this.usageBase.cacheWriteTokens ?? 0) +
+            (this.subagentUsage.cacheWriteTokens ?? 0),
         };
         break;
       }
@@ -823,7 +1132,9 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     return client.active?.options?.model ?? client.options?.model ?? this.config.model;
   }
 
-  private addSubagentUsage(usage: Usage, kind: "subagent" | "background" = "subagent"): void {    this.subagentUsage.inputTokens += usage.inputTokens;
+  private addSubagentUsage(usage: Usage, kind: "subagent" | "background" = "subagent"): void {
+    this.subagentUsage.cacheWriteTokens = (this.subagentUsage.cacheWriteTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
+    this.subagentUsage.inputTokens += usage.inputTokens;
     this.subagentUsage.outputTokens += usage.outputTokens;
     this.subagentUsage.cachedTokens += usage.cachedTokens;
     this.usage.inputTokens += usage.inputTokens;
@@ -838,6 +1149,32 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   }
 
   /**
+   * The messages a child starts from.
+   *
+   * `none` is the old behaviour and stays the default: a fresh context is what
+   * keeps a broad search from flooding the parent. `summary` and `full` exist
+   * for the case where rediscovering the task costs more than carrying it —
+   * a child that must edit files the parent has been discussing needs the
+   * decisions, not just the file names.
+   */
+  private seedForSubagent(context: "none" | "summary" | "full", prompt: string): ChatMessage[] {
+    if (context === "none") return [];
+    if (context === "full") {
+      // The child gets the conversation as it stands. Its own prompt follows as
+      // the user turn, so a fork does not have to be told what the parent knows.
+      return this.messages.filter((message) => message.role !== "system").slice(-60);
+    }
+    // `summary`: the same head/tail summarizer the compactor uses, over the
+    // recent conversation, as a single user message.
+    const recent = this.messages.filter((message) => message.role !== "system").slice(-40);
+    const digest = summarizerInput(recent, 12_000);
+    if (!digest) return [];
+    return [{ role: "user", content: `Context from the parent session:
+
+${digest}` }];
+  }
+
+  /**
    * Build one isolated child agent for a sub-task, with a proxied UI.
    *
    * The child runs with the parent's permission mode. It used to be forced to
@@ -846,13 +1183,30 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
    * and never chose. In `ask` mode the child's mutations now prompt like the
    * parent's, and in plan mode the child stays read-only.
    */
-  private spawnSubagent(label: string): Agent {    const child = new Agent(
-      { ...this.config, maxTurns: Math.min(25, this.config.maxTurns) },
+  private spawnSubagent(
+    label: string,
+    context: "none" | "summary" | "full" = "none",
+    prompt = "",
+  ): Agent {
+    const seedMessages = this.seedForSubagent(context, prompt);
+    const child = new Agent(
+      {
+        ...this.config,
+        maxTurns: Math.min(25, this.config.maxTurns),
+        // The child compacts against its own window when one is configured;
+        // otherwise it inherits the session's, which is the old behaviour.
+        ...(this.config.subagentContextWindow ? { contextWindow: this.config.subagentContextWindow } : {}),
+      },
       this.ui,
       this.client,
       SUBAGENT_TOOLS,
-      new Permissions({ ...this.config }, this.ui),
-      [],
+      (() => {
+        const childPermissions = new Permissions({ ...this.config }, this.ui);
+        // The parent's own origin, or a new label for a child of a child.
+        childPermissions.source = this.permissions.source ? `${this.permissions.source}/${label}` : label;
+        return childPermissions;
+      })(),
+      seedMessages,
       true,
     );
     // Surface the child's tool activity in the parent transcript's sub-agent group.
@@ -869,24 +1223,119 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     return child;
   }
 
-  private async runSubagent(prompt: string, signal: AbortSignal): Promise<string> {
+  /**
+   * Start a sub-agent and return its id.
+   *
+   * The child outlives the first report: its transcript and abort controller
+   * stay in the registry so a later turn can send it more work, stop it, or
+   * read what it did. Fresh-context is the default; `fork` seeds the child
+   * with the parent's conversation so it does not have to rediscover the task.
+   */
+  private startSubagent(
+    prompt: string,
+    options: { context: "none" | "summary" | "full"; label: string; background?: boolean },
+  ): { id: string; child: Agent } {
+    const label = options.label;
+    const child = this.spawnSubagent(label, options.context, prompt);
+    const record = this.subagents.create({
+      label,
+      prompt,
+      context: options.context,
+      background: options.background ?? false,
+    });
+    // The id travels with the start event so the card can be stopped, expanded,
+    // or paired with the report it eventually produces.
+    this.ui.subagentStart?.(prompt, { id: record.id });
+    this.subagentAgents.set(record.id, child);
+    return { id: record.id, child };
+  }
+
+  /** Every child this session has started, newest state included. */
+  listSubagents(): { id: string; label: string; status: string; context: string; turns: number; elapsedMs: number }[] {
+    const now = Date.now();
+    return this.subagents.all().map((record) => ({
+      id: record.id,
+      label: record.label,
+      status: record.status,
+      context: record.context,
+      turns: record.turns,
+      elapsedMs: (record.endedAt ?? now) - record.startedAt,
+    }));
+  }
+
+  /** Latest report of a child, or null when the id is unknown. */
+  subagentReport(id: string): string | null {
+    return this.subagents.get(id)?.report ?? null;
+  }
+
+  /**
+   * Send another instruction to an existing sub-agent.
+   *
+   * The child keeps its transcript, so a correction costs one message instead
+   * of re-running the whole task — which is the point of an addressable unit.
+   */
+  private async messageSubagent(id: string, text: string): Promise<string> {
+    const child = this.subagentAgents.get(id);
+    const record = this.subagents.get(id);
+    if (!child || !record) throw new Error(`no sub-agent with id ${id}`);
+    if (record.status === "running") throw new Error(`sub-agent ${id} is still running; wait for its report first`);
+    if (child.busy) throw new Error(`sub-agent ${id} is busy`);
+    record.status = "running";
+    this.ui.subagentStart?.(`${record.label}: ${text.slice(0, 120)}`);
+    try {
+      await child.run(text);
+      record.turns = child.turnCount;
+      const report = latestReport(child);
+      this.subagents.settle(id, "idle", report);
+      const final = child.lastRunPartial ? `[partial: hit the turn limit]
+${report}` : report;
+      this.ui.subagentEnd?.(true, report.slice(0, 160));
+      return wrapReport(id, record.label, final);
+    } catch (err) {
+      this.subagents.settle(id, "failed", (err as Error).message);
+      this.ui.subagentEnd?.(false, (err as Error).message);
+      throw err;
+    }
+  }
+
+  /** Stop a running sub-agent without touching the rest of the turn. */
+  stopSubagent(id: string): boolean {
+    const child = this.subagentAgents.get(id);
+    const record = this.subagents.get(id);
+    if (!child || !record) return false;
+    child.abort();
+    this.subagents.settle(id, "stopped", record.report);
+    return true;
+  }
+
+  private async runSubagent(
+    prompt: string,
+    signal: AbortSignal,
+    options: { context?: "none" | "summary" | "full" } = {},
+  ): Promise<string> {
     if (this.isSubagent) throw new Error("sub-agents cannot spawn sub-agents");
     this.ui.info("  ↳ sub-agent started");
-    this.ui.subagentStart?.(prompt);
     await this.fireSubagentHooks("SubagentStart", prompt);
-    const child = this.spawnSubagent("sub-agent");
+    const { id, child } = this.startSubagent(prompt, {
+      context: options.context ?? "none",
+      label: "sub-agent",
+    });
     const onAbort = () => child.abort();
     signal.addEventListener("abort", onAbort, { once: true });
     try {
       await child.run(prompt);
-      const text = [...child.messages].reverse().find((m) => m.role === "assistant" && m.content);
+      const report = latestReport(child);
       this.addSubagentUsage(child.usage);
       this.ui.info("  ↳ sub-agent finished");
-      const report = typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
+      const status = child.lastRunPartial ? "idle" : "done";
+      this.subagents.settle(id, status, report);
       this.ui.subagentEnd?.(true, report.slice(0, 160));
       await this.fireSubagentHooks("SubagentStop", prompt, report);
-      return report;
+      const text = child.lastRunPartial ? `[partial: hit the turn limit]
+${report}` : report;
+      return wrapReport(id, "sub-agent", text);
     } catch (err) {
+      this.subagents.settle(id, "failed", (err as Error).message);
       this.ui.subagentEnd?.(false, (err as Error).message);
       await this.fireSubagentHooks("SubagentStop", prompt, (err as Error).message);
       throw err;
@@ -901,26 +1350,41 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
    * controller (so one failure does not cancel the others) and its own
    * transcript; only the reports come back.
    */
-  private async runSubagents(prompts: string[], signal: AbortSignal): Promise<{ ok: boolean; report: string }[]> {
+  private async runSubagents(
+    prompts: string[],
+    signal: AbortSignal,
+    options: { context?: "none" | "summary" | "full" } = {},
+  ): Promise<{ ok: boolean; report: string }[]> {
     if (this.isSubagent) throw new Error("sub-agents cannot spawn sub-agents");
     this.ui.info(`  ↳ ${prompts.length} sub-agents started in parallel`);
     const children = prompts.map((prompt, index) => {
       this.ui.subagentStart?.(`[${index + 1}] ${prompt}`);
-      return { prompt, index, child: this.spawnSubagent(`#${index + 1}`) };
+      const record = this.subagents.create({
+        label: `#${index + 1}`,
+        prompt,
+        context: options.context ?? "none",
+        background: false,
+      });
+      const child = this.spawnSubagent(`#${index + 1}`, options.context ?? "none", prompt);
+      this.subagentAgents.set(record.id, child);
+      return { prompt, index, child, id: record.id };
     });
     const onAbort = () => children.forEach(({ child }) => child.abort());
     signal.addEventListener("abort", onAbort, { once: true });
 
     const results = await Promise.all(
-      children.map(async ({ prompt, index, child }) => {
+      children.map(async ({ prompt, index, child, id }) => {
         try {
           await child.run(prompt);
-          const text = [...child.messages].reverse().find((m) => m.role === "assistant" && m.content);
+          const report = latestReport(child);
           this.addSubagentUsage(child.usage);
-          const report = typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
+          this.subagents.settle(id, child.lastRunPartial ? "idle" : "done", report);
           this.ui.subagentEnd?.(true, `#${index + 1} ${report.slice(0, 120)}`);
-          return { ok: true, report };
+          const text = child.lastRunPartial ? `[partial: hit the turn limit]
+${report}` : report;
+          return { ok: true, report: wrapReport(id, `#${index + 1}`, text) };
         } catch (err) {
+          this.subagents.settle(id, "failed", (err as Error).message);
           this.ui.subagentEnd?.(false, `#${index + 1} ${(err as Error).message}`);
           return { ok: false, report: `sub-agent failed: ${(err as Error).message}` };
         } finally {

@@ -22,6 +22,12 @@ export interface ModelPrice {
   output: number;
   /** Discounted rate for cache hits; defaults to `input` when unknown. */
   cachedInput?: number;
+  /**
+   * Rate for input tokens written into the cache. Most gateways charge a
+   * premium over an uncached token; when unset the plain input rate is used,
+   * which is the conservative choice for a cost estimate.
+   */
+  cacheWrite?: number;
 }
 
 /** Prefix-matched, longest prefix wins. */
@@ -77,16 +83,25 @@ export function priceFor(model: string): ModelPrice | null {
  */
 export function costOf(
   model: string,
-  tokens: { inputTokens: number; outputTokens: number; cachedTokens?: number },
+  tokens: { inputTokens: number; outputTokens: number; cachedTokens?: number; cacheWriteTokens?: number },
 ): number | null {
   const price = priceFor(model);
   if (!price) return null;
-  const cached = Math.min(Math.max(0, tokens.cachedTokens ?? 0), Math.max(0, tokens.inputTokens));
-  const fullPriceInput = Math.max(0, tokens.inputTokens - cached);
+  // Cache writes are part of `inputTokens` on every gateway that reports them,
+  // so they are carved out of the full-price bucket the same way cache reads
+  // are. Counting them twice would overstate a turn by the size of the prompt.
+  const written = Math.min(Math.max(0, tokens.cacheWriteTokens ?? 0), Math.max(0, tokens.inputTokens));
+  const cached = Math.min(
+    Math.max(0, tokens.cachedTokens ?? 0),
+    Math.max(0, tokens.inputTokens) - written,
+  );
+  const fullPriceInput = Math.max(0, tokens.inputTokens - cached - written);
   const cachedRate = price.cachedInput ?? price.input;
+  const writeRate = price.cacheWrite ?? price.input;
   const dollars =
     (fullPriceInput / 1_000_000) * price.input +
     (cached / 1_000_000) * cachedRate +
+    (written / 1_000_000) * writeRate +
     (Math.max(0, tokens.outputTokens) / 1_000_000) * price.output;
   return Math.round(dollars * 1e6) / 1e6;
 }

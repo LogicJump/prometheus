@@ -203,16 +203,64 @@ export function findArtifacts(root: string, patterns: string[] | undefined, hint
   return found;
 }
 
-/** `arm-none-eabi-size -A`, when the toolchain is present. */
+/**
+ * Flash/RAM usage from the `size` that belongs to the ELF's own toolchain.
+ *
+ * Only the Arm `size` was tried, so an ESP32-C or any RISC-V part produced no
+ * usage at all - the build succeeded and the one number that tells you whether
+ * it fits was missing. The ELF's machine type says which toolchain built it.
+ */
 async function sizeOf(elf: string): Promise<MemoryUsage | undefined> {
-  const sizeTool = await tool("gcc-arm");
-  if (!sizeTool) return undefined;
-  // The size binary sits next to the compiler it belongs to.
-  const candidate = sizeTool.path.replace(/gcc(\.exe)?$/, sizeTool.path.endsWith(".exe") ? "size.exe" : "size");
-  const program = existsSync(candidate) ? candidate : "arm-none-eabi-size";
-  const result = await run(program, ["-A", elf], process.cwd(), 15_000);
-  if (result.code !== 0 || !result.out.includes("section")) return undefined;
-  return parseSize(result.out);
+  const families = await sizeFamilies(elf);
+  for (const family of families) {
+    const sizeTool = await tool(family);
+    if (!sizeTool) continue;
+    const candidate = sizeTool.path.replace(/gcc(\.exe)?$/, sizeTool.path.endsWith(".exe") ? "size.exe" : "size");
+    const program = existsSync(candidate) ? candidate : defaultSizeName(family);
+    const result = await run(program, ["-A", elf], process.cwd(), 15_000);
+    if (result.code !== 0 || !result.out.includes("section")) continue;
+    const parsed = parseSize(result.out);
+    if (parsed) return parsed;
+  }
+  // ESP-IDF's `idf.py size` reports in its own format; when the RISC-V size
+  // binary is not installed, still try the plain one so a bug report has a
+  // number rather than a blank.
+  return undefined;
+}
+
+/** Toolchain kinds to try for an ELF, most likely first. */
+async function sizeFamilies(elf: string): Promise<("gcc-arm" | "gcc-riscv")[]> {
+  const machine = await elfMachine(elf);
+  if (machine === 243) return ["gcc-riscv", "gcc-arm"]; // EM_RISCV
+  if (machine === 40 || machine === 0) return ["gcc-arm", "gcc-riscv"]; // EM_ARM
+  return ["gcc-arm", "gcc-riscv"];
+}
+
+function defaultSizeName(family: "gcc-arm" | "gcc-riscv"): string {
+  return family === "gcc-riscv" ? "riscv64-unknown-elf-size" : "arm-none-eabi-size";
+}
+
+/**
+ * The ELF header's e_machine field.
+ *
+ * Bytes 18-19, little-endian. Reading it is a dozen bytes and removes the
+ * guesswork about which `size` to run.
+ */
+async function elfMachine(path: string): Promise<number | null> {
+  try {
+    const { openSync, readSync, closeSync } = await import("node:fs");
+    const fd = openSync(path, "r");
+    const header = Buffer.alloc(20);
+    try {
+      readSync(fd, header, 0, 20, 0);
+    } finally {
+      closeSync(fd);
+    }
+    if (header[0] !== 0x7f || header.toString("ascii", 1, 4) !== "ELF") return null;
+    return header[18] | (header[19] << 8);
+  } catch {
+    return null;
+  }
 }
 
 export async function build(options: BuildOptions = {}): Promise<BuildResult> {

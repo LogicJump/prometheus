@@ -103,25 +103,42 @@ export function browserNavigate(win, action, arg) {
   };
 }
 
-export function browserSnapshot(win) {
+export function browserSnapshot(win, options = {}) {
   const view = views.get(win);
   if (!view) return null;
   const wc = view.webContents;
+  const selector = options.selector ? JSON.stringify(String(options.selector)) : "null";
+  const limit = Number(options.maxChars) > 0 ? Math.min(200_000, Number(options.maxChars)) : 12_000;
   return {
     url: wc.getURL(),
     title: wc.getTitle(),
     // The renderer inserts this into the composer, so the result is a plain
-    // string the agent can read.
+    // string the agent can read. A selector narrows it to one element, which is
+    // what makes "read the code block on this page" cheaper than the whole DOM.
     text: wc
       .executeJavaScript(
         `(() => {
-           const body = document.body;
-           const text = body ? body.innerText : "";
-           return text.replace(/\\n{3,}/g, "\\n\\n").slice(0, 12000);
+           const selector = ${selector};
+           const root = selector ? document.querySelector(selector) : document.body;
+           if (!root) return "";
+           const text = root.innerText || "";
+           return text.replace(/\\n{3,}/g, "\\n\\n").slice(0, ${limit});
          })()`,
       )
       .catch(() => ""),
   };
+}
+
+/** A PNG of the visible viewport, as a data URL. */
+export async function browserScreenshot(win) {
+  const view = views.get(win);
+  if (!view) return { ok: false, error: "the browser pane is not open" };
+  try {
+    const image = await view.webContents.capturePage();
+    return { ok: true, url: view.webContents.getURL(), dataUrl: image.toDataURL() };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
 }
 
 export function closeBrowser(win) {

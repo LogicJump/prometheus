@@ -142,11 +142,19 @@ test("a .uf2 is only accepted by a flasher that can write it", () => {
 
 /* ---------- 3.5 the promised-but-missing tools are gone from the surface ---------- */
 
-test("the tools that only existed in the design document are not advertised", async () => {
+test("a tool that is still unimplemented is not advertised", async () => {
   const { embeddedTools } = await import("../src/tools/embeddedTools.ts");
   const names = new Set(embeddedTools.map((tool) => tool.name));
-  for (const missing of ["embed_measure", "embed_waveform", "embed_pinmap", "embed_datasheet"]) {
+  // embed_measure now has a driver (SCPI through pyvisa) and reports honestly
+  // when no instrument is attached, so it is no longer in this list.
+  // embed_datasheet and embed_pinmap now exist (PDF index; devicetree, SVD and
+  // pin-table sources) and report their limits honestly.
+  for (const missing of ["embed_waveform"]) {
     assert.equal(names.has(missing), false, `${missing} must not be advertised until it exists`);
+  }
+  // The ones that do exist must each be callable without a missing peer.
+  for (const present of ["embed_measure", "embed_test", "embed_trace", "embed_power", "embed_packs", "embed_datasheet", "embed_pinmap"]) {
+    assert.equal(names.has(present), true, `${present} is implemented and should be listed`);
   }
 });
 

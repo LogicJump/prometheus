@@ -1,7 +1,7 @@
 /** Prometheus desktop renderer. */
 
 import { detectLocale, getDict } from "./i18n.js";
-import { escapeHtml, renderMarkdown } from "./markdown.js";
+import { escapeHtml, renderMarkdown, IncrementalRenderer } from "./markdown.js";
 import { createSettings } from "./settings.js";
 import { icon, setIcon } from "./icons.js";
 
@@ -52,6 +52,8 @@ const terminalPrompt = $("terminal-prompt");
 
 const state = {
   busy: false,
+  /** The next-turn suggestion currently offered; Tab accepts it. */
+  suggestion: "",
   goalRun: null,
   mode: "ask",
   effort: "auto",
@@ -65,6 +67,8 @@ const state = {
   /** How many sessions exist and how many are loaded; see the "show more" row. */
   sessionsTotal: 0,
   sessionsLimit: 80,
+  /** Host-side search results while a query is active; null means show the list. */
+  sessionMatches: null,
   locale: savedLocale === "zh" || savedLocale === "en" ? savedLocale : detectLocale(),
   theme: savedTheme || "dark",
   density: savedDensity === "compact" || savedDensity === "detailed" ? savedDensity : "balanced",
@@ -77,6 +81,8 @@ const state = {
   changedFiles: [],
   changes: { files: [], additions: 0, deletions: 0 },
   checkpoints: [],
+  /** True when the last rewind can be put back. */
+  checkpointRedo: false,
   selectedChange: null,
   selectedFile: null,
   tree: [],
@@ -97,8 +103,14 @@ const state = {
   queuedCount: 0,
   sessionQuery: "",
   showArchived: false,
+  /** Sidebar filter: all | working | needs-input | error | cwd. */
+  sessionFilter: "all",
   comments: [],
   attachments: [],
+  /** Paths picked with @ whose content should travel with the next message. */
+  mentionFiles: [],
+  /** Sub-agent records for the Tasks pane. */
+  subagents: [],
   pr: null,
   commands: [],
   diffScope: "session",
@@ -283,8 +295,10 @@ function attachRewind(node, index) {
   button.title = t.rewindTitle;
   button.addEventListener("click", (event) => {
     event.stopPropagation();
-    if (!confirm(t.rewindConfirm)) return;
-    api.send({ cmd: "rewindTo", index });
+    void confirmAction(t.rewindConfirm, { danger: true }).then((yes) => {
+      if (!yes) return;
+      api.send({ cmd: "rewindTo", index });
+    });
   });
   node.appendChild(button);
 }
@@ -309,7 +323,7 @@ function addAssistantTurn() {
   const last = transcript.lastElementChild;
   const node = addNode(`<div class="turn assistant"><div class="markdown"></div></div>`);
   if (last && (last.classList.contains("tool-row") || last.classList.contains("tool-group"))) node.classList.add("after-tools");
-  state.currentAssistant = { node, body: node.querySelector(".markdown"), text: "", raf: 0 };
+  state.currentAssistant = { node, body: node.querySelector(".markdown"), text: "", raf: 0, renderer: new IncrementalRenderer(t.copy) };
   return state.currentAssistant;
 }
 
@@ -321,12 +335,25 @@ function flushAssistant() {
     current.raf = 0;
   }
   const hadText = current.text.trim().length > 0;
-  current.body.innerHTML = md(current.text);
+  current.body.innerHTML = current.renderer ? current.renderer.render(current.text) : md(current.text);
   current.body.classList.remove("streaming");
   state.currentAssistant = null;
   bindCodeCopy(current.node);
   // A turn that produced no prose leaves an empty bubble behind.
   if (!hadText) current.node.remove();
+}
+
+/**
+ * Render an option's preview next to the buttons.
+ *
+ * A preview is what the user compares before answering, so it goes above the
+ * buttons at full width rather than inside a label that ellipsises it.
+ */
+function attachPreview(container, text) {
+  const pre = document.createElement("pre");
+  pre.className = "ask-preview";
+  pre.textContent = text;
+  container.appendChild(pre);
 }
 
 function bindCodeCopy(root) {
@@ -434,6 +461,56 @@ function addToolRow(name, summary) {
   return row;
 }
 
+/**
+ * A collapsible diff under a file-write row.
+ *
+ * The pane's renderer is reused for the lines; only the container is new. It
+ * starts collapsed for a large change and open for a small one, because a
+ * twenty-line edit is usually worth reading and a four-hundred-line rewrite is
+ * not.
+ */
+function attachInlineDiff(row, change) {
+  const existing = row.nextElementSibling;
+  if (existing && existing.classList.contains("inline-diff")) existing.remove();
+  const total = (change.additions ?? 0) + (change.deletions ?? 0);
+  if (!total && change.status === "modified") return;
+
+  const box = document.createElement("div");
+  box.className = "inline-diff";
+  const toggle = document.createElement("button");
+  toggle.className = "inline-diff-toggle";
+  toggle.innerHTML =
+    `<span class="add">+${change.additions ?? 0}</span> <span class="del">−${change.deletions ?? 0}</span>` +
+    `<span class="inline-diff-path">${escapeHtml(change.path ?? "")}</span>`;
+  toggle.title = t.inlineDiffHint;
+  box.appendChild(toggle);
+
+  const body = document.createElement("div");
+  body.className = "inline-diff-body";
+  body.hidden = total > 60;
+  for (const hunk of change.hunks ?? []) decorateWordDiff(hunk.lines);
+  for (const hunk of change.hunks ?? []) {
+    for (const line of hunk.lines) {
+      if (line.kind === "context") continue;
+      const node = document.createElement("div");
+      node.className = `diff-line ${line.kind}`;
+      const marker = line.kind === "add" ? "+" : "−";
+      node.innerHTML =
+        `<span class="diff-gutter">${String(line.oldNo ?? "").padStart(4)} ${String(line.newNo ?? "").padStart(4)}</span>` +
+        `<span class="diff-text">${line.highlights ? lineHtml(line, marker) : escapeHtml(`${marker} ${line.text}`)}</span>`;
+      body.appendChild(node);
+    }
+  }
+  box.appendChild(body);
+  toggle.setAttribute("aria-expanded", String(!body.hidden));
+  toggle.addEventListener("click", () => {
+    body.hidden = !body.hidden;
+    toggle.setAttribute("aria-expanded", String(!body.hidden));
+  });
+  row.after(box);
+  state.lastToolNode = null;
+}
+
 const FILE_TOOLS = new Set(["read_file", "write_file", "edit_file"]);
 /** Rows that lead somewhere: the pane showing the same facts, in full. */
 const EMBED_TOOL_PANES = {
@@ -533,10 +610,54 @@ function renderPlan(items) {
 
 /* ---------- state ---------- */
 
+/**
+ * Suggest the next thing to ask, after a turn ends.
+ *
+ * Drawn from the turn that just finished rather than a generic list: "run the
+ * tests" is only a good suggestion when the agent just said they pass. Three
+ * shapes cover what a follow-up usually is — verify, explain, continue.
+ */
+function suggestNextTurn() {
+  const suggestion = $("composer-suggestion");
+  if (!suggestion) return;
+  const text = summariseLastAssistant();
+  if (!text || localStorage.getItem("prometheus.suggestions") === "0") {
+    suggestion.hidden = true;
+    return;
+  }
+  const lower = text.toLowerCase();
+  let next = "";
+  if (/test/.test(lower) && !/pass(ed|ing)?/.test(lower)) next = t.suggestRunTests;
+  else if (/error|fail/.test(lower)) next = t.suggestFixErrors;
+  else if (/implemented|added|changed/.test(lower)) next = t.suggestReviewDiff;
+  if (!next) {
+    suggestion.hidden = true;
+    return;
+  }
+  state.suggestion = next;
+  suggestion.querySelector(".composer-suggestion-text").textContent = next;
+  suggestion.hidden = false;
+}
+
+function clearSuggestion() {
+  state.suggestion = "";
+  const suggestion = $("composer-suggestion");
+  if (suggestion) suggestion.hidden = true;
+}
+
 function setBusy(busy) {
   state.busy = busy;
+  // A live region that announces every streamed token makes a screen reader
+  // unusable during a turn: it reads the answer one character at a time, and
+  // the finished text is announced again at the end. Marking the region busy
+  // suppresses the incremental announcements while streaming.
+  transcript.setAttribute("aria-busy", busy ? "true" : "false");
   stopButton.hidden = !busy;
-  sendButton.disabled = busy;
+  // Enter has always queued a message mid-turn; the button was disabled, so
+  // the two ways to send disagreed. The button now queues as well, and says so.
+  sendButton.disabled = false;
+  sendButton.classList.toggle("queues", busy);
+  sendButton.title = busy ? t.queueSend : t.sendLabel;
   // Finishing a turn must not paint "ready" over a stopped host or a config
   // error that is still the actual state.
   if (busy) setStatus("statusWorking");
@@ -552,6 +673,62 @@ function setStatus(key) {
   statusText.textContent = statusLabel(key);
   // "Ready" is the resting state and needs no label; anything else is news.
   statusText.hidden = dotKind === "ready";
+}
+
+/* ---------- confirmation dialog ---------- */
+
+/**
+ * An in-window confirmation.
+ *
+ * `window.confirm` renders the OS dialog: it ignores the app's theme entirely,
+ * blocks the renderer thread, and cannot be reached by the app's own tests. It
+ * also cannot show a destructive action in the app's own color language. This
+ * follows the same tokens as every other surface, traps focus while open, and
+ * returns a promise.
+ */
+function confirmAction(message, options = {}) {
+  return new Promise((resolve) => {
+    const previous = document.activeElement;
+    const overlay = document.createElement("div");
+    overlay.className = "confirm-overlay";
+    overlay.innerHTML =
+      `<div class="confirm-dialog" role="alertdialog" aria-modal="true">` +
+      `<div class="confirm-text">${escapeHtml(message)}</div>` +
+      `<div class="confirm-actions">` +
+      `<button class="confirm-cancel">${escapeHtml(options.cancel ?? t.cancel)}</button>` +
+      `<button class="confirm-ok${options.danger ? " danger" : ""}">${escapeHtml(options.ok ?? t.confirm)}</button>` +
+      `</div></div>`;
+    document.body.appendChild(overlay);
+
+    const ok = overlay.querySelector(".confirm-ok");
+    const cancel = overlay.querySelector(".confirm-cancel");
+    const close = (answer) => {
+      overlay.remove();
+      document.removeEventListener("keydown", onKey, true);
+      if (previous && typeof previous.focus === "function") previous.focus();
+      resolve(answer);
+    };
+    function onKey(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        close(false);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      // Two buttons: keep Tab inside the dialog rather than walking into the
+      // page behind it.
+      event.preventDefault();
+      (document.activeElement === ok ? cancel : ok).focus();
+    }
+    document.addEventListener("keydown", onKey, true);
+    ok.addEventListener("click", () => close(true));
+    cancel.addEventListener("click", () => close(false));
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) close(false);
+    });
+    ok.focus();
+  });
 }
 
 /* ---------- in-conversation search ---------- */
@@ -790,6 +967,10 @@ function applyMention(path) {
   input.value = `${before}${inserted}${after}`;
   const position = before.length + inserted.length;
   input.setSelectionRange(position, position);
+  // A mention used to be only a path: the model had to spend a tool call
+  // reading a file the user had already picked. The picked path travels with
+  // the message so its content arrives with it.
+  if (!state.mentionFiles.includes(path)) state.mentionFiles.push(path);
   closeMention();
   autoSize();
   input.focus();
@@ -1018,18 +1199,59 @@ function handleEvent(message) {
       setStatus("statusConnecting");
       break;
 
-    case "ready":
+    case "ready": {
       setBusy(false);
       if (state.statusKey !== "statusError") setStatus("statusReady");
+      // Reopen the conversation the window was in last time. The host starts
+      // a fresh session on every launch, so without this every restart lost
+      // the context of what the user was doing.
+      const remembered = localStorage.getItem("prometheus.lastSession");
+      if (remembered && remembered !== state.sessionId && localStorage.getItem("prometheus.restartSession") !== "0") {
+        api.send({ cmd: "loadSession", id: remembered });
+      }
       if (state.needsSetup) {
         state.needsSetup = false;
         $("setup-button").hidden = true;
         addNode(`<div class="notice dim">${escapeHtml(t.setupBody)}</div>`);
       }
       break;
+    }
+
+    case "setup_checklist": {
+      state.setupChecklist = message.checks ?? [];
+      // Shown once, on an empty conversation: a returning user does not need
+      // to be told their toolchains again.
+      const missing = state.setupChecklist.filter((check) => !check.ok);
+      if (missing.length === 0 || localStorage.getItem("prometheus.setupDismissed") === "1") break;
+      // A conversation with history is not a first run.
+      if (state.sessions.length > 0) break;
+      const rows = missing
+        .map(
+          (check) =>
+            `<div class="setup-row"><div class="setup-label">${escapeHtml(check.label)}</div>` +
+            `<div class="setup-detail">${escapeHtml(check.detail)}</div>` +
+            (check.hint ? `<pre class="setup-hint">${escapeHtml(check.hint)}</pre>` : "") +
+            `</div>`,
+        )
+        .join("");
+      addNode(
+        `<div class="notice setup"><div class="setup-head">${escapeHtml(t.setupChecklistTitle)}</div>${rows}` +
+          `<button class="link-button" id="setup-dismiss">${escapeHtml(t.setupChecklistDismiss)}</button></div>`,
+      );
+      $("setup-dismiss")?.addEventListener("click", () => {
+        localStorage.setItem("prometheus.setupDismissed", "1");
+        document.querySelector(".notice.setup")?.remove();
+      });
+      break;
+    }
 
     case "state":
       state.sessionId = message.sessionId;
+      // Remember the conversation the user is in, so a restart comes back to
+      // it instead of opening a blank window. The setting can be turned off.
+      if (message.sessionId && localStorage.getItem("prometheus.restartSession") !== "0") {
+        localStorage.setItem("prometheus.lastSession", message.sessionId);
+      }
       if (message.cwd) state.cwd = message.cwd;
       state.locale = message.locale || state.locale;
       applyLocale(state.locale);
@@ -1141,6 +1363,7 @@ function handleEvent(message) {
 
     case "checkpoints":
       state.checkpoints = message.entries ?? [];
+      state.checkpointRedo = Boolean(message.redo);
       renderCheckpoints();
       break;
 
@@ -1167,15 +1390,39 @@ function handleEvent(message) {
 
     case "subagent_start": {
       const node = addNode(
-        `<div class="subagent running">` +
+        `<div class="subagent running"${message.id ? ` data-subagent="${escapeHtml(message.id)}"` : ""}>` +
           `<div class="subagent-head"><span class="subagent-glyph">${icon("corner-down-right")}</span>` +
           `<span class="subagent-title">${escapeHtml(t.subagentLabel)}</span>` +
-          `<span class="subagent-count"></span></div>` +
+          `<span class="subagent-count"></span>` +
+          (message.id ? `<button class="subagent-stop" type="button">${escapeHtml(t.subagentStop)}</button>` : "") +
+          `<button class="subagent-toggle" type="button" aria-expanded="false">${escapeHtml(t.subagentExpand)}</button>` +
+          `</div>` +
           `<div class="subagent-prompt">${escapeHtml(message.prompt ?? "")}</div>` +
           `<div class="subagent-activities"></div>` +
           `</div>`,
       );
-      state.currentSubagent = { node, count: 0 };
+      // Expand/collapse: the card stays compact by default but nothing is
+      // discarded, so a stuck child can be read line by line.
+      const toggle = node.querySelector(".subagent-toggle");
+      toggle?.addEventListener("click", () => {
+        const open = node.classList.toggle("expanded");
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        toggle.textContent = open ? t.subagentCollapse : t.subagentExpand;
+      });
+      // Stopping a child from its own card is the difference between "the
+      // agent is doing something odd" and "I can end that one part".
+      node.querySelector(".subagent-stop")?.addEventListener("click", () => {
+        api.send({ cmd: "stopSubagent", id: message.id });
+      });
+      state.currentSubagent = { node, count: 0, id: message.id ?? "" };
+      break;
+    }
+
+    case "subagents": {
+      // The Tasks panel's live view; the cards in the transcript already show
+      // history, this is for the ones still running.
+      state.subagents = message.subagents ?? [];
+      renderSubagents();
       break;
     }
 
@@ -1188,7 +1435,9 @@ function handleEvent(message) {
       line.className = "subagent-line";
       line.innerHTML = `${icon(message.kind === "tool" ? "chevron-right" : "dot", "inline")}<span>${escapeHtml(message.text)}</span>`;
       list.appendChild(line);
-      while (list.children.length > 40) list.removeChild(list.firstElementChild);
+      // A long sub-task used to keep only its last 40 lines, which is exactly
+      // the point where you cannot see how it got stuck. Everything is kept in
+      // the DOM; the collapsed card clips it and "expand" reveals the rest.
       sub.node.querySelector(".subagent-count").textContent = String(sub.count);
       break;
     }
@@ -1199,6 +1448,7 @@ function handleEvent(message) {
       sub.node.classList.remove("running");
       if (!message.ok) sub.node.classList.add("failed");
       sub.node.querySelector(".subagent-count").textContent = message.ok ? t.subagentDone : t.subagentFailed;
+      sub.node.querySelector(".subagent-stop")?.remove();
       state.currentSubagent = null;
       break;
     }
@@ -1295,6 +1545,21 @@ function handleEvent(message) {
       applyLocale(message.locale);
       break;
 
+    case "ui_preference": {
+      // A preference changed anywhere (Settings sends one at a time). Mirror
+      // the ones the transcript reads from localStorage, so a toggle takes
+      // effect without a reload.
+      const map = {
+        restartSession: "restartSession",
+        suggestions: "suggestions",
+        updateCheck: "updateCheck",
+        isolateByDefault: "isolateByDefault",
+      };
+      const key = map[message.key];
+      if (key) localStorage.setItem(`prometheus.${key}`, message.value === false ? "0" : "1");
+      break;
+    }
+
     case "usage_summary":
     case "mcp_servers":
     case "skills":
@@ -1317,6 +1582,7 @@ function handleEvent(message) {
 
     case "run_start":
       setBusy(true);
+      clearSuggestion();
       endThinking();
       // Keep typing possible while the turn runs; the message is queued.
       input.focus();
@@ -1335,7 +1601,10 @@ function handleEvent(message) {
       if (!current.raf) {
         current.raf = requestAnimationFrame(() => {
           current.raf = 0;
-          current.body.innerHTML = `${md(current.text)}<span class="caret"></span>`;
+          // Only the block still receiving text is re-rendered; completed
+          // blocks keep their HTML, so a long answer does not get slower as
+          // it grows.
+          current.body.innerHTML = `${current.renderer.render(current.text)}<span class="caret"></span>`;
           scrollToBottom();
         });
       }
@@ -1345,6 +1614,19 @@ function handleEvent(message) {
     case "assistant_end":
       flushAssistant();
       break;
+
+    case "assistant_discard": {
+      // The request is being retried and will stream from the first token.
+      // Clear the half-written turn instead of letting the second attempt
+      // append onto the first.
+      const current = state.currentAssistant;
+      if (current) {
+        if (current.raf) cancelAnimationFrame(current.raf);
+        current.node?.remove();
+        state.currentAssistant = null;
+      }
+      break;
+    }
 
     case "thinking_start":
       if (state.currentAssistant) flushAssistant();
@@ -1360,8 +1642,60 @@ function handleEvent(message) {
       endThinking();
       break;
 
+    case "tool_delta":
+      // A tool's arguments are still arriving. Show it in the same place the
+      // spinner text goes, throttled by requestAnimationFrame.
+      state.toolDelta = state.toolDelta || { name: "", text: "", raf: 0 };
+      state.toolDelta.name = message.name || state.toolDelta.name;
+      state.toolDelta.text = (state.toolDelta.text + (message.text ?? "")).slice(-400);
+      if (!state.toolDelta.raf) {
+        state.toolDelta.raf = requestAnimationFrame(() => {
+          state.toolDelta.raf = 0;
+          // The status line is where "working" already lives; appending the
+          // argument tail turns it into a progress readout without a new
+          // element competing for the same corner.
+          statusText.hidden = false;
+          statusText.textContent = `${state.toolDelta.name} … ${state.toolDelta.text.replace(/\s+/g, " ").slice(-60)}`;
+        });
+      }
+      break;
+
+    case "browser_request": {
+      // The agent asked the pane for something. Answering here keeps the
+      // browser tools in the same process that owns the view; the host only
+      // relays the request and the result.
+      const request = message.request ?? {};
+      void (async () => {
+        let result = { ok: false, error: "unsupported browser request" };
+        try {
+          if (request.kind === "open") {
+            await api.browserOpen(request.url);
+            result = { ok: true, url: request.url };
+          } else if (request.kind === "read") {
+            const snapshot = await api.browserSnapshot({ selector: request.selector });
+            result = snapshot
+              ? { ok: true, url: snapshot.url, title: snapshot.title, text: snapshot.text }
+              : { ok: false, error: "the browser pane is not open" };
+          } else if (request.kind === "screenshot") {
+            const shot = await api.browserScreenshot?.();
+            result = shot ? { ok: shot.ok, url: shot.url, text: shot.path, error: shot.error } : { ok: false, error: "screenshots are unavailable" };
+          }
+        } catch (error) {
+          result = { ok: false, error: String(error?.message ?? error) };
+        }
+        api.send({ cmd: "browserResult", id: message.id, result });
+      })();
+      break;
+    }
+
     case "tool_start":
       endThinking();
+      // The argument stream is finished; the normal tool row takes over.
+      if (state.toolDelta) {
+        if (state.toolDelta.raf) cancelAnimationFrame(state.toolDelta.raf);
+        state.toolDelta = null;
+        setStatus("statusWorking");
+      }
       if (state.currentAssistant) flushAssistant();
       addToolRow(message.name, message.summary);
       break;
@@ -1370,6 +1704,12 @@ function handleEvent(message) {
       // The transcript already shows the tool's text; this is the structured
       // side, which the panes use. Only a build changes what they display.
       if (message.name === "embed_build") api.send({ cmd: "getBoardState" });
+      // A file write's diff, attached to its row: seeing what changed in place
+      // is faster than opening the Changes pane and finding the file.
+      if (message.data && message.data.change) {
+        const row = state.lastToolNode;
+        if (row) attachInlineDiff(row, message.data.change);
+      }
       break;
 
     case "tool_end": {
@@ -1383,7 +1723,7 @@ function handleEvent(message) {
         if (!message.ok) summaryEl.style.color = "var(--danger)";
         setIcon(row.querySelector(".tool-glyph svg"), message.ok ? "check" : "x");
         // An edit's result is a diff size: make it read like one.
-        if (message.ok && message.name === "edit_file") {
+        if (message.ok && (message.name === "edit_file" || message.name === "write_file")) {
           const parts = String(message.summary).match(/\+(\d+)\s+-(\d+)/);
           if (parts) {
             summaryEl.innerHTML =
@@ -1407,6 +1747,51 @@ function handleEvent(message) {
       renderPlan(message.items);
       scrollToBottom();
       break;
+
+    case "ask_user": {
+      // A question from the model, drawn with the same bar the permission
+      // prompt uses. Preview text is monospace and scrolls: it is code or a
+      // layout, and the point of showing it is to compare, not to read prose.
+      state.pendingPermissionId = message.id;
+      pendingQuestion.textContent = message.header
+        ? `${message.header}: ${message.question}`
+        : message.question;
+      const choices = $("pending-choices");
+      choices.innerHTML = "";
+      if (message.multiSelect) {
+        const note = document.createElement("div");
+        note.className = "ask-note";
+        note.textContent = t.askMultiHint;
+        choices.appendChild(note);
+        for (const option of message.options ?? []) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "btn small";
+          button.textContent = option.label;
+          button.addEventListener("click", () => answerPermission(option.value));
+          if (option.preview) attachPreview(choices, option.preview);
+          choices.appendChild(button);
+        }
+      } else {
+        for (const option of message.options ?? []) {
+          if (option.preview) attachPreview(choices, option.preview);
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "btn small";
+          button.textContent = option.label;
+          button.addEventListener("click", () => answerPermission(option.value));
+          choices.appendChild(button);
+        }
+      }
+      choices.hidden = false;
+      pendingPermission.hidden = false;
+      // The allow/always/deny buttons belong to a permission prompt; a
+      // question has its own options and no "allow" to give.
+      pendingPermission.querySelectorAll("[data-permission]").forEach((button) => (button.hidden = true));
+      choices.querySelector("button")?.focus();
+      notifyIfAway(t.notifyNeedsInput, message.question);
+      break;
+    }
 
     case "permission_choice": {
       // Second-stage question after "always allow": remember all calls of a
@@ -1518,6 +1903,58 @@ function handleEvent(message) {
       scrollToBottom();
       break;
 
+    case "recovery": {
+      // A previous process died mid-goal. Offer to pick the loop up rather
+      // than silently dropping the work, with the round it had reached.
+      const list = message.sessions || [];
+      if (list.length === 0) break;
+      const rows = list
+        .slice(0, 4)
+        .map((session) => {
+          const label = escapeHtml(session.title || session.id);
+          const note = escapeHtml(`${session.goal.kind} ${session.goal.round}/${session.goal.maxRounds}: ${session.goal.text}`);
+          return (
+            `<div class="recovery-row" data-session="${escapeHtml(session.id)}">` +
+            `<div class="recovery-title">${label}</div>` +
+            `<div class="recovery-note">${note}</div>` +
+            `<div class="recovery-actions">` +
+            `<button class="link-button" data-recovery-open="${escapeHtml(session.id)}">${escapeHtml(t.recoveryOpen)}</button>` +
+            `</div></div>`
+          );
+        })
+        .join("");
+      addNode(`<div class="notice recovery"><div class="recovery-head">${escapeHtml(t.recoveryTitle)}</div>${rows}</div>`);
+      for (const button of document.querySelectorAll("[data-recovery-open]")) {
+        button.addEventListener("click", () => {
+          const id = button.getAttribute("data-recovery-open");
+          api.send({ cmd: "loadSession", id });
+          api.send({ cmd: "resumeGoal" });
+        });
+      }
+      break;
+    }
+
+    case "turn_progress": {
+      // The status line names what the turn is doing and how long it has run.
+      // It is not a message in the transcript: a heartbeat every second would
+      // bury the conversation.
+      if (!state.busy) break;
+      const seconds = Math.max(0, Math.round((message.elapsedMs ?? 0) / 1000));
+      const parts = [`${seconds}s`];
+      if (message.tool) parts.push(message.tool);
+      if (message.retry > 0) parts.push(t.retryCount.replace("{n}", String(message.retry)));
+      statusText.hidden = false;
+      statusText.textContent = parts.join(" · ");
+      break;
+    }
+
+    case "ephemeral_done":
+      // The host dropped the turn from the transcript; say so rather than
+      // leaving the user wondering why the conversation forgot it.
+      addNode(`<div class="notice dim">${escapeHtml(t.ephemeralDone)}</div>`);
+      scrollToBottom();
+      break;
+
     case "error":
       flushAssistant();
       endThinking();
@@ -1531,6 +1968,7 @@ function handleEvent(message) {
       flushAssistant();
       endThinking();
       setBusy(false);
+      suggestNextTurn();
       updateMeter(message.context, message.usage);
       notifyIfAway(t.notifyTurnDone, summariseLastAssistant());
       if (message.files && message.files.length > 0) {
@@ -1630,6 +2068,13 @@ function handleEvent(message) {
       renderSessions(message.sessions);
       break;
 
+    case "session_matches":
+      // Results of a host-side full search: they replace the visible list for
+      // the duration of the query, then the normal list comes back.
+      state.sessionMatches = message.query ? message.sessions || [] : null;
+      renderSessions(state.sessions);
+      break;
+
     case "session_saved":
       api.send({ cmd: "listSessions", includeArchived: state.showArchived });
       break;
@@ -1672,6 +2117,30 @@ function handleEvent(message) {
   }
 }
 
+/** The Tasks pane: every sub-agent this session started, and its state. */
+function renderSubagents() {
+  const list = $("tasks-list");
+  if (!list) return;
+  list.innerHTML = "";
+  const subagents = state.subagents ?? [];
+  if (subagents.length === 0) {
+    list.innerHTML = `<div class="sidebar-empty">${escapeHtml(t.noTasks)}</div>`;
+    return;
+  }
+  for (const agent of subagents) {
+    const row = document.createElement("div");
+    row.className = `task-row ${agent.status}`;
+    const seconds = Math.max(0, Math.round((agent.elapsedMs ?? 0) / 1000));
+    row.innerHTML =
+      `<span class="task-state ${escapeHtml(agent.status)}"></span>` +
+      `<span class="task-label">${escapeHtml(agent.label)}</span>` +
+      `<span class="task-meta">${escapeHtml(t.taskMeta(agent.turns ?? 0, seconds))}</span>` +
+      (agent.status === "running" ? `<button class="link-button task-stop">${escapeHtml(t.subagentStop)}</button>` : "");
+    row.querySelector(".task-stop")?.addEventListener("click", () => api.send({ cmd: "stopSubagent", id: agent.id }));
+    list.appendChild(row);
+  }
+}
+
 /* ---------- workbench: diff, file, tree, checkpoints ---------- */
 
 function openWorkbench(pane) {
@@ -1683,7 +2152,13 @@ function openWorkbench(pane) {
   localStorage.setItem("prometheus.workbench", "1");
   localStorage.setItem("prometheus.pane", state.pane);
   workbenchTabs.querySelectorAll("button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.pane === state.pane);
+    const active = button.dataset.pane === state.pane;
+    button.classList.toggle("active", active);
+    // A tab strip is one stop in the tab order, with arrows moving between
+    // tabs: otherwise every pane button is a tab stop and keyboard users walk
+    // through eight of them to get past the strip.
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
   });
   const showDiff = state.pane === "diff";
   const showTerminal = state.pane === "terminal";
@@ -1691,9 +2166,16 @@ function openWorkbench(pane) {
   const showBrowser = state.pane === "browser";
   const showFiles = state.pane === "files";
   const showHistory = state.pane === "history";
+  const showTasks = state.pane === "tasks";
   const showFile = state.pane === "file";
   const showBoard = state.pane === "board";
   const showSerial = state.pane === "serial";
+  const tasksRoot = $("tasks-root");
+  if (tasksRoot) tasksRoot.hidden = !showTasks;
+  if (showTasks) {
+    api.send({ cmd: "subagents" });
+    renderSubagents();
+  }
   $("diff-pane").hidden = !showDiff;
   diffRoot.hidden = !showDiff;
   diffFilelist.hidden = !showDiff || state.changes.files.length === 0;
@@ -1808,6 +2290,57 @@ function showWorktreeDiff() {
     : `<div class="diff-empty">${escapeHtml(t.noChanges)}</div>`;
 }
 
+/**
+ * Mark the words that differ between a removed line and the line that
+ * replaced it.
+ *
+ * Line diffs answer "which lines changed"; on a long line the answer is still
+ * "this entire line", which is unreadable for a one-word edit. The line-level
+ * diff is authoritative — this only decorates the pair it already produced,
+ * and gives up (leaving plain lines) when the pair is not comparable.
+ */
+function decorateWordDiff(lines) {
+  // Collect removed and added line indices per hunk, in order, and pair them
+  // positionally: that is how most line diffs of a single edit fall out.
+  for (let index = 0; index < lines.length; index++) {
+    if (lines[index].kind !== "del") continue;
+    const dels = [];
+    const adds = [];
+    let cursor = index;
+    while (cursor < lines.length && lines[cursor].kind === "del") dels.push(lines[cursor++]);
+    while (cursor < lines.length && lines[cursor].kind === "add") adds.push(lines[cursor++]);
+    const pairs = Math.min(dels.length, adds.length);
+    for (let pair = 0; pair < pairs; pair++) {
+      const before = dels[pair];
+      const after = adds[pair];
+      if (before.text.length + after.text.length > 800) continue;
+      const oldWords = before.text.split(/(\s+)/);
+      const newWords = after.text.split(/(\s+)/);
+      const oldSet = new Set(oldWords.filter((word) => word.trim()));
+      const newSet = new Set(newWords.filter((word) => word.trim()));
+      // A pair that shares almost nothing is a different line, not an edit.
+      const shared = [...oldSet].filter((word) => newSet.has(word)).length;
+      if (shared === 0) continue;
+      before.highlights = oldWords.map((word) => word.trim() !== "" && !newSet.has(word));
+      after.highlights = newWords.map((word) => word.trim() !== "" && !oldSet.has(word));
+      before.words = oldWords;
+      after.words = newWords;
+    }
+    index = cursor - 1;
+  }
+  return lines;
+}
+
+/** Render a line's text, wrapping the marked words. */
+function lineHtml(line, marker) {
+  if (!line.highlights || !line.words) return escapeHtml(`${marker} ${line.text}`);
+  const cls = line.kind === "add" ? "word-add" : "word-del";
+  const body = line.words
+    .map((word, index) => (line.highlights[index] ? `<span class="${cls}">${escapeHtml(word)}</span>` : escapeHtml(word)))
+    .join("");
+  return `${escapeHtml(marker)} ${body}`;
+}
+
 function renderDiff() {
   const scope = state.diffScope;
   const active = scope === "turn" ? state.changes.lastTurn ?? { files: [], additions: 0, deletions: 0 } : state.changes;
@@ -1829,6 +2362,9 @@ function renderDiff() {
     return;
   }
   renderCommentRows(selected.path);
+  // Word-level highlights are computed per hunk, after the line diff has
+  // decided which lines pair up.
+  for (const hunk of selected.hunks) decorateWordDiff(hunk.lines);
   for (const hunk of selected.hunks) {
     const header = document.createElement("div");
     header.className = "diff-hunk-header";
@@ -1845,7 +2381,8 @@ function renderDiff() {
       gutter.textContent = `${line.oldNo ?? ""}`.padStart(5) + " " + `${line.newNo ?? ""}`.padStart(5);
       const text = document.createElement("span");
       text.className = "diff-text";
-      text.textContent = `${marker} ${line.text}`;
+      if (line.highlights) text.innerHTML = lineHtml(line, marker);
+      else text.textContent = `${marker} ${line.text}`;
       row.append(gutter, text);
       if (lineNo != null && line.kind !== "del") {
         // Clicking a line attaches a review comment to it.
@@ -2579,15 +3116,37 @@ function renderCheckpoints() {
     checkpointList.innerHTML = `<div class="sidebar-empty">${escapeHtml(t.noCheckpoints)}</div>`;
     return;
   }
+  if (state.checkpointRedo) {
+    // The undo is itself undoable; without this the first click on "restore"
+    // was a one-way door and users stopped using it.
+    const redo = document.createElement("button");
+    redo.className = "restore-start";
+    redo.textContent = t.redoSafe;
+    redo.addEventListener("click", () => api.send({ cmd: "redo" }));
+    checkpointList.appendChild(redo);
+  }
+
   const restoreAll = document.createElement("button");
   restoreAll.className = "restore-start";
   restoreAll.textContent = t.restoreStart;
   restoreAll.addEventListener("click", () => {
-    if (confirm(t.restoreConfirm)) api.send({ cmd: "restoreCheckpoint", id: "start" });
+    void confirmAction(t.restoreConfirm, { danger: true }).then((yes) => {
+      if (yes) api.send({ cmd: "restoreCheckpoint", id: "start" });
+    });
   });
   checkpointList.appendChild(restoreAll);
 
+  // History grouped by the turn that produced the change. A flat list of
+  // paths lost the "what happened when" that makes a rewind decision possible.
+  let lastIndex = null;
   for (const entry of [...entries].reverse()) {
+    if (entry.messageIndex !== undefined && entry.messageIndex !== lastIndex) {
+      lastIndex = entry.messageIndex;
+      const header = document.createElement("div");
+      header.className = "checkpoint-turn";
+      header.textContent = t.checkpointTurn(entry.messageIndex);
+      checkpointList.appendChild(header);
+    }
     const row = document.createElement("button");
     row.className = "checkpoint-row";
     const time = new Date(entry.at).toLocaleTimeString(state.locale === "zh" ? "zh-CN" : "en-US", {
@@ -2598,9 +3157,13 @@ function renderCheckpoints() {
     row.innerHTML =
       `<span class="checkpoint-time">${escapeHtml(time)}</span>` +
       `<span class="checkpoint-path">${escapeHtml(entry.path)}</span>`;
-    row.title = `${entry.tool} · ${t.restore}`;
+    row.title = `${entry.tool} · ${t.restoreFile}`;
     row.addEventListener("click", () => {
-      if (confirm(`${t.restore} ${entry.path}?`)) api.send({ cmd: "restoreCheckpoint", id: entry.id });
+      // This row is one file. Restoring the whole range from here undid every
+      // later edit too, which is not what clicking one path promises.
+      void confirmAction(`${t.restoreFile} ${entry.path}?`, { danger: true }).then((yes) => {
+        if (yes) api.send({ cmd: "restoreFile", path: entry.path });
+      });
     });
     checkpointList.appendChild(row);
   }
@@ -2961,14 +3524,19 @@ function renderSessions(sessions) {
   state.sessions = sessions || [];
   sessionList.innerHTML = "";
   const query = state.sessionQuery.trim().toLowerCase();
-  const visible = query
-    ? state.sessions.filter(
-        (session) =>
-          (session.title ?? session.summary).toLowerCase().includes(query) ||
-          session.summary.toLowerCase().includes(query) ||
-          session.cwd.toLowerCase().includes(query),
-      )
-    : state.sessions;
+  // A query goes to the host, which searches every saved transcript. The local
+  // filter only ran over the page already in memory, so a match on the 81st
+  // session reported that no such conversation existed.
+  const visible = state.sessionMatches
+    ? state.sessionMatches
+    : query
+      ? state.sessions.filter(
+          (session) =>
+            (session.title ?? session.summary).toLowerCase().includes(query) ||
+            session.summary.toLowerCase().includes(query) ||
+            session.cwd.toLowerCase().includes(query),
+        )
+      : state.sessions;
   if (visible.length === 0) {
     const empty = document.createElement("div");
     empty.className = "sidebar-empty";
@@ -3069,6 +3637,30 @@ function renderSessions(sessions) {
         event.preventDefault();
         openSessionMenu(event, session);
       });
+      // The same actions behind a visible control. A right-click menu is
+      // invisible to anyone who does not think to try one, and the session
+      // row is where pinning and renaming belong.
+      const more = document.createElement("span");
+      more.className = "session-more";
+      more.setAttribute("role", "button");
+      more.tabIndex = 0;
+      more.title = t.sessionMenu;
+      more.innerHTML = icon("more");
+      more.addEventListener("click", (event) => {
+        event.stopPropagation();
+        const rect = more.getBoundingClientRect();
+        openSessionMenu({ clientX: rect.left, clientY: rect.bottom, preventDefault() {} }, session);
+      });
+      more.addEventListener("keydown", (event) => {
+        // The menu key is what a keyboard user reaches for; both open it.
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          event.stopPropagation();
+          const rect = more.getBoundingClientRect();
+          openSessionMenu({ clientX: rect.left, clientY: rect.bottom, preventDefault() {} }, session);
+        }
+      });
+      button.appendChild(more);
       sessionList.appendChild(button);
     }
   }
@@ -3109,7 +3701,9 @@ function openSessionMenu(event, session) {
       sendSessionFlags(session, { archived: !session.archived });
     }],
     [t.sessionDelete, () => {
-      if (confirm(t.sessionDeleteConfirm)) api.send({ cmd: "deleteSession", id: session.id, includeArchived: state.showArchived });
+      void confirmAction(t.sessionDeleteConfirm, { danger: true }).then((yes) => {
+        if (yes) api.send({ cmd: "deleteSession", id: session.id, includeArchived: state.showArchived });
+      });
     }],
   ];
   for (const [label, action] of actions) {
@@ -3155,10 +3749,20 @@ function setDensity(density) {
 
 const systemTheme = matchMedia("(prefers-color-scheme: light)");
 systemTheme.addEventListener("change", () => {
-  if (state.theme === "system") document.documentElement.dataset.theme = systemTheme.matches ? "light" : "dark";
+  // High contrast follows the same light/dark choice as "system"; both
+  // resolve again when the OS preference flips.
+  if (state.theme === "system" || state.theme === "high-contrast") {
+    document.documentElement.dataset.theme = resolvedTheme(state.theme);
+  }
 });
 
 function resolvedTheme(theme) {
+  if (theme === "high-contrast") {
+    // The high-contrast theme follows the system's light/dark choice for its
+    // base, then raises every text and border token; it is a variant, not a
+    // third palette.
+    return systemTheme.matches ? "light-contrast" : "contrast";
+  }
   if (theme !== "system") return theme;
   return systemTheme.matches ? "light" : "dark";
 }
@@ -3186,20 +3790,41 @@ function autoSize() {
   input.style.height = `${Math.min(220, input.scrollHeight)}px`;
 }
 
+/** Messages sent from this window, newest first; Up/Down walks them. */
+const history = [];
+let historyIndex = -1;
+let draft = "";
+const HISTORY_LIMIT = 100;
+
+function rememberInHistory(text) {
+  if (!text.trim()) return;
+  if (history[0] === text) return;
+  history.unshift(text);
+  if (history.length > HISTORY_LIMIT) history.pop();
+  historyIndex = -1;
+  draft = "";
+}
+
 function submit() {
   const text = input.value.trim();
   const images = state.attachments.map((attachment) => attachment.url);
+  const files = [...state.mentionFiles];
   if (!text && images.length === 0) return;
   input.value = "";
   autoSize();
+  rememberInHistory(text);
   addUserTurn(text || t.imageOnlyPrompt, images.length);
   state.attachments = [];
+  state.mentionFiles = [];
   renderAttachments();
-  api.send({ cmd: "prompt", text, images });
+  api.send({ cmd: "prompt", text, images, ...(files.length ? { files } : {}) });
   input.focus();
 }
 
-input.addEventListener("input", autoSize);
+input.addEventListener("input", () => {
+  autoSize();
+  if (input.value.trim()) clearSuggestion();
+});
 input.addEventListener("keydown", (event) => {
   if (!commandMenu.hidden && commandState) {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -3237,6 +3862,34 @@ input.addEventListener("keydown", (event) => {
       if (path) applyMention(path);
       return;
     }
+  }
+  // Up/Down walk the messages this window sent. Only when the caret is on the
+  // first or last line, so arrows still move within a multi-line draft.
+  if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.isComposing) {
+    const beforeCaret = input.value.slice(0, input.selectionStart);
+    const afterCaret = input.value.slice(input.selectionStart);
+    const caretAtEdge = event.key === "ArrowUp" ? !beforeCaret.includes("\n") : !afterCaret.includes("\n");
+    if (caretAtEdge && (history.length > 0 || historyIndex >= 0)) {
+      event.preventDefault();
+      if (event.key === "ArrowUp") {
+        if (historyIndex === -1) draft = input.value;
+        historyIndex = Math.min(history.length - 1, historyIndex + 1);
+      } else {
+        historyIndex = historyIndex <= 0 ? -1 : historyIndex - 1;
+      }
+      input.value = historyIndex >= 0 ? history[historyIndex] : draft;
+      autoSize();
+      input.setSelectionRange(input.value.length, input.value.length);
+      return;
+    }
+  }
+  if (event.key === "Tab" && state.suggestion && !input.value.trim() && !event.shiftKey) {
+    event.preventDefault();
+    input.value = state.suggestion;
+    clearSuggestion();
+    autoSize();
+    input.focus();
+    return;
   }
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
     event.preventDefault();
@@ -3288,6 +3941,14 @@ document.addEventListener("keydown", (event) => {
     openPalette();
   } else if (key === "f") {
     event.preventDefault();
+    // Ctrl+F means "find what I am looking at": in the settings dialog that is
+    // the settings list, not the transcript behind it.
+    if (!settingsDialog.hidden) {
+      const search = $("settings-search");
+      search.focus();
+      search.select();
+      return;
+    }
     openFind();
   } else if (key === "n") {
     event.preventDefault();
@@ -3363,29 +4024,47 @@ function renderAttachments() {
   });
 }
 
-/** Paste or drop an image into the composer. */
+/**
+ * Paste or drop files into the composer.
+ *
+ * Images travel as data URLs (the model sees them). Text and PDFs are passed
+ * by path and the host reads them: a log file dropped into the composer used
+ * to be silently ignored, which is exactly the file a user debugging a build
+ * wants to show the agent.
+ */
 function handleImageFiles(files) {
   for (const file of files) {
-    if (!file.type.startsWith("image/")) continue;
-    if (file.size > MAX_IMAGE_BYTES) {
-      addNotice("warn", t.attachmentTooLarge);
+    if (file.type.startsWith("image/")) {
+      if (file.size > MAX_IMAGE_BYTES) {
+        addNotice("warn", t.attachmentTooLarge);
+        continue;
+      }
+      const reader = new FileReader();
+      reader.onload = () => addAttachment(String(reader.result), file.name);
+      reader.readAsDataURL(file);
       continue;
     }
-    const reader = new FileReader();
-    reader.onload = () => addAttachment(String(reader.result), file.name);
-    reader.readAsDataURL(file);
+    // Electron exposes the real path on dropped files; plain browser File
+    // objects do not, and there is nothing useful to send without one.
+    const path = file.path;
+    if (!path) {
+      addNotice("warn", t.attachmentUnsupported);
+      continue;
+    }
+    if (!state.mentionFiles.includes(path)) state.mentionFiles.push(path);
+    addNotice("dim", t.attachmentAdded(file.name));
   }
 }
 
 input.addEventListener("paste", (event) => {
-  const files = [...(event.clipboardData?.files ?? [])].filter((file) => file.type.startsWith("image/"));
+  const files = [...(event.clipboardData?.files ?? [])];
   if (files.length === 0) return;
   event.preventDefault();
   handleImageFiles(files);
 });
 
 document.addEventListener("drop", (event) => {
-  const files = [...(event.dataTransfer?.files ?? [])].filter((file) => file.type.startsWith("image/"));
+  const files = [...(event.dataTransfer?.files ?? [])];
   if (files.length === 0) return;
   event.preventDefault();
   handleImageFiles(files);
@@ -3408,6 +4087,10 @@ function renderPrBar() {
   const pr = info.pr;
   $("pr-create").hidden = Boolean(pr);
   $("pr-open").hidden = !pr;
+  const failing = Boolean(pr && pr.checks && pr.checks.failed > 0);
+  state.prNumber = pr?.number ?? null;
+  $("pr-fix-ci").hidden = !failing;
+  $("pr-rerun").hidden = !failing;
   if (!pr) {
     $("pr-state").textContent = t.prNone;
     $("pr-state").className = "pr-state";
@@ -3440,6 +4123,16 @@ $("pr-open").addEventListener("click", () => {
   if (state.pr?.pr?.url) api.openExternal(state.pr.pr.url);
 });
 
+$("pr-rerun").addEventListener("click", () => {
+  api.send({ cmd: "prRerun", number: state.prNumber });
+});
+
+$("pr-fix-ci").addEventListener("click", () => {
+  // The log becomes a normal turn: the transcript shows what the agent did
+  // with it, and the user can interrupt.
+  api.send({ cmd: "prFixCi", number: state.prNumber });
+});
+
 $("pr-create").addEventListener("click", async () => {
   // A PR needs a pushed branch; ask the agent to run the push so the user sees
   // the command in the transcript instead of it happening silently.
@@ -3448,6 +4141,20 @@ $("pr-create").addEventListener("click", async () => {
   if (title === null) return;
   api.send({ cmd: "createPr", title: title.trim(), body: t.prBodyDefault });
 });
+
+/**
+ * Split `/compact` arguments into a focus and a keep count.
+ *
+ * Mirrors the REPL's parser: `--keep N` is pulled out wherever it appears and
+ * the rest is the focus, so "tests --keep 12" and "--keep 12 tests" mean the
+ * same thing.
+ */
+function parseCompactArgs(text) {
+  const keepMatch = /(?:^|\s)--keep(?:=|\s+)(\d+)/.exec(text || "");
+  const keep = keepMatch ? Number(keepMatch[1]) : 0;
+  const focus = String(text || "").replace(/(?:^|\s)--keep(?:=|\s+)\d+/, "").trim();
+  return { ...(focus ? { focus } : {}), ...(keep > 0 ? { keep } : {}) };
+}
 
 /**
  * Ask for one line of text.
@@ -3557,9 +4264,23 @@ function paletteEntries() {
     { label: t.modeAsk, run: () => api.send({ cmd: "setMode", mode: "ask" }) },
     { label: t.modeAuto, run: () => api.send({ cmd: "setMode", mode: "auto" }) },
     { label: t.modePlan, run: () => api.send({ cmd: "setMode", mode: "plan" }) },
+    { label: t.modeAcceptEdits, run: () => api.send({ cmd: "setMode", mode: "acceptEdits" }) },
+    { label: t.modeDontAsk, run: () => api.send({ cmd: "setMode", mode: "dontAsk" }) },
+    { label: t.modeBypass, run: () => api.send({ cmd: "setMode", mode: "bypassPermissions" }) },
     // 压缩一直是自动的，但那意味着用户没法在自己想腾出上下文的时候
     // 腾出上下文 —— 比如刚读完一大堆文件，马上要换一个话题。
-    { label: t.compactNow, run: () => api.send({ cmd: "compact" }) },
+    {
+      label: t.compactNow,
+      // A focus and a keep count turn a size-driven compaction into an
+      // instruction-driven one; asking keeps the default one-click path, and
+      // an empty answer sends the plain command.
+      run: async () => {
+        const answer = (await askText(t.compactFocusPrompt, ""))?.trim();
+        if (answer === null) return;
+        const parsed = parseCompactArgs(answer);
+        api.send({ cmd: "compact", ...parsed });
+      },
+    },
     // Goal 和 loop 都是自主循环，所以入口要明确写"会自己跑多轮"，
     // 不能伪装成一次普通提问。
     { label: t.startGoal, run: () => startAutonomous("startGoal") },
@@ -3818,31 +4539,118 @@ document.addEventListener("click", (event) => {
 $("worktree-enable").addEventListener("click", () => api.send({ cmd: "worktreeStart" }));
 $("worktree-diff").addEventListener("click", () => api.send({ cmd: "worktreeDiff" }));
 $("worktree-merge").addEventListener("click", () => {
-  if (confirm(t.worktreeMergeConfirm)) api.send({ cmd: "worktreeMerge" });
+  void confirmAction(t.worktreeMergeConfirm).then((yes) => {
+    if (yes) api.send({ cmd: "worktreeMerge" });
+  });
 });
 $("worktree-discard").addEventListener("click", () => {
-  if (confirm(t.worktreeDiscardConfirm)) api.send({ cmd: "worktreeDiscard" });
+  void confirmAction(t.worktreeDiscardConfirm, { danger: true }).then((yes) => {
+    if (yes) api.send({ cmd: "worktreeDiscard" });
+  });
 });
 
 const clearConversation = () => {
   // Clearing keeps the session and its saved history; only the transcript goes.
-  if (confirm(t.clearConfirm)) api.send({ cmd: "clearHistory" });
+  void confirmAction(t.clearConfirm, { danger: true }).then((yes) => {
+    if (yes) api.send({ cmd: "clearHistory" });
+  });
 };
 $("new-session").addEventListener("click", () => api.send({ cmd: "newSession" }));
 $("refresh-sessions").addEventListener("click", () => {
   api.send({ cmd: "listSessions", includeArchived: state.showArchived });
 });
 
+/* ---------- session filter ---------- */
+
+/**
+ * Filter the sidebar by state or workspace.
+ *
+ * The filter runs on the host: a client-side filter only sees the page already
+ * loaded, so "only errors" would miss a failure on the 81st session and give
+ * the false impression that everything was fine.
+ */
+function openSessionFilter(event) {
+  const trigger = $("session-filter");
+  const menu = document.createElement("div");
+  menu.className = "session-menu";
+  const options = [
+    { value: "all", label: t.sessionFilterAll },
+    { value: "working", label: t.sessionFilterWorking },
+    { value: "needs-input", label: t.sessionFilterNeedsInput },
+    { value: "error", label: t.sessionFilterError },
+    { value: "cwd", label: t.sessionFilterWorkspace },
+  ];
+  for (const option of options) {
+    const item = document.createElement("button");
+    item.className = "session-menu-item";
+    item.setAttribute("role", "menuitemradio");
+    item.setAttribute("aria-checked", String(state.sessionFilter === option.value));
+    item.textContent = option.label;
+    item.addEventListener("click", () => {
+      state.sessionFilter = option.value;
+      closeSessionMenu();
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.title = option.label;
+      sendSessionList();
+    });
+    menu.appendChild(item);
+  }
+  const rect = trigger.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, rect.right - 160)}px`;
+  menu.style.top = `${rect.bottom + 6}px`;
+  document.body.appendChild(menu);
+  sessionMenu = menu;
+  trigger.setAttribute("aria-expanded", "true");
+  document.addEventListener(
+    "mousedown",
+    (dismiss) => {
+      if (!menu.contains(dismiss.target) && dismiss.target !== trigger && !trigger.contains(dismiss.target)) {
+        closeSessionMenu();
+        trigger.setAttribute("aria-expanded", "false");
+      }
+    },
+    { once: true },
+  );
+}
+
+/** The filter the host should apply, given the current state. */
+function sendSessionList(extra = {}) {
+  const filter = state.sessionFilter;
+  api.send({
+    cmd: "listSessions",
+    includeArchived: state.showArchived,
+    ...(filter === "all" ? {} : filter === "cwd" ? { cwd: state.cwd } : { status: filter }),
+    ...extra,
+  });
+}
+
+$("session-filter").addEventListener("click", openSessionFilter);
+$("session-filter").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  openSessionFilter(event);
+});
+
 $("toggle-archived").addEventListener("click", () => {
   state.showArchived = !state.showArchived;
   $("toggle-archived").classList.toggle("active", state.showArchived);
   $("toggle-archived").title = state.showArchived ? t.hideArchived : t.showArchived;
-  api.send({ cmd: "listSessions", includeArchived: state.showArchived });
+  sendSessionList();
 });
 
+let sessionSearchTimer = null;
 $("session-search").addEventListener("input", (event) => {
   state.sessionQuery = event.target.value;
-  renderSessions(state.sessions);
+  if (sessionSearchTimer) clearTimeout(sessionSearchTimer);
+  const query = state.sessionQuery.trim();
+  if (!query) {
+    state.sessionMatches = null;
+    renderSessions(state.sessions);
+    return;
+  }
+  sessionSearchTimer = setTimeout(() => {
+    api.send({ cmd: "searchSessions", query, includeArchived: state.showArchived });
+  }, 180);
 });
 
 /** Collapse or expand the conversation sidebar; remembered across restarts. */
@@ -3874,6 +4682,8 @@ function renderChangesBadge() {
   const badge = $("changes-badge");
   badge.hidden = count === 0;
   badge.textContent = String(count);
+  // A change landing mid-turn is worth a glance without opening the pane.
+  badge.classList.toggle("live", state.busy && count > 0);
   $("changes-button").title = count > 0 ? `${t.paneDiff} (${count})` : t.paneDiff;
 }
 
@@ -3889,6 +4699,15 @@ $("terminal-button").addEventListener("click", () => {
 
 workbenchTabs.querySelectorAll("button").forEach((button) => {
   button.addEventListener("click", () => openWorkbench(button.dataset.pane));
+  button.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const tabs = [...workbenchTabs.querySelectorAll("button")];
+    const index = tabs.indexOf(button);
+    const next = tabs[(index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length];
+    next.focus();
+    openWorkbench(next.dataset.pane);
+  });
 });
 
 $("close-workbench").addEventListener("click", closeWorkbench);
@@ -4007,6 +4826,17 @@ async function exportSessionFile(markdown, filename) {
   if (result?.saved) addNotice("dim", `${t.exportSaved} ${result.path}`);
 }
 
+/** Background update check: only surfaces when a newer version exists. */
+async function checkUpdateQuietly() {
+  if (!api.checkUpdate || localStorage.getItem("prometheus.updateCheck") === "0") return;
+  const result = await api.checkUpdate();
+  if (!result || result.status !== "available") return;
+  state.updateAvailable = result;
+  addNotice("dim", t.updateAvailableBanner(result.latest));
+  const button = $("check-update");
+  if (button) button.textContent = `${t.checkUpdate} · ${result.latest}`;
+}
+
 /* ---------- top bar overflow menu ---------- */
 
 const topbarMenu = $("topbar-menu");
@@ -4016,6 +4846,7 @@ function syncMenuControls() {
   if (!document.getElementById("menu-theme")) return;
   document.querySelectorAll("#menu-theme [data-theme-choice]").forEach((button) => {
     button.classList.toggle("active", button.dataset.themeChoice === state.theme);
+    button.setAttribute("aria-pressed", String(button.dataset.themeChoice === state.theme));
   });
   document.querySelectorAll("#menu-locale [data-locale]").forEach((button) => {
     button.classList.toggle("active", button.dataset.locale === state.locale);
@@ -4118,6 +4949,9 @@ bootStep("view", () => {
 bootStep("motion", () => {
   document.documentElement.dataset.motion = localStorage.getItem("prometheus.motion") || "full";
 });
+bootStep("uiScale", () => {
+  document.documentElement.style.setProperty("--ui-scale", localStorage.getItem("prometheus.uiScale") || "1");
+});
 bootStep("fontScale", () => {
   document.documentElement.style.setProperty("--font-scale", localStorage.getItem("prometheus.fontScale") || "1");
 });
@@ -4127,6 +4961,11 @@ bootStep("codeFont", () => {
 });
 setupVoice();
 void refreshVersion();
+// An update that exists should be visible without opening About. The check is
+// the same one the About page runs and does nothing when no feed is
+// configured, so a build without an update feed pays nothing.
+void checkUpdateQuietly();
+api.send({ cmd: "getSetupChecklist" });
 api.send({ cmd: "listSessions" });
 api.send({ cmd: "listCommands" });
 // The inspector is opened by the action that needs it, not on launch: a

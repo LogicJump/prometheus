@@ -1,6 +1,7 @@
 /** Shell execution with a timeout and combined output, plus the todo-list tool. */
 
 import { spawn } from "node:child_process";
+import { captureBashChanges, dirtyState } from "../gitSnapshot.ts";
 import type { Tool, ToolResult, TodoItem } from "../types.ts";
 import { resolveSafePath } from "../permissions.ts";
 import { SandboxError, classifyCommand, sandboxEnv, shellFor, type SandboxPolicy } from "../sandbox.ts";
@@ -17,6 +18,58 @@ function sandboxHint(violations: string[]): string {
 
 export { SandboxError };
 const MAX_OUTPUT = 120_000;
+
+/**
+ * Commands that can change files on disk.
+ *
+ * A conservative list on purpose: matching too much only costs a `git status`
+ * (a few milliseconds), while matching too little silently loses the ability
+ * to undo. Common read-only commands are excluded so the check is not paid on
+ * every `cat`.
+ */
+const MUTATING_PROGRAMS = new Set([
+  "rm", "del", "erase", "rd", "rmdir", "mv", "move", "ren", "rename", "cp", "copy", "xcopy", "robocopy", "sed", "perl", "python", "python3", "node", "npm", "npx", "pnpm", "yarn", "cargo", "make", "cmake", "ninja", "gradle", "mvn", "dotnet", "go", "rustc", "gcc", "clang", "tsc", "eslint", "prettier", "black", "ruff",
+]);
+
+/**
+ * Read-only git subcommands, which change nothing and need no snapshot.
+ */
+const READONLY_GIT = new Set([
+  "status", "log", "diff", "show", "branch", "remote", "config", "rev-parse", "ls-files", "describe", "blame",
+]);
+
+/**
+ * Does this command line run something that can write to disk?
+ *
+ * Token-based rather than one monolithic regular expression: a command can
+ * be quoted, prefixed, or chained, and the first word of each segment is
+ * what decides. `git` is special because most of its subcommands are reads.
+ */
+function canWriteFiles(command: string): boolean {
+  // Split on shell separators rather than matching one giant pattern: the
+  // first word of each segment is the program, and `git status && rm x` has
+  // two segments with different answers.
+  const segments = command.split(/&&|\|\||;|\n/);
+  for (const segment of segments) {
+    const words = segment.trim().split(/\s+/).map((word) => word.replace(/^["']+|["']+$/g, ""));
+    // Skip a leading env assignment or `sudo`-style wrapper.
+    let index = 0;
+    while (index < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]) || words[index] === "sudo")) index += 1;
+    const raw = words[index] ?? "";
+    const program = (raw.split(/[\\/]/).pop() ?? "").replace(/\.exe$/i, "").toLowerCase();
+    if (!program) continue;
+    if (program === "git") {
+      const sub = (words[index + 1] ?? "").toLowerCase();
+      if (!READONLY_GIT.has(sub)) return true;
+      continue;
+    }
+    if (MUTATING_PROGRAMS.has(program)) return true;
+  }
+  return false;
+}
+
+/** A redirect to a path (`cmd > file`, `cmd >> file`) counts as a write. */
+const REDIRECT_WRITE = /(^|[^0-9&])>>?\s*[^\s&|>]/;
 
 export const bashTool: Tool = {
   name: "bash",
@@ -53,6 +106,7 @@ export const bashTool: Tool = {
       mode: ctx.config.sandbox ?? "enforce",
       network: ctx.config.networkPolicy ?? "off",
       allowedDirs: ctx.config.allowedDirs ?? [],
+      ...(ctx.config.sandboxCredentials ? { credentials: ctx.config.sandboxCredentials } : {}),
     };
     // The pipeline already asked the user; the sandbox is the backstop that
     // holds even in auto mode.
@@ -63,6 +117,40 @@ export const bashTool: Tool = {
         content: `Blocked by the command sandbox: ${verdict.reason}. ${sandboxHint(verdict.violations)}`,
         display: "blocked",
       };
+    }
+
+    // A run that requires OS containment must not quietly continue under the
+    // policy layer alone: the caller asked for a stronger guarantee than the
+    // classifier can give, and silently downgrading it is the failure mode the
+    // setting exists to prevent.
+    if (ctx.config.sandboxFailIfUnavailable && jobContainmentSupported() && policy.mode !== "off") {
+      const available = await openJob()
+        .then((handle) => {
+          handle?.dispose();
+          return handle !== null;
+        })
+        .catch(() => false);
+      if (!available) {
+        return {
+          isError: true,
+          content:
+            "the OS-level command sandbox could not be created, and this session is configured to refuse rather than fall back. " +
+            "Run the command yourself, or turn off sandboxFailIfUnavailable.",
+          display: "sandbox unavailable",
+        };
+      }
+    }
+
+    // Git sees the files a command changes before the command runs, which is
+    // the only moment their prior content is still reachable. Doing this only
+    // for mutating commands keeps a read-only `git status` free.
+    let snapshotBefore: Awaited<ReturnType<typeof dirtyState>> = null;
+    if (ctx.sessionId && (canWriteFiles(command) || REDIRECT_WRITE.test(command))) {
+      try {
+        snapshotBefore = await dirtyState(cwd);
+      } catch {
+        snapshotBefore = null;
+      }
     }
 
     return new Promise<ToolResult>(async (resolve) => {
@@ -141,6 +229,11 @@ export const bashTool: Tool = {
         if (settled) return;
         settled = true;
         done = true;
+        if (snapshotBefore && ctx.sessionId) {
+          // Fire-and-forget: the command's result is what the model needs;
+          // the snapshot is for a later undo and must not slow it down.
+          void captureBashChanges(ctx.sessionId, cwd, snapshotBefore).catch(() => {});
+        }
         clearTimeout(timer);
         ctx.signal.removeEventListener("abort", onAbort);
         // A finished command still has a live job handle. Closing it is what

@@ -80,16 +80,22 @@ test("the agent runs children concurrently and sums their usage", async () => {
     return { text: `answer: ${text}` };
   });
   const started = Date.now();
-  const results = await agent.runSubagentsForTest(["one", "two", "three"], new AbortController().signal);
-  const elapsed = Date.now() - started;
-  assert.equal(results.length, 3);
-  assert.ok(results.every((result) => result.ok));
-  assert.deepEqual(
-    results.map((result) => result.report),
-    ["answer: one", "answer: two", "answer: three"],
-  );
-  // Each child costs 100 input tokens; the parent sees all three.
-  assert.equal(agent.usage.inputTokens, 300);
-  assert.ok(elapsed < 5_000, "children overlapped rather than running serially");
-  await fake.close();
+  let results: { ok: boolean; report: string }[] = [];
+  try {
+    results = await agent.runSubagentsForTest(["one", "two", "three"], new AbortController().signal);
+    const elapsed = Date.now() - started;
+    assert.equal(results.length, 3);
+    assert.ok(results.every((result) => result.ok));
+    // Each report is wrapped in a provenance element so the parent can tell a
+    // child's output from something the user typed; the body is unchanged.
+    assert.deepEqual(
+      results.map((result) => /<subagent-report[^>]*>\n([\s\S]*?)\n<\/subagent-report>/.exec(result.report)?.[1]),
+      ["answer: one", "answer: two", "answer: three"],
+    );
+    // Each child costs 100 input tokens; the parent sees all three.
+    assert.equal(agent.usage.inputTokens, 300);
+    assert.ok(elapsed < 5_000, "children overlapped rather than running serially");
+  } finally {
+    await fake.close();
+  }
 });

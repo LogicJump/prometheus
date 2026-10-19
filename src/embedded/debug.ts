@@ -425,6 +425,64 @@ export const SERVER_PORTS: Record<string, number> = {
   jlink: 2331,
 };
 
+/** Default executable names, used when the toolchain reported a directory only. */
+export const SERVER_PROGRAMS: Record<"openocd" | "pyocd" | "probe-rs" | "jlink", string[]> = {
+  openocd: ["openocd"],
+  pyocd: ["pyocd"],
+  "probe-rs": ["probe-rs"],
+  // The debug server is a different binary from the flasher (JLinkExe); the
+  // toolchain probe used to look only for JLinkExe and hand its path here.
+  jlink: ["JLinkGDBServerCL", "JLinkGDBServerCL.exe", "JLinkGDBServer", "JLinkGDBServer.exe"],
+};
+
+/**
+ * OpenOCD config files implied by a chip name.
+ *
+ * Users should not have to know that `stm32f407` needs
+ * `target/stm32f4x.cfg`. The mapping is by family prefix — an architecture
+ * fact OpenOCD already encodes in its file names — not a chip allowlist, so an
+ * older or newer part of the same family resolves the same way.
+ */
+export function openocdConfigsFor(target: string | undefined): { interfaceConfig?: string; targetConfig?: string } {
+  const lower = String(target ?? "").toLowerCase();
+  if (!lower) return {};
+  const families: [RegExp, string][] = [
+    [/^stm32f0/, "target/stm32f0x.cfg"],
+    [/^stm32f1/, "target/stm32f1x.cfg"],
+    [/^stm32f2/, "target/stm32f2x.cfg"],
+    [/^stm32f3/, "target/stm32f3x.cfg"],
+    [/^stm32f4/, "target/stm32f4x.cfg"],
+    [/^stm32f7/, "target/stm32f7x.cfg"],
+    [/^stm32h7/, "target/stm32h7x.cfg"],
+    [/^stm32g0/, "target/stm32g0x.cfg"],
+    [/^stm32g4/, "target/stm32g4x.cfg"],
+    [/^stm32l0/, "target/stm32l0.cfg"],
+    [/^stm32l1/, "target/stm32l1.cfg"],
+    [/^stm32l4/, "target/stm32l4x.cfg"],
+    [/^stm32l5/, "target/stm32l5x.cfg"],
+    [/^stm32u5/, "target/stm32u5x.cfg"],
+    [/^stm32wb/, "target/stm32wbx.cfg"],
+    [/^stm32wl/, "target/stm32wlx.cfg"],
+    [/^nrf51/, "target/nrf51.cfg"],
+    [/^nrf52/, "target/nrf52.cfg"],
+    [/^nrf53/, "target/nrf53.cfg"],
+    [/^nrf91/, "target/nrf91.cfg"],
+    [/^rp2040|^rp2350/, "target/rp2040.cfg"],
+    [/^samd2/, "target/at91samdXX.cfg"],
+    [/^same7/, "target/atsame70.cfg"],
+    [/^lpc17/, "target/lpc17xx.cfg"],
+    [/^lpc40/, "target/lpc40xx.cfg"],
+    [/^kinetis|^mk[0-9]/, "target/kx.cfg"],
+    [/^esp32s3/, "target/esp32s3.cfg"],
+    [/^esp32c3/, "target/esp32c3.cfg"],
+    [/^esp32/, "target/esp32.cfg"],
+  ];
+  for (const [pattern, file] of families) {
+    if (pattern.test(lower)) return { targetConfig: file };
+  }
+  return {};
+}
+
 export interface ServerCommand {
   program: string;
   args: string[];
@@ -444,6 +502,9 @@ export function serverCommand(
 ): ServerCommand | null {
   switch (kind) {
     case "openocd": {
+      // A target config can be derived from the chip name; without one the
+      // server cannot be started at all, so the derivation is what makes
+      // "just tell me the chip" work.
       if (!options.targetConfig) return null;
       const args: string[] = [];
       if (options.interfaceConfig) args.push("-f", options.interfaceConfig);
@@ -465,6 +526,11 @@ export function serverCommand(
     case "jlink": {
       if (!options.target) return null;
       const args = ["-device", options.target, "-if", "SWD", "-speed", "4000", "-port", "2331", "-singlerun", "-NoGui", "1"];
+      // Several probes on one machine need the server told which one; the
+      // flash path already selected by serial, the debug path silently used
+      // whichever answered first.
+      if (options.probe) args.push("-SelectEmuBySN", options.probe);
+      if (options.elf) args.push("-elf", options.elf);
       return { program, args, readyPattern: /Waiting for GDB connection|Listening/i, port: 2331 };
     }
     default:

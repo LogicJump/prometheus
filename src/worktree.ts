@@ -8,8 +8,8 @@
  */
 
 import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { SessionFile } from "./sessions.ts";
 import { sessionToMarkdown } from "./export.ts";
 
@@ -24,6 +24,84 @@ function git(cwd: string, args: string[], timeout = 60_000): Promise<{ ok: boole
       },
     );
   });
+}
+
+/**
+ * Paths a fresh worktree needs that git will not carry: local env files,
+ * generated config, anything a project lists in `.worktreeinclude`.
+ *
+ * One pattern per line, gitignore syntax, `#` for comments. Only names are
+ * copied, never directories recursively unless the pattern names one.
+ */
+export function readWorktreeInclude(repoRoot: string): string[] {
+  const file = join(repoRoot, ".worktreeinclude");
+  try {
+    if (!existsSync(file)) return [];
+    return readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#") && !line.startsWith("!"));
+  } catch {
+    return [];
+  }
+}
+
+/** Does a repo-relative path match one of the include patterns? */
+export function matchesInclude(relativePath: string, patterns: string[]): boolean {
+  const normalized = relativePath.split("\\").join("/");
+  return patterns.some((pattern) => {
+    const directory = pattern.endsWith("/");
+    const clean = pattern.replace(/^\//, "").replace(/\/$/, "");
+    if (!clean) return false;
+    if (directory) return normalized === clean || normalized.startsWith(`${clean}/`);
+    if (!clean.includes("*")) return normalized === clean || normalized.startsWith(`${clean}/`);
+    const regex = new RegExp(`^${clean.split("*").map(escapeRegex).join("[^/]*")}$`);
+    return regex.test(normalized) || regex.test(normalized.split("/").pop() ?? "");
+  });
+}
+
+function escapeRegex(text: string): string {
+  // Written without a regex literal so the backslash escapes stay readable:
+  // a literal would need four levels of escaping to mean "any of these".
+  const special = "^$.*+?()[]{}|";
+  let out = "";
+  for (const char of text) out += special.includes(char) ? "\\" + char : char;
+  return out;
+}
+
+/** Copy the paths `.worktreeinclude` names from the main tree into a worktree. */
+function copyIncluded(from: string, to: string, patterns: string[]): string[] {
+  const copied: string[] = [];
+  if (patterns.length === 0) return copied;
+  const walk = (dir: string, depth: number) => {
+    if (depth > 8) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === ".git" || entry.name === "node_modules" || entry.name === ".prometheus") continue;
+      const source = join(dir, entry.name);
+      const relativePath = source.slice(from.length + 1);
+      if (entry.isDirectory()) {
+        walk(source, depth + 1);
+        continue;
+      }
+      if (!entry.isFile() || !matchesInclude(relativePath, patterns)) continue;
+      const target = join(to, relativePath);
+      try {
+        mkdirSync(dirname(target), { recursive: true });
+        copyFileSync(source, target);
+        copied.push(relativePath.split("\\").join("/"));
+      } catch {
+        /* an unreadable include is not worth failing the worktree for */
+      }
+    }
+  };
+  walk(from, 0);
+  return copied;
 }
 
 /** Copy a working tree into a new worktree, skipping git metadata and build output. */
@@ -124,6 +202,9 @@ export async function createWorktree(
       await git(path, ["add", "-A"]);
       await git(path, ["-c", "user.name=Prometheus", "-c", "user.email=prometheus@localhost", "commit", "-m", "Prometheus worktree baseline"]);
     }
+    // Files git cannot carry (env files, generated configs) come from the
+    // project's own list rather than a guess about which ones matter.
+    copyIncluded(top, path, readWorktreeInclude(top));
     const head = await git(path, ["rev-parse", "--abbrev-ref", "HEAD"]);
     // For an empty repository the baseline commit is the fork point.
     const forkedAt = baseSha || (await git(path, ["rev-parse", "HEAD"])).out.trim() || base;
@@ -196,6 +277,16 @@ export async function removeWorktree(repoRoot: string, worktree: Worktree): Prom
 export function carrySession(targetDir: string, session: SessionFile): void {
   try {
     mkdirSync(targetDir, { recursive: true });
+    // The carry folder is disposable: the transcript itself lives in the
+    // session store, and a stale copy inside the worktree would be committed
+    // into the user's branch. Ignoring it is part of writing it.
+    const ignore = join(targetDir, ".gitignore");
+    const existing = existsSync(ignore) ? readFileSync(ignore, "utf8") : "";
+    const entry = "session.md\n" + "session.json\n";
+    if (!existing.includes("session.md")) {
+      const separator = existing && !existing.endsWith("\n") ? "\n" : "";
+      writeFileSync(ignore, `${existing}${separator}${entry}`, "utf8");
+    }
     writeFileSync(join(targetDir, "session.md"), sessionToMarkdown(session), "utf8");
     writeFileSync(
       join(targetDir, "session.json"),
@@ -205,6 +296,118 @@ export function carrySession(targetDir: string, session: SessionFile): void {
   } catch {
     /* carrying artifacts is best effort */
   }
+}
+
+
+/**
+ * A lock file naming the session that owns a worktree.
+ *
+ * Two windows pointed at the same worktree would edit the same checked-out
+ * files with different agents, and `worktree add` would have refused anyway;
+ * the lock makes the reason legible before anything is changed.
+ */
+function lockPath(worktreePath: string): string {
+  return join(worktreePath, ".prometheus-lock.json");
+}
+
+export function lockWorktree(worktreePath: string, sessionId: string): { ok: boolean; holder?: string } {
+  const file = lockPath(worktreePath);
+  try {
+    if (existsSync(file)) {
+      const held = JSON.parse(readFileSync(file, "utf8")) as { sessionId?: string; pid?: number };
+      // A lock left by a dead process is stale, not a conflict. A live one held
+      // by another session is a conflict even inside this process: two sessions
+      // in one window (a fork, a resumed worktree) must not share a checkout.
+      const alive = held.pid !== undefined && isAlive(held.pid);
+      if (alive && held.sessionId && held.sessionId !== sessionId) {
+        return { ok: false, holder: held.sessionId };
+      }
+      if (alive && !held.sessionId) {
+        return { ok: false, holder: `pid ${held.pid}` };
+      }
+    }
+    writeFileSync(file, JSON.stringify({ sessionId, pid: process.pid, at: new Date().toISOString() }, null, 2), "utf8");
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, holder: (err as Error).message };
+  }
+}
+
+export function unlockWorktree(worktreePath: string): void {
+  try {
+    rmSync(lockPath(worktreePath), { force: true });
+  } catch {
+    /* best effort */
+  }
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface StaleWorktree {
+  path: string;
+  branch: string;
+  /** Why it is considered stale: no lock, or a lock whose process is gone. */
+  reason: string;
+  ageDays: number;
+}
+
+/**
+ * Worktrees under `.prometheus/worktrees` that no live process owns.
+ *
+ * A crashed window leaves its checkout and branch behind; enough of them and
+ * the folder is confusing and the branch list is noise. The scan is a read;
+ * `removeWorktree` does the deletion, and only for what this reports.
+ */
+export function staleWorktrees(repoRoot: string, olderThanDays = 14): StaleWorktree[] {
+  const root = join(repoRoot, ".prometheus", "worktrees");
+  if (!existsSync(root)) return [];
+  const out: StaleWorktree[] = [];
+  for (const entry of readdirSafe(root)) {
+    const path = join(root, entry);
+    let stat;
+    try {
+      stat = statSync(path);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    const ageDays = (Date.now() - stat.mtimeMs) / 86_400_000;
+    if (ageDays < olderThanDays) continue;
+    let reason = "no owner recorded";
+    const file = lockPath(path);
+    if (existsSync(file)) {
+      try {
+        const held = JSON.parse(readFileSync(file, "utf8")) as { sessionId?: string; pid?: number };
+        if (held.pid && isAlive(held.pid)) continue;
+        reason = `owner ${held.sessionId ?? "unknown"} is no longer running`;
+      } catch {
+        /* an unreadable lock is as good as none */
+      }
+    }
+    const branch = `prometheus/${entry}`;
+    out.push({ path, branch, reason, ageDays: Math.floor(ageDays) });
+  }
+  return out;
+}
+
+function readdirSafe(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+/** One line per stale worktree, for the CLI and a startup notice. */
+export function formatStaleWorktrees(stale: StaleWorktree[]): string[] {
+  return stale.map((entry) => `${entry.branch}  ${entry.ageDays}d old  ${entry.reason}  (${entry.path})`);
 }
 
 /** Default branch label for display. */

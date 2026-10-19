@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { Tool, ToolResult } from "../types.ts";
-import { resolveSafePath } from "../permissions.ts";
+import { resolveReadablePath, resolveSafePath } from "../permissions.ts";
 import { readTextFile, relPath, withLineNumbers } from "./fsUtil.ts";
 import { diffFile } from "../diff.ts";
 import { findMatch, parsePatch, reindent } from "./match.ts";
@@ -25,7 +25,7 @@ export const readFileTool: Tool = {
   },
   summarize: (input) => String(input.path ?? ""),
   async execute(input, ctx): Promise<ToolResult> {
-    const abs = resolveSafePath(String(input.path), ctx.cwd, ctx.config.allowedDirs);
+    const abs = resolveReadablePath(String(input.path), ctx.cwd, ctx.config.allowedDirs);
     let text: string;
     try {
       text = await readTextFile(abs);

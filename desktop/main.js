@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
-import { browserNavigate, browserSnapshot, closeBrowser, openBrowser, setBrowserBounds } from "./browser.js";
+import { browserNavigate, browserSnapshot, browserScreenshot, closeBrowser, openBrowser, setBrowserBounds } from "./browser.js";
 import { SystemIntegration } from "./system.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -417,10 +417,29 @@ app.whenReady().then(() => {
     return browserNavigate(BrowserWindow.fromWebContents(event.sender), action, arg);
   });
 
-  ipcMain.handle("browser-snapshot", async (event) => {
-    const snapshot = browserSnapshot(BrowserWindow.fromWebContents(event.sender));
+  ipcMain.handle("browser-snapshot", async (event, options = {}) => {
+    const snapshot = browserSnapshot(BrowserWindow.fromWebContents(event.sender), options);
     if (!snapshot) return null;
     return { url: snapshot.url, title: snapshot.title, text: await snapshot.text };
+  });
+
+  /**
+   * Screenshot for the agent's `browser_screenshot` tool.
+   *
+   * Saved under the config home rather than returned inline: a base64 image in
+   * a tool result would be megabytes of context. The path is what the model can
+   * hand to an image-reading turn.
+   */
+  ipcMain.handle("browser-screenshot", async (event) => {
+    const result = await browserScreenshot(BrowserWindow.fromWebContents(event.sender));
+    if (!result.ok) return result;
+    const { mkdir: mk, writeFile: wf } = await import("node:fs/promises");
+    const dir = join(app.getPath("userData"), "browser-shots");
+    await mk(dir, { recursive: true });
+    const file = join(dir, `shot-${Date.now()}.png`);
+    const base64 = String(result.dataUrl).replace(/^data:image\/png;base64,/, "");
+    await wf(file, Buffer.from(base64, "base64"));
+    return { ok: true, url: result.url, path: file };
   });
 
   ipcMain.handle("browser-close", async (event) => {
