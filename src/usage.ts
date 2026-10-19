@@ -23,6 +23,14 @@ export interface UsageRecord {
   cachedTokens: number;
   /** Estimated US dollars for the turn; absent when the model has no price. */
   cost?: number | null;
+  /**
+   * Who spent it: the main loop, a foreground sub-agent, or a background one.
+   *
+   * One session used to produce one opaque total, so the Usage page could not
+   * answer "was delegate worth it". Older records have no field and are read
+   * as `main`.
+   */
+  source?: "main" | "subagent" | "background";
 }
 
 export interface UsageDay {
@@ -44,6 +52,8 @@ export interface UsageSummary {
   days: UsageDay[];
   totals: { inputTokens: number; outputTokens: number; cachedTokens: number; turns: number; cost: number };
   models: UsageModel[];
+  /** Cost by who spent it, so delegation has a price tag. */
+  sources: { source: "main" | "subagent" | "background"; inputTokens: number; outputTokens: number; cost: number }[];
 }
 
 const FILE = join(CONFIG_HOME, "usage.jsonl");
@@ -62,6 +72,7 @@ export function recordUsage(record: Omit<UsageRecord, "at"> & { at?: string }): 
       inputTokens,
       outputTokens,
       cachedTokens: Math.max(0, Math.round(record.cachedTokens || 0)),
+      ...(record.source ? { source: record.source } : {}),
     };
     entry.cost = costOf(entry.model, entry);
     appendFileSync(FILE, `${JSON.stringify(entry)}\n`, "utf8");
@@ -119,12 +130,14 @@ export function usageSummary(days = 30): UsageSummary {
 
   const totals = { inputTokens: 0, outputTokens: 0, cachedTokens: 0, turns: 0, cost: 0 };
   const models = new Map<string, UsageModel>();
+  const sources = new Map<string, { source: "main" | "subagent" | "background"; inputTokens: number; outputTokens: number; cost: number }>();
 
   for (const record of records) {
     const at = new Date(record.at);
     if (Number.isNaN(at.getTime()) || at < cutoff) continue;
     const day = byDay.get(dayKey(at));
     if (!day) continue;
+    const cost = record.cost ?? costOf(record.model, record) ?? 0;
     day.inputTokens += record.inputTokens;
     day.outputTokens += record.outputTokens;
     day.cachedTokens += record.cachedTokens ?? 0;
@@ -133,18 +146,25 @@ export function usageSummary(days = 30): UsageSummary {
     totals.outputTokens += record.outputTokens;
     totals.cachedTokens += record.cachedTokens ?? 0;
     totals.turns += 1;
-    totals.cost += record.cost ?? costOf(record.model, record) ?? 0;
+    totals.cost += cost;
     const model = record.model || "unknown";
     const entry = models.get(model) ?? { model, inputTokens: 0, outputTokens: 0, cost: 0 };
     entry.inputTokens += record.inputTokens;
     entry.outputTokens += record.outputTokens;
-    entry.cost += record.cost ?? costOf(record.model, record) ?? 0;
+    entry.cost += cost;
     models.set(model, entry);
+    const sourceName = record.source ?? "main";
+    const source = sources.get(sourceName) ?? { source: sourceName, inputTokens: 0, outputTokens: 0, cost: 0 };
+    source.inputTokens += record.inputTokens;
+    source.outputTokens += record.outputTokens;
+    source.cost += cost;
+    sources.set(sourceName, source);
   }
 
   return {
     days: [...byDay.values()],
     totals,
     models: [...models.values()].sort((a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens)),
+    sources: [...sources.values()].sort((a, b) => b.inputTokens + b.outputTokens - (a.inputTokens + a.outputTokens)),
   };
 }

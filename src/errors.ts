@@ -28,6 +28,24 @@ export interface ClassifiedError {
 
 const NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "UND_ERR_SOCKET"]);
 
+/**
+ * Network failures nest their code one level down: undici throws
+ * `TypeError("terminated")` with `cause.code === "UND_ERR_SOCKET"`, and fetch
+ * wraps connect errors the same way. Reading only the top level sent every
+ * dropped connection down the terminal path, so the loop never retried a blip.
+ */
+function networkCode(error: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const candidate = current as { code?: unknown; cause?: unknown };
+    if (typeof candidate.code === "string") return candidate.code;
+    current = candidate.cause;
+  }
+  return undefined;
+}
+
 export function classifyError(error: unknown, attempt = 1): ClassifiedError {
   if (error instanceof ApiError) {
     const level: ErrorLevel = error.retryable ? "recoverable" : "terminal";
@@ -44,18 +62,21 @@ export function classifyError(error: unknown, attempt = 1): ClassifiedError {
   if (cause?.name === "AbortError") {
     return { level: "terminal", message: "aborted", status: 0, retryAfterMs: 0, cause: error };
   }
-  if (cause?.code && NETWORK_CODES.has(cause.code)) {
+  const code = networkCode(error);
+  if (code && NETWORK_CODES.has(code)) {
     return {
       level: "recoverable",
-      message: cause.message ?? cause.code,
+      message: cause?.message ?? code,
       status: 0,
       retryAfterMs: backoff(attempt),
       cause: error,
     };
   }
-  // A fetch timeout surfaces as a DOMException named TimeoutError.
-  if (cause?.name === "TimeoutError") {
-    return { level: "recoverable", message: cause.message ?? "request timed out", status: 0, retryAfterMs: backoff(attempt), cause: error };
+  // A fetch timeout surfaces as a DOMException named TimeoutError. Our own
+  // timeout aborts with a plain Error that says "timed out"; either one is a
+  // transient condition, not a reason to end the conversation.
+  if (cause?.name === "TimeoutError" || /\btimed out\b/i.test(cause?.message ?? "")) {
+    return { level: "recoverable", message: cause?.message ?? "request timed out", status: 0, retryAfterMs: backoff(attempt), cause: error };
   }
   return { level: "terminal", message: cause?.message ?? String(error), status: 0, retryAfterMs: 0, cause: error };
 }

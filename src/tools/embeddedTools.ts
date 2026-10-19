@@ -228,6 +228,9 @@ const flashTool: Tool = {
       interface_config: { type: "string", description: "OpenOCD interface config, e.g. `interface/stlink.cfg`" },
       target_config: { type: "string", description: "OpenOCD target config, e.g. `target/stm32f4x.cfg`" },
       reset: { type: "boolean", description: "Reset the board after writing; default true" },
+      programmer: { type: "string", description: "avrdude programmer id (`-c`), e.g. `arduino` or `usbasp`. Required for avrdude" },
+      part: { type: "string", description: "avrdude part id (`-p`), e.g. `atmega328p`. Required for avrdude" },
+      port: { type: "string", description: "Serial port for a flasher that programs over one (avrdude, esptool), e.g. `COM3`" },
     },
     required: ["firmware"],
     additionalProperties: false,
@@ -277,6 +280,9 @@ const flashTool: Tool = {
       ...(input.interface_config ? { interfaceConfig: String(input.interface_config) } : {}),
       ...(input.target_config ? { targetConfig: String(input.target_config) } : {}),
       ...(input.reset !== undefined ? { reset: Boolean(input.reset) } : {}),
+      ...(input.programmer ? { programmer: String(input.programmer) } : {}),
+      ...(input.part ? { part: String(input.part) } : {}),
+      ...((input.port ? String(input.port) : board.port) ? { port: String(input.port ?? board.port) } : {}),
     });
 
     const lines = [result.detail];
@@ -317,16 +323,26 @@ const serialTool: Tool = {
       until: { type: "string", description: "Stop as soon as a received line matches this regular expression" },
       max_lines: { type: "integer", description: "Stop after this many lines, default 2000" },
       only_errors: { type: "boolean", description: "Return only lines parsed as error or warning level" },
-      reset_on_connect: {
-        type: "boolean",
-        description:
-          "Assert DTR when opening, which resets most dev boards. Use it to catch a boot banner; leave it off when the firmware is already running and you want what it is printing now. Default false.",
-      },
     },
+    required: [],
     additionalProperties: false,
   },
   summarize: (input) => String(input.port ?? "serial"),
   async execute(input, ctx): Promise<ToolResult> {
+    // The tool is readonly, so plan mode and the ask-mode auto-approval both
+    // let it run without a confirmation. Asserting DTR resets most boards,
+    // which changes physical state — a read must not do that behind a
+    // read-only label. The switch is gone from the schema; an older model or a
+    // saved prompt that still passes it gets told why instead of a silent reset.
+    if (input.reset_on_connect === true) {
+      return {
+        isError: true,
+        content:
+          "embed_serial is read-only and never resets the board. It does not assert DTR. " +
+          "If you need the boot banner, reset the board yourself (or use embed_reset) and then read.",
+        display: "read-only",
+      };
+    }
     const board = selectedBoard(ctx);
     const ports = await listSerialPorts();
     let port = useBoard(input.port ? String(input.port) : undefined, board.port);
@@ -357,8 +373,9 @@ const serialTool: Tool = {
 
     const timeoutMs = Math.min(60_000, Math.max(100, Number(input.timeout_ms ?? 5000)));
     const baud = Number(useBoard(input.baud !== undefined ? Number(input.baud) : undefined, board.baud) ?? 115200);
-    const assertDtr = Boolean(useBoard(input.reset_on_connect !== undefined ? Boolean(input.reset_on_connect) : undefined, board.assertDtr));
-    const result = await capture((path, rate) => openPort(path, rate, { assertDtr }), port, {
+    // Never assert DTR: a read must not reset the board, and the tool is
+    // marked read-only so neither plan mode nor an auto-approval asks first.
+    const result = await capture((path, rate) => openPort(path, rate, { assertDtr: false }), port, {
       timeoutMs,
       baud,
       ...(until ? { until } : {}),
@@ -688,58 +705,144 @@ function describeStop(stop: MiRecord | null): string[] {
 // ---- embed_registers -------------------------------------------------------
 
 /**
- * Where an SVD for this chip might be.
+ * Where a CMSIS-SVD for a chip might be.
  *
- * The packs install into several places and none of them is standard on
- * Windows. Rather than make the user find a file, the tool searches the places
- * a vendor pack actually lands and reports which one it used.
+ * No vendor or IDE is named here. Packs land in whatever root the pack manager
+ * was told to use (`CMSIS_PACK_ROOT`), the two cmsis-pack-manager caches, and
+ * any directory the user points at (`PROMETHEUS_SVD_DIRS`, path-separator
+ * separated). The project may also carry its own under `.prometheus/svd/`.
+ * Vendors differ in layout, so the lookup walks a pack root rather than
+ * assuming one flat naming scheme.
  */
-const SVD_DIRS = [
-  // STM32CubeProgrammer ships one SVD per sub-family with the tool.
-  "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/SVD",
-  "C:/Program Files (x86)/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/SVD",
-  "C:/Program Files/STMicroelectronics/STM32Cube/STM32CubeProgrammer/SVD",
-  // Keil and the CMSIS packs.
-  "C:/Keil_v5/ARM/PACK",
-  ...(process.env.CMSIS_PACK_ROOT ? [join(process.env.CMSIS_PACK_ROOT, ".Web")] : []),
-  ...(process.env.USERPROFILE ? [join(process.env.USERPROFILE, ".cache", "cmsis-pack-manager")] : []),
-  ...(process.env.HOME ? [join(process.env.HOME, ".cache", "cmsis-pack-manager")] : []),
-];
+export function svdSearchDirs(cwd: string): string[] {
+  const dirs: string[] = [];
+  const push = (dir: string | undefined | null) => {
+    if (!dir) return;
+    const trimmed = dir.trim();
+    if (trimmed && !dirs.includes(trimmed)) dirs.push(trimmed);
+  };
+  for (const entry of (process.env.PROMETHEUS_SVD_DIRS ?? "").split(delimiter)) push(entry);
+  push(join(cwd, ".prometheus", "svd"));
+  const packRoots = [
+    process.env.CMSIS_PACK_ROOT,
+    process.env.USERPROFILE ? join(process.env.USERPROFILE, ".cache", "cmsis-pack-manager") : undefined,
+    process.env.HOME ? join(process.env.HOME, ".cache", "cmsis-pack-manager") : undefined,
+    process.env.HOME ? join(process.env.HOME, ".cache", "cmsis-pack-manager", "cmsis") : undefined,
+  ];
+  for (const root of packRoots) {
+    if (!root) continue;
+    push(root);
+    push(join(root, "CMSIS", "Packs"));
+    push(join(root, ".Web"));
+  }
+  return dirs.filter((dir) => existsSync(dir));
+}
 
-function findSvd(name: string): string | null {
+/** Depth-limited walk for a file whose base name matches, so vendor trees work. */
+function findUnder(root: string, wanted: string, depth = 6): string | null {
+  let entries: string[];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    if (entry.toLowerCase() === `${wanted}.svd`) return join(root, entry);
+  }
+  for (const entry of entries) {
+    if (depth <= 0) break;
+    const full = join(root, entry);
+    try {
+      if (!statSync(full).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const found = findUnder(full, wanted, depth - 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findSvd(name: string, dirs: string[]): string | null {
   const wanted = name.toLowerCase();
-  // Exact filename first (`STM32F411.svd`), then a directory walk.
-  for (const dir of SVD_DIRS) {
+  for (const dir of dirs) {
     if (!existsSync(dir)) continue;
     const direct = join(dir, `${name}.svd`);
     if (existsSync(direct)) return direct;
     try {
       for (const entry of readdirSync(dir)) {
-        if (entry.toLowerCase() === `${wanted}.svd` || entry.toLowerCase().startsWith(`${wanted}`)) {
-          return join(dir, entry);
-        }
+        if (entry.toLowerCase() === `${wanted}.svd`) return join(dir, entry);
       }
     } catch {
       /* unreadable */
     }
+    const walked = findUnder(dir, wanted);
+    if (walked) return walked;
   }
   return null;
 }
 
-/** The chip name implied by the loaded project, when it has one. */
-function chipFromProject(): string | null {
-  const pio = "platformio.ini";
-  if (existsSync(pio)) {
-    const text = readFileSync(pio, "utf8");
-    const board = /board\s*=\s*(\S+)/.exec(text)?.[1];
-    if (board) {
-      // `nucleo_f411re` → STM32F411; `esp32dev` → ESP32.
-      const normalized = board.replace(/^nucleo[_-]?/i, "").replace(/re$/i, "").toUpperCase();
-      const stm = /STM32([A-Z]\d{3})/.exec(normalized);
-      if (stm) return `STM32${stm[1]}`;
+/**
+ * The chip names a project implies, most specific first.
+ *
+ * Project formats name their part in their own way (`nucleo_f411re`,
+ * `CONFIG_IDF_TARGET="esp32s3"`, `-mcpu=cortex-m4`); none of them is a CMSIS
+ * device name. Rather than hard-code one ecosystem's naming, read the likely
+ * tokens out of the project files and let the SVD lookup find whichever one
+ * has a matching file. The caller still states `device` explicitly when it
+ * knows the part.
+ */
+function chipHintsFromProject(cwd: string): string[] {
+  const hints: string[] = [];
+  const add = (value: string | undefined | null) => {
+    if (!value) return;
+    const token = value.trim().replace(/^["']|["']$/g, "");
+    if (!token) return;
+    if (!hints.includes(token)) hints.push(token);
+    // A board id like `nucleo_f411re` carries the part after the separator.
+    for (const part of token.split(/[^A-Za-z0-9]+/)) {
+      if (part.length >= 4 && !hints.includes(part)) hints.push(part);
     }
+  };
+  const read = (relative: string): string | null => {
+    const file = join(cwd, relative);
+    try {
+      return existsSync(file) ? readFileSync(file, "utf8") : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const pio = read("platformio.ini");
+  if (pio) {
+    for (const match of pio.matchAll(/^\s*board\s*=\s*(\S+)/gim)) add(match[1]);
+    for (const match of pio.matchAll(/^\s*board_build\.mcu\s*=\s*(\S+)/gim)) add(match[1]);
   }
-  return null;
+  const sdkconfig = read("sdkconfig") ?? read("sdkconfig.defaults");
+  if (sdkconfig) {
+    const target = /CONFIG_IDF_TARGET\s*=\s*"?([\w-]+)"?/.exec(sdkconfig)?.[1];
+    add(target);
+  }
+  const west = read("west.yml") ?? read("west.yaml") ?? read("prj.conf");
+  if (west) {
+    const soc = /CONFIG_SOC\s*=\s*"?([\w-]+)"?/.exec(west)?.[1] ?? /soc:\s*([\w-]+)/.exec(west)?.[1];
+    add(soc);
+  }
+  // A CMake file usually names the core, and sometimes the device macro.
+  for (const name of ["CMakeLists.txt", "CMakePresets.json", "CMakeCache.txt"]) {
+    const text = read(name);
+    if (!text) continue;
+    const device = /(?:-D?)?([A-Za-z]+[0-9]{3,4}[A-Za-z]*)/.exec(text)?.[1];
+    add(device);
+    const processor = /CMAKE_SYSTEM_PROCESSOR:?[A-Z]*=?\s*"?([\w-]+)"?/.exec(text)?.[1];
+    add(processor);
+  }
+  const mcu = read("mcu.h") ?? read("user_settings.h");
+  if (mcu) {
+    const define = /#define\s+([A-Za-z]+[0-9]{3,4}[A-Za-z]*)x?/i.exec(mcu)?.[1];
+    add(define);
+  }
+  return hints;
 }
 
 const registersTool: Tool = {
@@ -759,24 +862,37 @@ const registersTool: Tool = {
   },
   summarize: (input) => String(input.register ?? input.peripheral ?? input.device ?? "registers"),
   async execute(input, ctx): Promise<ToolResult> {
-    const deviceName = input.device ? String(input.device) : chipFromProject();
-    if (!deviceName) {
-      return {
-        isError: true,
-        content:
-          "No chip named. Pass `device` (e.g. STM32F411), or run this in a PlatformIO/CMake project whose board identifies the chip.",
-        display: "no device",
-      };
+    const dirs = svdSearchDirs(ctx.cwd);
+    const hints = chipHintsFromProject(ctx.cwd);
+    const explicit = input.device ? String(input.device) : null;
+    // The explicit name first, then whatever the project implies. Guessing a
+    // name is only acceptable if the file it names actually exists; the
+    // reported source path is what makes the answer checkable.
+    const candidates = explicit ? [explicit] : hints;
+    let svdPath: string | null = null;
+    let deviceName: string | null = null;
+    for (const candidate of candidates) {
+      const found = findSvd(candidate, dirs);
+      if (!found) continue;
+      svdPath = found;
+      deviceName = candidate;
+      break;
     }
-
-    const svdPath = findSvd(deviceName);
     if (!svdPath) {
+      if (!explicit && hints.length === 0) {
+        return {
+          isError: true,
+          content:
+            "No chip named. Pass `device` (the CMSIS device name, e.g. STM32F411), or point PROMETHEUS_SVD_DIRS at a directory of .svd files.",
+          display: "no device",
+        };
+      }
       return {
         isError: true,
         content:
-          `No SVD found for ${deviceName}. Looked in:\n` +
-          SVD_DIRS.map((dir) => `  ${dir}`).join("\n") +
-          `\nSTM32CubeProgrammer installs one per sub-family; CMSIS packs install under CMSIS_PACK_ROOT.`,
+          `No SVD found for ${explicit ?? `any of: ${hints.join(", ")}`}. Looked in:\n` +
+          (dirs.length ? dirs.map((dir) => `  ${dir}`).join("\n") : "  (no SVD directory found)") +
+          `\nSet PROMETHEUS_SVD_DIRS to a directory of .svd files, put them in .prometheus/svd/, or install a CMSIS pack.`,
         display: "no svd",
       };
     }
@@ -789,6 +905,13 @@ const registersTool: Tool = {
     }
 
     const provenance = `source: ${svdPath} (device ${device.name}${device.cpu ? `, ${device.cpu.name}` : ""})`;
+    // Storage is stated before any peripheral: the file's own memory entries,
+    // never a peripheral that merely happens to be called FLASH.
+    const storage = device.memories?.length
+      ? `memory: ${device.memories
+          .map((memory) => `${memory.name} @0x${memory.start.toString(16).toUpperCase()} ${Math.round(memory.size / 1024)} KB`)
+          .join(", ")}`
+      : "memory: the SVD does not model the flash/SRAM regions, so their sizes are not in this map";
 
     if (input.register) {
       const path = String(input.register);
@@ -833,6 +956,7 @@ const registersTool: Tool = {
         lines.push(`  ${peripheral.registers.map((register) => `${register.name}+0x${register.offset.toString(16).toUpperCase()}`).join(" ")}`);
       }
     }
+    if (!search) lines.unshift(storage, "");
     return {
       content: `${device.name}: ${periphs.length} peripheral(s)\n${lines.join("\n")}\n\n${provenance}\nAsk for a peripheral by name to get its full register and field detail.`,
       display: `${periphs.length} peripherals`,

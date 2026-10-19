@@ -12,9 +12,11 @@
  *   user      ~/.prometheus/mcp.json                 available everywhere
  *   project   <workspace>/.prometheus/mcp.json       this repository only
  *
- * A project server with the same name overrides the user server. There is no
- * OAuth flow: credentials are environment variables or headers in the config
- * file, which keeps the trust boundary where the user put it.
+ * A project server with the same name overrides the user server. A remote
+ * server that answers 401 is authorized through OAuth (`src/oauth.ts`): the
+ * browser flow runs once and the token is kept in `~/.prometheus/mcp-tokens.json`.
+ * A server whose credentials are supplied as headers or environment variables
+ * never reaches that path.
  *
  * Config:
  *
@@ -30,6 +32,17 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
+import {
+  discoverMetadata,
+  isExpired,
+  loadTokens,
+  parseChallenge,
+  refreshToken,
+  saveToken,
+  type AuthorizationServerMetadata,
+  type AuthChallenge,
+  type InteractiveResult,
+} from "./oauth.ts";
 import type { Tool, ToolResult } from "./types.ts";
 
 export interface McpServerConfig {
@@ -62,6 +75,21 @@ export interface McpPrompt {
   arguments?: { name: string; description?: string; required?: boolean }[];
 }
 
+/**
+ * One part of a `tools/call` result.
+ *
+ * MCP allows text, images, audio, embedded resources and a typed
+ * `structuredContent`. The old code kept only `type: "text"`, so a screenshot
+ * tool returned "(no output)".
+ */
+export interface McpContentPart {
+  type?: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+  resource?: { uri?: string; text?: string; blob?: string; mimeType?: string };
+}
+
 export interface McpConfigFile {
   servers?: Record<string, McpServerConfig>;
 }
@@ -80,8 +108,117 @@ export interface McpClient {
   listResources?(): Promise<McpResource[]>;
   readResource?(uri: string): Promise<string>;
   listPrompts?(): Promise<McpPrompt[]>;
+  /** Fetch one prompt with its messages. Servers that list prompts usually have it. */
+  getPrompt?(name: string, args: Record<string, string>): Promise<{ description?: string; messages: unknown[] }>;
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
+  /**
+   * Called for every server-initiated notification. List-change notifications
+   * are the reason this exists: the tool list was loaded once at startup and
+   * never refreshed, so a server that added a tool kept advertising the stale
+   * set until the app restarted.
+   */
+  onNotification?(handler: (method: string, params: unknown) => void): void;
+  /**
+   * Answer an `elicitation/create` request. Returning a value here sends it
+   * back to the server; returning null declines. When no handler is installed
+   * the client answers "declined", which is the protocol's way of saying the
+   * user was not asked.
+   */
+  onElicitation?(handler: (request: ElicitationRequest) => Promise<ElicitationResult | null>): void;
   dispose(): void;
+}
+
+/** A server asking the user for input. */
+export interface ElicitationRequest {
+  message: string;
+  /** A JSON Schema for the form; the client renders what it understands. */
+  requestedSchema?: {
+    type?: string;
+    properties?: Record<string, { type?: string; title?: string; description?: string; enum?: string[]; default?: unknown }>;
+    required?: string[];
+  };
+}
+
+export interface ElicitationResult {
+  action: "accept" | "decline" | "cancel";
+  content?: Record<string, unknown>;
+}
+
+/** What the host needs to run the browser flow for one server. */
+export interface AuthorizeOptions {
+  server: string;
+  resourceUrl: string;
+  metadata: AuthorizationServerMetadata;
+  scope?: string;
+}
+
+/**
+ * Turn a server's schema into a flat list of questions the UI can ask.
+ *
+ * Only scalar fields are asked. A nested object or an array is left at its
+ * default and reported, because inventing a way to render arbitrary JSON in a
+ * terminal prompt would produce a form the user cannot check.
+ */
+export function elicitationQuestions(request: ElicitationRequest): { name: string; label: string; options?: string[]; default?: unknown }[] {
+  const properties = request.requestedSchema?.properties ?? {};
+  const required = new Set(request.requestedSchema?.required ?? []);
+  const out: { name: string; label: string; options?: string[]; default?: unknown }[] = [];
+  for (const [name, schema] of Object.entries(properties)) {
+    if (!schema) continue;
+    const scalar = schema.type === "string" || schema.type === "number" || schema.type === "integer" || schema.type === "boolean";
+    if (!scalar && !schema.enum) continue;
+    out.push({
+      name,
+      label: schema.title ?? schema.description ?? name,
+      ...(schema.enum ? { options: schema.enum } : {}),
+      ...(schema.default !== undefined ? { default: schema.default } : {}),
+    });
+    void required;
+  }
+  return out;
+}
+
+/** Notifications a client should route to its handler. */
+const INTERESTING_NOTIFICATIONS = new Set([
+  "notifications/tools/list_changed",
+  "notifications/resources/list_changed",
+  "notifications/prompts/list_changed",
+  "notifications/resources/updated",
+  "notifications/message",
+]);
+
+/** Map a JSON-RPC error object to an Error that keeps the code and data. */
+function rpcError(error: { code?: number; message?: string; data?: unknown }): Error {
+  const err = new Error(error.message ?? "MCP error") as Error & { code?: number; data?: unknown };
+  err.code = error.code;
+  err.data = error.data;
+  return err;
+}
+
+/**
+ * Follow `nextCursor` until the server stops returning one.
+ *
+ * The old code sent one request and ignored the cursor, so a server with more
+ * tools than fit in one page silently lost the rest. The cap guards against a
+ * server that echoes the same cursor forever.
+ */
+async function paginate<T>(
+  request: (method: string, params: unknown) => Promise<unknown>,
+  method: string,
+  key: string,
+  limit = 50,
+): Promise<T[]> {
+  const out: T[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < limit; page++) {
+    const result = (await request(method, cursor ? { cursor } : {})) as Record<string, unknown>;
+    const items = result?.[key];
+    if (Array.isArray(items)) out.push(...(items as T[]));
+    const next = result?.nextCursor;
+    if (typeof next !== "string" || !next) break;
+    cursor = next;
+  }
+  return out;
 }
 
 function transportOf(config: McpServerConfig): "stdio" | "http" {
@@ -146,14 +283,69 @@ export class StdioMcpClient implements McpClient {
     }
   }
 
-  private settle(message: { id?: number; result?: unknown; error?: { message?: string } }): void {
+  private settle(message: { id?: number; result?: unknown; error?: { code?: number; message?: string; data?: unknown }; method?: string; params?: unknown }): void {
+    // A notification has no id. The old code returned here, which discarded
+    // every `list_changed` the servers sent.
+    if (message.method && message.id === undefined) {
+      if (INTERESTING_NOTIFICATIONS.has(message.method)) this.notificationHandler?.(message.method, message.params);
+      return;
+    }
+    // A server-initiated request carries an id we never issued. Ignoring it
+    // would leave the server waiting forever, so answer it: elicitation is
+    // routed to the user when a handler exists, and every other method gets an
+    // explicit "not implemented" rather than silence.
+    if (typeof message.id === "number" && !this.pending.has(message.id) && message.method) {
+      const id = message.id;
+      if (message.method === "elicitation/create") {
+        void this.answerElicitation(id, message.params as ElicitationRequest);
+        return;
+      }
+      this.child.stdin?.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: `prometheus does not implement ${message.method}` },
+        })}\n`,
+      );
+      return;
+    }
     if (typeof message.id !== "number") return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
     clearTimeout(pending.timer);
-    if (message.error) pending.reject(new Error(message.error.message ?? "MCP error"));
+    if (message.error) pending.reject(rpcError(message.error));
     else pending.resolve(message.result);
+  }
+
+  private notificationHandler: ((method: string, params: unknown) => void) | null = null;
+
+  onNotification(handler: (method: string, params: unknown) => void): void {
+    this.notificationHandler = handler;
+  }
+
+  private elicitationHandler: ((request: ElicitationRequest) => Promise<ElicitationResult | null>) | null = null;
+
+  onElicitation(handler: (request: ElicitationRequest) => Promise<ElicitationResult | null>): void {
+    this.elicitationHandler = handler;
+  }
+
+  /** Ask the user (when there is one) and answer the server either way. */
+  private async answerElicitation(id: number, request: ElicitationRequest): Promise<void> {
+    let result: ElicitationResult | null = null;
+    try {
+      result = this.elicitationHandler ? await this.elicitationHandler(request ?? { message: "" }) : null;
+    } catch {
+      result = null;
+    }
+    // A client with no user must not accept on its own: declining is the
+    // protocol's signal that the request was seen and refused.
+    const payload = result ?? { action: "decline" as const };
+    try {
+      this.child.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id, result: payload })}\n`);
+    } catch {
+      /* the server went away while the user was thinking */
+    }
   }
 
   request(method: string, params: unknown, timeoutMs = 20_000): Promise<unknown> {
@@ -178,44 +370,64 @@ export class StdioMcpClient implements McpClient {
   async initialize(): Promise<void> {
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
-      capabilities: {},
+      // Declaring elicitation is what makes a server ask at all. Listing the
+      // capability without a handler would turn every prompt into a timeout.
+      capabilities: this.elicitationHandler ? { elicitation: {} } : {},
       clientInfo: { name: "prometheus", version: "0.1.0" },
     });
     this.notify("notifications/initialized", {});
   }
 
   async listTools(): Promise<{ name: string; description?: string; inputSchema?: Record<string, unknown> }[]> {
-    const result = (await this.request("tools/list", {})) as { tools?: unknown[] };
-    return Array.isArray(result?.tools) ? (result.tools as never[]) : [];
+    return paginate((method, params) => this.request(method, params), "tools/list", "tools");
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
     const result = (await this.request("tools/call", { name, arguments: args }, 120_000)) as {
-      content?: { type?: string; text?: string }[];
+      content?: McpContentPart[];
       isError?: boolean;
+      structuredContent?: unknown;
     };
     return toToolResult(result);
   }
 
 
   async listResources(): Promise<McpResource[]> {
-    const result = (await this.request("resources/list", {})) as { resources?: McpResource[] };
-    return Array.isArray(result?.resources) ? result.resources : [];
+    return paginate((method, params) => this.request(method, params), "resources/list", "resources");
   }
 
   async readResource(uri: string): Promise<string> {
     const result = (await this.request("resources/read", { uri }, 60_000)) as {
-      contents?: { text?: string; uri?: string }[];
+      contents?: { text?: string; uri?: string; blob?: string; mimeType?: string }[];
     };
     return (result?.contents ?? [])
-      .map((entry) => entry.text ?? "")
+      .map((entry) => {
+        if (typeof entry.text === "string") return entry.text;
+        // A binary resource has a `blob` (base64) and no text. Reporting it is
+        // better than an empty string that reads as "the document is blank".
+        if (entry.blob) return `[binary resource ${entry.uri ?? uri}${entry.mimeType ? ` (${entry.mimeType})` : ""}, ${Math.ceil((entry.blob.length * 3) / 4 / 1024)} KiB]`;
+        return "";
+      })
       .filter(Boolean)
       .join("\n");
   }
 
   async listPrompts(): Promise<McpPrompt[]> {
-    const result = (await this.request("prompts/list", {})) as { prompts?: McpPrompt[] };
-    return Array.isArray(result?.prompts) ? result.prompts : [];
+    return paginate((method, params) => this.request(method, params), "prompts/list", "prompts");
+  }
+
+  /**
+   * Fetch one prompt's messages. The host used to render a prompt as a string
+   * template of its name and arguments; the server's own text was never
+   * requested, so a prompt with a body (a code review checklist, a commit
+   * format) arrived empty.
+   */
+  async getPrompt(name: string, args: Record<string, string>): Promise<{ description?: string; messages: unknown[] }> {
+    const result = (await this.request("prompts/get", { name, arguments: args })) as {
+      description?: string;
+      messages?: unknown[];
+    };
+    return { description: result?.description, messages: Array.isArray(result?.messages) ? result.messages : [] };
   }
   dispose(): void {
     this.closed = true;
@@ -233,15 +445,56 @@ export class HttpMcpClient implements McpClient {
   private readonly headers: Record<string, string>;
   private nextId = 1;
   private sessionId = "";
+  private elicitationHandler: ((request: ElicitationRequest) => Promise<ElicitationResult | null>) | null = null;
+  /** Server name from mcp.json, used as the token-store key. */
+  private readonly serverName: string;
+  private bearer = "";
+  private clientId = "";
+  private authorize: ((options: AuthorizeOptions) => Promise<InteractiveResult | null>) | null = null;
 
-  constructor(config: McpServerConfig) {
+  constructor(config: McpServerConfig, serverName = config.url ?? "mcp") {
     if (!config.url) throw new Error("MCP HTTP server has no url");
     this.url = config.url;
+    this.serverName = serverName;
     this.headers = { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...config.headers };
+    const stored = loadTokens()[serverName];
+    if (stored && !isExpired(stored)) this.bearer = stored.access_token;
+  }
+
+  /** Install the browser-flow runner; without one a 401 is just an error. */
+  onAuthorize(handler: (options: AuthorizeOptions) => Promise<InteractiveResult | null>): void {
+    this.authorize = handler;
+  }
+
+  onElicitation(handler: (request: ElicitationRequest) => Promise<ElicitationResult | null>): void {
+    this.elicitationHandler = handler;
+  }
+
+  /** Ask the user, then POST the answer back as a JSON-RPC response. */
+  private async answerElicitation(id: number, request: ElicitationRequest): Promise<void> {
+    let result: ElicitationResult | null = null;
+    try {
+      result = this.elicitationHandler ? await this.elicitationHandler(request ?? { message: "" }) : null;
+    } catch {
+      result = null;
+    }
+    const payload = result ?? { action: "decline" as const };
+    // A response is a bare JSON-RPC message with no method; the server
+    // correlates it by id.
+    await this.post({ jsonrpc: "2.0", id, result: payload }, 10_000).catch(() => {});
   }
 
   private requestHeaders(): Record<string, string> {
-    return this.sessionId ? { ...this.headers, "Mcp-Session-Id": this.sessionId } : { ...this.headers };
+    const headers: Record<string, string> = { ...this.headers, "MCP-Protocol-Version": "2025-06-18" };
+    if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
+    if (this.bearer) headers.Authorization = `Bearer ${this.bearer}`;
+    return headers;
+  }
+
+  private notificationHandler: ((method: string, params: unknown) => void) | null = null;
+
+  onNotification(handler: (method: string, params: unknown) => void): void {
+    this.notificationHandler = handler;
   }
 
   private async post(payload: unknown, timeoutMs: number): Promise<Response> {
@@ -262,6 +515,36 @@ export class HttpMcpClient implements McpClient {
     }
   }
 
+  /**
+   * Renew the bearer token after a 401.
+   *
+   * A stored refresh token is used first; when there is none, the caller's
+   * authorization handler runs the browser flow. Both paths end with a token
+   * in memory and on disk, so the next process start does not repeat the
+   * browser step.
+   */
+  private async renewToken(challenge: AuthChallenge | null): Promise<boolean> {
+    const metadata = await discoverMetadata(this.url, challenge?.resourceMetadata);
+    const stored = loadTokens()[this.serverName];
+    if (stored?.refresh_token) {
+      const refreshed = await refreshToken(metadata, stored, { clientId: this.clientId, resource: this.url });
+      saveToken(this.serverName, refreshed);
+      this.bearer = refreshed.access_token;
+      return true;
+    }
+    if (!this.authorize) return false;
+    const result = await this.authorize({
+      server: this.serverName,
+      resourceUrl: this.url,
+      metadata,
+      scope: challenge?.scope,
+    });
+    if (!result) return false;
+    this.clientId = result.clientId;
+    this.bearer = result.token.access_token;
+    return true;
+  }
+
   async request(method: string, params: unknown, timeoutMs = 20_000): Promise<unknown> {
     const id = this.nextId++;
     let res: Response;
@@ -270,15 +553,35 @@ export class HttpMcpClient implements McpClient {
     } catch (err) {
       throw new Error(`MCP HTTP request failed: ${(err as Error).message}`);
     }
+    // A remote server that answers 401 is asking for OAuth, not reporting a
+    // bug. Renew once and replay the same request; a second 401 is a real
+    // failure and falls through to the error below.
+    if (res.status === 401) {
+      const challenge = parseChallenge(res.headers.get("www-authenticate"));
+      let renewed = false;
+      try {
+        renewed = await this.renewToken(challenge);
+      } catch (err) {
+        throw new Error(`MCP: ${this.serverName} needs authorization, and the flow failed: ${(err as Error).message}`);
+      }
+      if (renewed) {
+        try {
+          res = await this.post({ jsonrpc: "2.0", id, method, params }, timeoutMs);
+        } catch (err) {
+          throw new Error(`MCP HTTP request failed: ${(err as Error).message}`);
+        }
+      }
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`MCP HTTP ${res.status}: ${text.slice(0, 300)}`);
+      const hint = res.status === 401 ? " (this server requires authorization; see docs/reference.md#mcp-servers)" : "";
+      throw new Error(`MCP HTTP ${res.status}${hint}: ${text.slice(0, 300)}`);
     }
     if ((res.headers.get("content-type") ?? "").includes("text/event-stream")) {
       return this.readSse(res, id);
     }
-    const body = (await res.json()) as { result?: unknown; error?: { message?: string } };
-    if (body.error) throw new Error(body.error.message ?? "MCP error");
+    const body = (await res.json()) as { result?: unknown; error?: { code?: number; message?: string; data?: unknown } };
+    if (body.error) throw rpcError(body.error);
     return body.result;
   }
 
@@ -303,14 +606,37 @@ export class HttpMcpClient implements McpClient {
             .map((line) => line.slice(5).trim())
             .join("\n");
           if (!data) continue;
-          let message: { id?: number; result?: unknown; error?: { message?: string } };
+          let message: {
+            id?: number;
+            result?: unknown;
+            error?: { code?: number; message?: string; data?: unknown };
+            method?: string;
+            params?: unknown;
+          };
           try {
             message = JSON.parse(data);
           } catch {
             continue;
           }
+          // Notifications and server-initiated requests share this stream. The
+          // old code dropped both because it only matched its own id.
+          if (message.method && message.id === undefined) {
+            if (INTERESTING_NOTIFICATIONS.has(message.method)) this.notificationHandler?.(message.method, message.params);
+            continue;
+          }
+          if (message.method && typeof message.id === "number" && message.id !== id) {
+            if (message.method === "elicitation/create") {
+              void this.answerElicitation(message.id, message.params as ElicitationRequest);
+            } else {
+              void this.post(
+                { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `prometheus does not implement ${message.method}` } },
+                10_000,
+              ).catch(() => {});
+            }
+            continue;
+          }
           if (message.id !== id) continue;
-          if (message.error) throw new Error(message.error.message ?? "MCP error");
+          if (message.error) throw rpcError(message.error);
           return message.result;
         }
       }
@@ -328,56 +654,108 @@ export class HttpMcpClient implements McpClient {
   async initialize(): Promise<void> {
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
-      capabilities: {},
+      // Declaring elicitation is what makes a server ask at all. Listing the
+      // capability without a handler would turn every prompt into a timeout.
+      capabilities: this.elicitationHandler ? { elicitation: {} } : {},
       clientInfo: { name: "prometheus", version: "0.1.0" },
     });
     this.notify("notifications/initialized", {});
   }
 
   async listTools(): Promise<{ name: string; description?: string; inputSchema?: Record<string, unknown> }[]> {
-    const result = (await this.request("tools/list", {})) as { tools?: unknown[] };
-    return Array.isArray(result?.tools) ? (result.tools as never[]) : [];
+    return paginate((method, params) => this.request(method, params), "tools/list", "tools");
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
     const result = (await this.request("tools/call", { name, arguments: args }, 120_000)) as {
-      content?: { type?: string; text?: string }[];
+      content?: McpContentPart[];
       isError?: boolean;
+      structuredContent?: unknown;
     };
     return toToolResult(result);
   }
 
 
   async listResources(): Promise<McpResource[]> {
-    const result = (await this.request("resources/list", {})) as { resources?: McpResource[] };
-    return Array.isArray(result?.resources) ? result.resources : [];
+    return paginate((method, params) => this.request(method, params), "resources/list", "resources");
   }
 
   async readResource(uri: string): Promise<string> {
     const result = (await this.request("resources/read", { uri }, 60_000)) as {
-      contents?: { text?: string; uri?: string }[];
+      contents?: { text?: string; uri?: string; blob?: string; mimeType?: string }[];
     };
     return (result?.contents ?? [])
-      .map((entry) => entry.text ?? "")
+      .map((entry) => {
+        if (typeof entry.text === "string") return entry.text;
+        // A binary resource has a `blob` (base64) and no text. Reporting it is
+        // better than an empty string that reads as "the document is blank".
+        if (entry.blob) return `[binary resource ${entry.uri ?? uri}${entry.mimeType ? ` (${entry.mimeType})` : ""}, ${Math.ceil((entry.blob.length * 3) / 4 / 1024)} KiB]`;
+        return "";
+      })
       .filter(Boolean)
       .join("\n");
   }
 
   async listPrompts(): Promise<McpPrompt[]> {
-    const result = (await this.request("prompts/list", {})) as { prompts?: McpPrompt[] };
-    return Array.isArray(result?.prompts) ? result.prompts : [];
+    return paginate((method, params) => this.request(method, params), "prompts/list", "prompts");
+  }
+
+  /**
+   * Fetch one prompt's messages. The host used to render a prompt as a string
+   * template of its name and arguments; the server's own text was never
+   * requested, so a prompt with a body (a code review checklist, a commit
+   * format) arrived empty.
+   */
+  async getPrompt(name: string, args: Record<string, string>): Promise<{ description?: string; messages: unknown[] }> {
+    const result = (await this.request("prompts/get", { name, arguments: args })) as {
+      description?: string;
+      messages?: unknown[];
+    };
+    return { description: result?.description, messages: Array.isArray(result?.messages) ? result.messages : [] };
   }
   dispose(): void {
     /* nothing to close; the server owns the session */
   }
 }
 
-function toToolResult(result: { content?: { type?: string; text?: string }[]; isError?: boolean }): ToolResult {
-  const text = (result?.content ?? [])
-    .filter((part) => part?.type === "text" && typeof part.text === "string")
-    .map((part) => part.text)
-    .join("\n");
-  return { content: text || "(no output)", isError: Boolean(result?.isError) };
+function toToolResult(result: {
+  content?: McpContentPart[];
+  isError?: boolean;
+  structuredContent?: unknown;
+}): ToolResult {
+  const parts: string[] = [];
+  for (const part of result?.content ?? []) {
+    if (!part) continue;
+    switch (part.type) {
+      case "text":
+        if (typeof part.text === "string") parts.push(part.text);
+        break;
+      case "image":
+      case "audio": {
+        // The bytes stay out of the transcript, but the model has to know the
+        // tool produced one; silently returning "(no output)" for a screenshot
+        // is worse than a line saying what was there.
+        const kind = part.type === "image" ? "image" : "audio";
+        const size = typeof part.data === "string" ? `, ${Math.ceil((part.data.length * 3) / 4 / 1024)} KiB` : "";
+        parts.push(`[${kind} ${part.mimeType ?? "unknown type"}${size}]`);
+        break;
+      }
+      case "resource": {
+        const resource = part.resource;
+        if (resource?.text) parts.push(resource.text);
+        else if (resource?.uri) parts.push(`[resource ${resource.uri}${resource.mimeType ? ` (${resource.mimeType})` : ""}]`);
+        break;
+      }
+      default:
+        // A part type this client does not know about is reported, not dropped.
+        if (typeof part.text === "string") parts.push(part.text);
+        break;
+    }
+  }
+  if (result?.structuredContent !== undefined && parts.length === 0) {
+    parts.push(JSON.stringify(result.structuredContent));
+  }
+  return { content: parts.filter(Boolean).join("\n") || "(no output)", isError: Boolean(result?.isError) };
 }
 
 /** User scope first, then project scope (project overrides by name). */
@@ -404,7 +782,7 @@ export function readMcpConfig(cwd: string): Record<string, McpServerConfig & { s
 }
 
 export function createClient(name: string, config: McpServerConfig): McpClient {
-  return transportOf(config) === "http" ? new HttpMcpClient(config) : new StdioMcpClient(name, config);
+  return transportOf(config) === "http" ? new HttpMcpClient(config, name) : new StdioMcpClient(name, config);
 }
 
 export interface LoadedMcp {
@@ -415,19 +793,92 @@ export interface LoadedMcp {
   prompts: { server: string; prompt: McpPrompt }[];
   /** Resources advertised by servers, readable through mcp_read_resource. */
   resources: { server: string; resource: McpResource }[];
+  /** The client for each server name, so a resource is read from its owner. */
+  byServer: Map<string, McpClient>;
+  /**
+   * Called when any server announces that its tool, resource or prompt list
+   * changed. The host re-lists and replaces the tools it had added; without
+   * this a server that gained a tool kept advertising the old set until the app
+   * restarted.
+   */
+  onRefresh?: (server: string, kind: "tools" | "resources" | "prompts") => void;
+  /** True when the tool set was large enough to defer; `tool_search` unlocks them. */
+  deferred?: boolean;
+}
+
+/** Wrap one server's advertised tools as local tools. */
+function wrapServerTools(
+  server: string,
+  client: McpClient,
+  listed: { name?: string; description?: string; inputSchema?: Record<string, unknown> }[],
+  deferred = false,
+): Tool[] {
+  const tools: Tool[] = [];
+  for (const entry of listed) {
+    if (!entry?.name) continue;
+    const toolName = `mcp__${server}__${entry.name}`;
+    tools.push({
+      name: toolName,
+      description: entry.description ?? `MCP tool ${entry.name} from ${server}`,
+      // MCP tools can have side effects the schema does not describe, so they
+      // prompt in ask mode and are unavailable in plan mode.
+      readonly: false,
+      parameters: entry.inputSchema ?? { type: "object", properties: {} },
+      ...(deferred ? { deferred: true } : {}),
+      summarize: (input) => {
+        const first = Object.values(input).find((value) => typeof value === "string");
+        return String(first ?? entry.name).slice(0, 120);
+      },
+      execute: (input) => client.callTool(entry.name as string, input),
+    });
+  }
+  return tools;
+}
+
+/**
+ * Tools to keep in the request no matter how many servers are attached.
+ *
+ * A handful of MCP tools costs less than the round trip of a `tool_search`, so
+ * deferral only kicks in once the set is big enough to matter. The threshold is
+ * on the whole MCP set, not per server, because the cost is the sum.
+ */
+const DEFER_ABOVE = 10;
+
+/** Re-list one server's tools after it announced a change. */
+export async function refreshServerTools(
+  server: string,
+  client: McpClient,
+  timeoutMs = 15_000,
+  deferred = false,
+): Promise<Tool[]> {
+  const listed = await withTimeout(client.listTools(), timeoutMs, `MCP server "${server}" did not list tools`);
+  return wrapServerTools(server, client, listed, deferred);
 }
 
 /**
  * Start every configured server, initialize it, and wrap its tools as local
  * tools. A server that fails is reported and skipped; the others still load.
+ *
+ * `elicitation` is answered through this callback, which the host supplies.
+ * Without one every request is declined, which is the honest answer for a
+ * runtime with no user behind it.
  */
-export async function loadMcpTools(cwd: string, timeoutMs = 15_000): Promise<LoadedMcp> {
+export async function loadMcpTools(
+  cwd: string,
+  timeoutMs = 15_000,
+  elicitation?: (server: string, request: ElicitationRequest) => Promise<ElicitationResult | null>,
+  authorize?: (options: AuthorizeOptions) => Promise<InteractiveResult | null>,
+): Promise<LoadedMcp> {
   const configs = readMcpConfig(cwd);
   const clients: McpClient[] = [];
+  const byServer = new Map<string, McpClient>();
   const tools: Tool[] = [];
   const errors: string[] = [];
   const prompts: { server: string; prompt: McpPrompt }[] = [];
   const resources: { server: string; resource: McpResource }[] = [];
+  const pendingWrapping: { name: string; client: McpClient; listed: { name?: string; description?: string; inputSchema?: Record<string, unknown> }[] }[] = [];
+
+  const result: LoadedMcp = { clients, tools, errors, prompts, resources, byServer };
 
   await Promise.all(
     Object.entries(configs).map(async ([name, config]) => {
@@ -440,9 +891,27 @@ export async function loadMcpTools(cwd: string, timeoutMs = 15_000): Promise<Loa
         return;
       }
       try {
+        // Both handlers are installed before `initialize`: the capability
+        // declaration depends on the elicitation one, and a list_changed sent
+        // during the handshake must not be dropped.
+        client.onNotification?.((method) => {
+          const kind =
+            method === "notifications/tools/list_changed" ? "tools"
+            : method === "notifications/resources/list_changed" ? "resources"
+            : method === "notifications/prompts/list_changed" ? "prompts"
+            : null;
+          if (kind) result.onRefresh?.(name, kind);
+        });
+        if (elicitation) client.onElicitation?.((request) => elicitation(name, request));
+        // OAuth is installed before initialize for the same reason: the first
+        // request may be the one the server protects.
+        if (authorize && "onAuthorize" in client) {
+          (client as HttpMcpClient).onAuthorize(authorize);
+        }
         await withTimeout(client.initialize(), timeoutMs, `MCP server "${name}" did not initialize`);
         const listed = await withTimeout(client.listTools(), timeoutMs, `MCP server "${name}" did not list tools`);
         clients.push(client);
+        byServer.set(name, client);
         // Resources and prompts are optional; a server that does not implement
         // them answers with an error, which must not fail the whole server.
         if (client.listResources) {
@@ -463,23 +932,7 @@ export async function loadMcpTools(cwd: string, timeoutMs = 15_000): Promise<Loa
             /* server has no prompts */
           }
         }
-        for (const entry of listed) {
-          if (!entry?.name) continue;
-          const toolName = `mcp__${name}__${entry.name}`;
-          tools.push({
-            name: toolName,
-            description: entry.description ?? `MCP tool ${entry.name} from ${name}`,
-            // MCP tools can have side effects the schema does not describe, so
-            // they prompt in ask mode and are unavailable in plan mode.
-            readonly: false,
-            parameters: entry.inputSchema ?? { type: "object", properties: {} },
-            summarize: (input) => {
-              const first = Object.values(input).find((value) => typeof value === "string");
-              return String(first ?? entry.name).slice(0, 120);
-            },
-            execute: (input) => client.callTool(entry.name, input),
-          });
-        }
+        pendingWrapping.push({ name, client, listed });
       } catch (err) {
         client.dispose();
         errors.push(err instanceof Error ? err.message : String(err));
@@ -487,17 +940,32 @@ export async function loadMcpTools(cwd: string, timeoutMs = 15_000): Promise<Loa
     }),
   );
 
-  if (resources.length > 0) tools.push(resourceTool(clients, resources));
-  return { clients, tools, errors, prompts, resources };
+  // Deferral is decided on the total, not per server: what costs tokens is the
+  // sum of every schema in the request, and a single server can carry forty.
+  const totalListed = pendingWrapping.reduce((count, entry) => count + entry.listed.length, 0);
+  const deferred = totalListed > DEFER_ABOVE;
+  for (const entry of pendingWrapping) {
+    tools.push(...wrapServerTools(entry.name, entry.client, entry.listed, deferred));
+  }
+  result.deferred = deferred;
+
+  if (resources.length > 0) tools.push(resourceTool(byServer, resources));
+  return result;
 }
 
 /**
  * One read-only tool for every advertised resource. Listing them as a single
  * tool keeps the tool schema small while still letting the model open a
  * document the server offered.
+ *
+ * The resource names its server, and that name — not a list position — picks
+ * the client. The old code used the resource's index into a `clients` array
+ * that only held servers which had finished loading, in completion order:
+ * with two servers the read could go to the wrong one, which is a privacy bug
+ * (a document from server A requested from server B) and not merely a miss.
  */
 function resourceTool(
-  clients: McpClient[],
+  byServer: Map<string, McpClient>,
   resources: { server: string; resource: McpResource }[],
 ): Tool {
   const catalogue = resources
@@ -521,8 +989,7 @@ function resourceTool(
       const uri = String(input.uri ?? "");
       const entry = resources.find((candidate) => candidate.resource.uri === uri);
       if (!entry) return { isError: true, content: `no MCP resource with uri ${uri}` };
-      const index = resources.indexOf(entry);
-      const client = clients[index];
+      const client = byServer.get(entry.server);
       if (!client?.readResource) return { isError: true, content: `${entry.server} cannot read resources` };
       try {
         const text = await client.readResource(uri);

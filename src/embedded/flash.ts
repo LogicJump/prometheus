@@ -20,7 +20,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { extname } from "node:path";
 import { toolEnv } from "./toolEnv.ts";
 
@@ -46,6 +46,12 @@ export interface FlashRequest {
   targetConfig?: string;
   /** esptool baud rate. */
   baud?: number;
+  /** Serial port for tools that program over one (avrdude `-P`, esptool `--port`). */
+  port?: string;
+  /** avrdude programmer id (`-c`), e.g. `arduino`, `usbasp`. */
+  programmer?: string;
+  /** avrdude part id (`-p`), e.g. `atmega328p`. */
+  part?: string;
   /** Extra arguments, passed through unchanged. */
   extraArgs?: string[];
 }
@@ -91,7 +97,9 @@ const SUCCESS_MARKERS: Record<FlasherKind, RegExp[]> = {
   pyocd: [/\[flasher\]\s+loaded\s+\S+\s+bytes/i, /^Space Core\s+OK/im, /Erased\s+\d+.*programmed/i],
   openocd: [/\*\* Programming Finished \*\*/i, /\*\* Verified OK \*\*/i, /shutdown command invoked/i],
   "probe-rs": [/Finished in \d+\.\d+s/i, /Erasing sectors \.\.\. \[done\]/i, /\[done\]/i],
-  jlink: [/Verify successful\.?/i, /Programming successful\.?/i, /O\.K\./i],
+  // `O.K.` alone is what a bare connection prints. A flash needs the download
+  // or compare step to have run, which is a separate line.
+  jlink: [/Verify successful\.?/i, /Programming successful\.?/i, /(?:Downloading|Comparing).*\n(?:.*\n)?.*O\.K\./i, /Comparing flash contents[\s\S]{0,200}O\.K\./i],
   esptool: [/Hash of data verified/i, /Wrote \d+ bytes .* at .*/i, /Leaving\.\.\./i],
   "st-flash": [/Flash written and verified/i, /OK/i],
   "dfu-util": [/File downloaded successfully/i],
@@ -125,6 +133,13 @@ export function classifyOutput(kind: FlasherKind, output: string, exitCode: numb
     return { ok: false, ...(verified ? { verified: true } : {}), reason: firstMatchLine(output, failed) };
   }
   if (succeeded) return { ok: true, ...(verified ? { verified: true } : {}) };
+  // JLinkExe exits zero after a session that only connected and never loaded
+  // anything, so its exit code proves nothing. Without a write phrase there is
+  // no evidence a byte reached the chip, and "probably fine" is not a claim a
+  // flasher gets to make.
+  if (kind === "jlink") {
+    return { ok: false, reason: "the J-Link session ended without reporting a write; nothing was programmed" };
+  }
   // No phrase either way: fall back to the exit code, but say so.
   if (exitCode === 0) return { ok: true, reason: "the tool reported no status; exit code 0" };
   return { ok: false, reason: exitCode === null ? "the tool timed out" : `exit code ${exitCode}` };
@@ -135,6 +150,38 @@ function firstMatchLine(output: string, pattern: RegExp): string {
     if (pattern.test(line)) return line.trim().slice(0, 200);
   }
   return pattern.source;
+}
+
+/**
+ * The JLinkExe Commander script for this request, written beside the firmware.
+ *
+ * Returning the path (rather than the script text) is what makes the argv
+ * self-describing: the command line names the file that is about to be read,
+ * and the file itself names the firmware. A test can then assert that the
+ * file to be written appears in the command.
+ */
+export function jlinkScriptPath(request: FlashRequest): string | null {
+  if (!existsSync(request.firmware)) return null;
+  const lower = request.firmware.toLowerCase();
+  const loadFile =
+    lower.endsWith(".bin") && request.address !== undefined
+      ? `loadfile ${request.firmware} 0x${request.address.toString(16)}`
+      : `loadfile ${request.firmware}`;
+  const lines = [
+    "r",
+    "h",
+    loadFile,
+    lower.endsWith(".bin") ? `verifybin ${request.firmware} 0x${(request.address ?? 0).toString(16)}` : `verifyelf ${request.firmware}`,
+  ];
+  if (request.reset !== false) lines.push("r", "g");
+  lines.push("qc");
+  const scriptPath = `${request.firmware}.jlink`;
+  try {
+    writeFileSync(scriptPath, `${lines.join("\n")}\n`, "utf8");
+    return scriptPath;
+  } catch {
+    return null;
+  }
 }
 
 /** The argument vector for each tool. */
@@ -176,17 +223,24 @@ export function commandFor(request: FlashRequest): string[] {
       return [...args, ...extra];
     }
     case "jlink": {
-      // JLinkExe takes a script file, not flags. The caller supplies one as the
-      // first extra argument; without it we build a one-shot -CommanderScript
-      // equivalent through -autoconnect and loadfile.
+      // JLinkExe is a session, not a one-shot command: it reads a Commander
+      // script. `-autoconnect 1` connects, prints `O.K.`, and then waits at the
+      // prompt — so a success marker on that output reported a flash that never
+      // happened. The script is written to a file next to the firmware and run
+      // with -CommanderScript, so the file is named, written and verified in
+      // the same session.
       const device = request.target ?? "Cortex-M4";
-      const speed = "4000";
-      const args = ["-device", device, "-if", "SWD", "-speed", speed, "-autoconnect", "1", "-NoGui", "1"];
-      for (const item of extra) args.push(item);
-      return args;
+      const args = ["-device", device, "-if", "SWD", "-speed", "4000", "-NoGui", "1"];
+      if (request.probe) args.push("-SelectEmuBySN", request.probe);
+      const scriptPath = jlinkScriptPath(request);
+      if (scriptPath) args.push("-CommanderScript", scriptPath);
+      else args.push("-autoconnect", "1");
+      return [...args, ...extra];
     }
     case "esptool": {
-      const args = ["--chip", "auto", "--baud", String(request.baud ?? 460800), "write_flash"];
+      const args = ["--chip", "auto", "--baud", String(request.baud ?? 460800)];
+      if (request.port) args.push("--port", request.port);
+      args.push("write_flash");
       if (request.address !== undefined) args.push("0x" + request.address.toString(16));
       else args.push("0x0");
       args.push(request.firmware);
@@ -202,8 +256,13 @@ export function commandFor(request: FlashRequest): string[] {
       return [...args, ...extra];
     }
     case "avrdude": {
-      // -c and -p have no sensible defaults; the caller must supply them.
-      const args = ["-V", "-U", `flash:w:${request.firmware}:i`];
+      // -c and -p have no sensible defaults; a wrong part id silently writes
+      // to the wrong flash layout, so the caller must supply both.
+      const args = ["-V"];
+      if (request.programmer) args.push("-c", request.programmer);
+      if (request.part) args.push("-p", request.part);
+      if (request.port) args.push("-P", request.port);
+      args.push("-U", `flash:w:${request.firmware}:i`);
       return [...args, ...extra];
     }
     default:
@@ -231,11 +290,26 @@ export function validate(request: FlashRequest): string | null {
   if (![".elf", ".hex", ".bin", ".uf2"].includes(ext)) {
     return `${ext || "no extension"} is not a firmware format (expected .elf, .hex, .bin or .uf2)`;
   }
+  // A .uf2 is written by copying it onto a mass-storage volume that the chip's
+  // ROM bootloader exposes. None of these tools does that, so accepting the
+  // file only produced a confusing failure inside the flasher.
+  if (ext === ".uf2") {
+    return "a .uf2 is written by copying it to the board's bootloader volume, which none of these flashers can do; use the .elf/.hex or pass a supported format";
+  }
   if (ext === ".bin" && request.kind !== "esptool" && request.address === undefined) {
     return "a raw .bin needs a load address; pass `address` (usually 0x08000000 on STM32)";
   }
   if ((request.kind === "pyocd" || request.kind === "probe-rs") && !request.target) {
     return `${request.kind} needs a target name`;
+  }
+  if (request.kind === "jlink" && !request.target) {
+    return "J-Link needs a device name (the probe's -device id, e.g. STM32F429ZI)";
+  }
+  if (request.kind === "avrdude" && !request.programmer) {
+    return "avrdude needs a programmer id (pass `programmer`, e.g. arduino or usbasp)";
+  }
+  if (request.kind === "avrdude" && !request.part) {
+    return "avrdude needs a part id (pass `part`, e.g. atmega328p)";
   }
   if (request.kind === "openocd" && !request.targetConfig) {
     return "OpenOCD needs a target config file (e.g. target/stm32f4x.cfg)";

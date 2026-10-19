@@ -125,12 +125,15 @@ export type RememberChoice = "always-tool" | "always-detail";
  * commands".
  */
 export function ruleFromChoice(toolName: string, detail: string, scope: RuleScope, cwd: string, choice: string): ApprovalRule {
+  // `detail` is what the rule is narrowed to. An empty one means the user
+  // chose the whole tool, so the note carries the name alone instead of a
+  // dangling `bash: ` that reads like a truncated summary.
   const rule: Omit<ApprovalRule, "id" | "createdAt"> = {
     tool: toolName,
     action: "allow",
     scope,
     ...(scope === "project" ? { cwd } : {}),
-    note: `${toolName}: ${detail.slice(0, 80)}`,
+    note: detail ? `${toolName}: ${detail.slice(0, 80)}` : `${toolName}: every call`,
   };
   if (choice === "always-tool" || !detail) return addRule(rule);
   return addRule({ ...rule, match: detail.split("\n")[0].slice(0, 200) });

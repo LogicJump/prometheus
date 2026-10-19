@@ -30,7 +30,8 @@ import {
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { SESSIONS_DIR } from "./config.ts";
-import type { ChatMessage } from "./types.ts";
+import { sessionLockHolder, type SessionHolder } from "./sessionLock.ts";
+import type { BoardSelection, ChatMessage } from "./types.ts";
 
 export interface SessionFile {
   id: string;
@@ -48,6 +49,20 @@ export interface SessionFile {
   generation?: number;
   /** Last known task state, shown as a dot in the sidebar. */
   status?: SessionStatus;
+  /**
+   * The settings the conversation was running with.
+   *
+   * A resumed session used to come back on whatever the current config said,
+   * so a plan-mode investigation reopened in auto mode and a concise reply
+   * style was forgotten. Only values the user actually set are stored; the
+   * caller decides whether to apply them.
+   */
+  mode?: "ask" | "auto" | "plan";
+  effort?: "auto" | "low" | "medium" | "high";
+  sandbox?: "off" | "enforce";
+  networkPolicy?: "off" | "proxy" | "open";
+  /** Board selection in force when the session was last used. */
+  board?: BoardSelection;
 }
 
 /**
@@ -73,6 +88,11 @@ export interface SessionMeta {
   /** Hash of the last stored message, so an append can verify its prefix in O(1). */
   lastHash?: string;
   status?: SessionStatus;
+  mode?: "ask" | "auto" | "plan";
+  effort?: "auto" | "low" | "medium" | "high";
+  sandbox?: "off" | "enforce";
+  networkPolicy?: "off" | "proxy" | "open";
+  board?: BoardSelection;
 }
 
 function hashMessage(message: ChatMessage): string {
@@ -200,11 +220,21 @@ export function appendMessages(id: string, messages: ChatMessage[]): number {
  * Save a session. New sessions get a directory; existing ones append only the
  * messages past `messageCount`, and a shorter conversation (compaction) starts
  * a new generation.
+ *
+ * A session another process has claimed is not written to. Both callers that
+ * write (the desktop host, the CLI) take the lock first; this check is the
+ * backstop for a caller that did not, because the failure mode — two writers
+ * interleaving appends and disagreeing about `messageCount` — corrupts a
+ * conversation rather than failing loudly.
  */
 export function saveSession(session: SessionFile): void {
   const now = new Date().toISOString();
   session.updatedAt = now;
   const existing = readMeta(session.id);
+  if (existing) {
+    const holder = sessionLockHolder(session.id);
+    if (holder && holder.pid !== process.pid) throw new ForeignSessionWriter(session.id, holder);
+  }
 
   if (!existing) {
     const createdAt = session.createdAt || now;
@@ -221,6 +251,7 @@ export function saveSession(session: SessionFile): void {
       generation: 1,
       messageCount: session.messages.length,
       status: session.status,
+      ...sessionSettings(session),
     };
     mkdirSync(sessionDir(session.id), { recursive: true });
     writeFileSync(
@@ -249,6 +280,7 @@ export function saveSession(session: SessionFile): void {
     pinned: session.pinned !== undefined ? session.pinned : existing.pinned,
     archived: session.archived !== undefined ? session.archived : existing.archived,
     status: session.status !== undefined ? session.status : existing.status,
+    ...sessionSettings(session),
     updatedAt: now,
   };
   const stored = loadMessages(session.id);
@@ -285,8 +317,37 @@ export function saveSession(session: SessionFile): void {
   session.generation = meta.generation;
 }
 
-function sameMessages(a: ChatMessage[], b: ChatMessage[]): boolean {
-  if (a.length !== b.length) return false;
+/**
+ * Raised when a session is owned by a different process. Callers can present
+ * `holder` to the user instead of a generic write failure.
+ */
+export class ForeignSessionWriter extends Error {
+  readonly sessionId: string;
+  readonly holder: SessionHolder;
+
+  constructor(sessionId: string, holder: SessionHolder) {
+    super(
+      `session ${sessionId} is open in another process (pid ${holder.pid}` +
+        `${holder.label ? `, ${holder.label}` : ""}); refusing to write a transcript someone else owns`,
+    );
+    this.name = "ForeignSessionWriter";
+    this.sessionId = sessionId;
+    this.holder = holder;
+  }
+}
+
+/** The runtime settings a session carries, when the caller supplied them. */
+function sessionSettings(session: SessionFile): Partial<SessionMeta> {
+  const out: Partial<SessionMeta> = {};
+  if (session.mode !== undefined) out.mode = session.mode;
+  if (session.effort !== undefined) out.effort = session.effort;
+  if (session.sandbox !== undefined) out.sandbox = session.sandbox;
+  if (session.networkPolicy !== undefined) out.networkPolicy = session.networkPolicy;
+  if (session.board !== undefined) out.board = session.board;
+  return out;
+}
+
+function sameMessages(a: ChatMessage[], b: ChatMessage[]): boolean {  if (a.length !== b.length) return false;
   for (let index = 0; index < a.length; index++) {
     if (JSON.stringify(a[index]) !== JSON.stringify(b[index])) return false;
   }
@@ -314,6 +375,12 @@ export function loadSession(idOrPrefix: string): SessionFile | null {
       pinned: meta.pinned,
       archived: meta.archived,
       generation: meta.generation,
+      status: meta.status,
+      mode: meta.mode,
+      effort: meta.effort,
+      sandbox: meta.sandbox,
+      networkPolicy: meta.networkPolicy,
+      board: meta.board,
     };
   }
 
@@ -327,6 +394,20 @@ export function loadSession(idOrPrefix: string): SessionFile | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Load the newest session for a workspace (the `--continue` case).
+ *
+ * `listSessions` floats pinned sessions to the top, which is the right order
+ * for the sidebar and the wrong one here: `--continue` means "the one I was
+ * just in", so pinned-ness is ignored and recency decides.
+ */
+export function latestSession(cwd = process.cwd()): SessionFile | null {
+  const candidates = listSessions(false)
+    .filter((session) => session.cwd === cwd && !session.archived)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return candidates.length > 0 ? loadSession(candidates[0].id) : null;
 }
 
 export interface SessionSummary {

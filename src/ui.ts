@@ -1,7 +1,7 @@
 /** Terminal renderer: colors, tool lines, spinner, and an inline confirmation prompt. */
 
 import * as readline from "node:readline/promises";
-import type { TodoItem, Ui } from "./types.ts";
+import type { PermissionDetail, TodoItem, Ui } from "./types.ts";
 import { ansi as style, displayWidth, hasOpenMarkdown, renderMarkdown } from "./render.ts";
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -217,10 +217,23 @@ export class TerminalUi implements Ui {
     this.clearSpinnerLine();
   }
 
-  async confirm(question: string): Promise<"yes" | "always" | "no"> {
+  /** Release everything that would keep the process alive or assert on exit. */
+  dispose(): void {
+    this.spinnerStop();
+  }
+
+  async confirm(question: string, detail?: PermissionDetail): Promise<"yes" | "always" | "no"> {
     this.spinnerStop();
     this.assistantEnd();
     this.thinkingEnd();
+    // A file edit is approved on what it changes. Printing the path and asking
+    // yes/no made the terminal prompt a rubber stamp, so the diff is shown
+    // first, kept small enough to read above the question.
+    if (detail) {
+      const summary = `  ${detail.path}: +${detail.additions} -${detail.deletions}`;
+      const preview = renderDiffPreview(detail);
+      this.out.write(`${style.gray(summary)}\r\n${preview}`);
+    }
     // Inside the REPL, the readline instance is already reading a line - a second
     // reader on stdin would fight it for input. Ask on the existing interface.
     if (this.interactive && this.rl) {
@@ -247,4 +260,48 @@ export class TerminalUi implements Ui {
       rl.close();
     }
   }
+}
+
+/**
+ * A compact diff for a confirmation prompt.
+ *
+ * Bounded on purpose: the question has to stay readable above the prompt, so
+ * this shows the changed lines with a few of context around them rather than
+ * the whole hunk list.
+ */
+function renderDiffPreview(detail: PermissionDetail): string {
+  const before = new Set((detail.before ?? "").split("\n"));
+  const after = new Set((detail.after ?? "").split("\n"));
+  const lines: string[] = [];
+  let shown = 0;
+  const cap = 24;
+  const older = (detail.before ?? "").split("\n");
+  const newer = (detail.after ?? "").split("\n");
+  let i = 0;
+  let j = 0;
+  while ((i < older.length || j < newer.length) && shown < cap) {
+    if (i < older.length && j < newer.length && older[i] === newer[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    if (i < older.length && !after.has(older[i])) {
+      lines.push(style.red(`  - ${older[i]}`));
+      i++;
+      shown++;
+      continue;
+    }
+    if (j < newer.length && !before.has(newer[j])) {
+      lines.push(style.green(`  + ${newer[j]}`));
+      j++;
+      shown++;
+      continue;
+    }
+    // Both sides have an unmatched line that the other side also contains
+    // further down: step both rather than looping.
+    i++;
+    j++;
+  }
+  if (i < older.length || j < newer.length) lines.push(style.gray(`  … more changes`));
+  return lines.length ? `${lines.join("\r\n")}\r\n` : "";
 }

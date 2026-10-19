@@ -67,8 +67,13 @@ export interface SvdDevice {
   name: string;
   vendor?: string;
   cpu?: { name: string; revision?: string; fpuPresent?: boolean; mpuPresent?: boolean; endian?: string };
-  /** The part's flash and RAM, from the `<memory>` blocks when present. */
-  memories?: { name: string; start: number; size: number; access?: string }[];
+  /**
+   * The part's flash and SRAM, from `<memory>` elements where the vendor uses
+   * them and from peripherals that are structurally memory otherwise. Never
+   * from a name alone — `FLASH` is usually the flash controller (see
+   * `memoryPeripheral`).
+   */
+  memories?: { name: string; start: number; size: number; access?: string; usage?: string }[];
   peripherals: SvdPeripheral[];
   /** The file this came from, for provenance. */
   source?: string;
@@ -327,6 +332,67 @@ function parsePeripheral(block: string): SvdPeripheral | null {
   };
 }
 
+/**
+ * ARMv7-M and ARMv8-M map every address onto one of a handful of fixed
+ * regions. Code flash and SRAM live in the first two; every peripheral sits at
+ * 0x40000000 and above. The boundary is the architecture's, not a vendor's, so
+ * it holds for any Cortex-M part.
+ */
+const PERIPHERAL_SPACE_START = 0x40000000;
+const SRAM_SPACE_START = 0x20000000;
+/** Executable regions: code, system memory, and the Cortex-M0's alias. */
+const CODE_SPACE = [
+  [0x00000000, 0x1fffffff],
+  [0x60000000, 0x9fffffff], // external RAM; some parts run code from here
+] as const;
+
+/** Names that describe a bus window or an alias rather than storage. */
+const WINDOW_NAME = /^(?:periph|peripheral|bus|alias|mirror|remap)$/i;
+
+/**
+ * Decide whether a peripheral entry is really a memory block.
+ *
+ * Some SVDs model flash and SRAM as peripherals — but a peripheral called
+ * `FLASH` is far more often the flash *controller*. On the 108 STM32 files that
+ * ship with STM32CubeProgrammer, every one of them is: base 0x40023C00,
+ * `<addressBlock><usage>registers</usage>`, and registers named ACR/CR/LATENCY.
+ * Reading that as "the chip's flash" answers a storage question with a control
+ * register map, which is a confidently wrong answer.
+ *
+ * So the test is structural, not nominal: the region must be memory, the
+ * peripheral must not declare itself as registers, and its size must be a
+ * plausible memory size rather than a few control bytes.
+ */
+function memoryPeripheral(
+  block: string,
+  peripheral: SvdPeripheral,
+): { name: string; start: number; size: number; usage?: string } | null {
+  const base = peripheral.baseAddress;
+  const inCode = CODE_SPACE.some(([start, end]) => base >= start && base <= end);
+  const inSram = base >= SRAM_SPACE_START && base < PERIPHERAL_SPACE_START;
+  // Anything at the peripheral boundary or above is control space, whatever its
+  // name. This alone rejects all 108 STM32 flash controllers.
+  if (!inCode && !inSram) return null;
+  if (WINDOW_NAME.test(peripheral.name)) return null;
+  if (!/flash|rom|ram|sram|dtcm|itcm|ccm|tcm/i.test(peripheral.name)) return null;
+
+  // An addressBlock marked `registers` is a statement by the vendor that this
+  // is a peripheral interface. A block marked `buffer` or `reserved` is memory.
+  const addressBlock = blocks(block, "addressBlock")[0];
+  const usage = addressBlock ? tag(addressBlock, "usage") : undefined;
+  if (usage === "registers") return null;
+
+  const size =
+    num(addressBlock ? tag(addressBlock, "size") : undefined) ??
+    num(tag(block, "size")) ??
+    num(tag(block, "addressBlockSize"));
+  // A controller's registers are a few hundred bytes to a few KiB. Storage is
+  // measured in tens of KiB at least; without a believable size, no claim.
+  if (size === undefined || size < 0x1000) return null;
+
+  return { name: peripheral.name, start: base, size, ...(usage ? { usage } : {}) };
+}
+
 // ---- the device ------------------------------------------------------------
 
 /**
@@ -400,16 +466,30 @@ export function parseSvd(input: string, options: { source?: string } = {}): SvdD
   const peripherals: SvdPeripheral[] = [];
   const memories: NonNullable<SvdDevice["memories"]> = [];
 
+  // The schema's <memory> elements, when a vendor uses them. These are the only
+  // entries a name alone can be trusted for: they are declared as memory.
+  for (const block of blocks(deviceXml, "memory")) {
+    const name = tag(block, "name") ?? "memory";
+    const start = num(tag(block, "start"));
+    const size = num(tag(block, "size"));
+    if (start !== undefined && size !== undefined) memories.push({ name, start, size });
+  }
+
   for (const block of blocks(peripheralsBlock, "peripheral")) {
     const name = tag(block, "name");
-    // Some files model the flash and RAM regions as peripherals.
-    if (name === "FLASH" || name === "RAM") {
-      const start = num(tag(block, "baseAddress"));
-      const size = num(tag(block, "size"));
-      if (start !== undefined && size !== undefined) memories.push({ name, start, size });
-    }
+    // A peripheral called `FLASH` is usually the flash *controller*: on the 108
+    // STM32 files that ship with STM32CubeProgrammer it sits at 0x40023C00,
+    // declares its address block as `registers`, and has ACR/LATENCY/CR fields.
+    // Filing that as "the part's flash" is exactly the bug where a query about
+    // storage returns the controller's registers. Only a peripheral that lands
+    // in a memory region, does not declare itself as registers, and is not just
+    // a bus window counts.
     const parsed = parsePeripheral(block);
-    if (parsed) peripherals.push(parsed);
+    if (parsed) {
+      const memory = memoryPeripheral(block, parsed);
+      if (memory) memories.push(memory);
+      peripherals.push(parsed);
+    }
   }
 
   return {
@@ -425,6 +505,30 @@ export function parseSvd(input: string, options: { source?: string } = {}): SvdD
 // ---- the three tiers -------------------------------------------------------
 
 /**
+ * Total flash and SRAM, or undefined for a region the SVD does not model.
+ *
+ * Regions on the same start address are aliases (Cortex-M parts often list the
+ * same SRAM twice); counting them twice would double the answer.
+ */
+export function memoryTotals(device: SvdDevice): { flash: number; ram: number } {
+  const seen = new Set<number>();
+  let flash = 0;
+  let ram = 0;
+  for (const memory of device.memories ?? []) {
+    if (seen.has(memory.start)) continue;
+    seen.add(memory.start);
+    if (memory.start < SRAM_SPACE_START) flash += memory.size;
+    else ram += memory.size;
+  }
+  return { flash, ram };
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(bytes % (1024 * 1024) ? 1 : 0)} MB`;
+  return `${Math.round(bytes / 1024)} KB`;
+}
+
+/**
  * The index: one line per peripheral plus one per register.
  *
  * This is what fits in a context window. It carries the resolved base address
@@ -432,6 +536,20 @@ export function parseSvd(input: string, options: { source?: string } = {}): SvdD
  */
 export function peripheralIndex(device: SvdDevice): string {
   const lines: string[] = [`${device.name} (${device.peripherals.length} peripherals)`];
+  // Storage first, and labelled as such: "how much flash does this chip have"
+  // must not be answered by the flash controller's register map.
+  if (device.memories?.length) {
+    const total = memoryTotals(device);
+    for (const memory of device.memories) {
+      lines.push(
+        `memory ${memory.name}: 0x${memory.start.toString(16).toUpperCase().padStart(8, "0")} ` +
+          `${formatBytes(memory.size)}${memory.usage ? ` (${memory.usage})` : ""}`,
+      );
+    }
+    if (total.flash || total.ram) {
+      lines.push(`memory total: flash ${formatBytes(total.flash)}, ram ${formatBytes(total.ram)}`);
+    }
+  }
   for (const peripheral of device.peripherals) {
     const base = `0x${peripheral.baseAddress.toString(16).toUpperCase().padStart(8, "0")}`;
     lines.push(`\n${peripheral.name} @${base}${peripheral.description ? ` — ${peripheral.description}` : ""}`);

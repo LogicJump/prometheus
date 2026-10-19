@@ -9,11 +9,12 @@ import { ChatClient } from "./llm.ts";
 import { TerminalUi } from "./ui.ts";
 import { ansi as style } from "./render.ts";
 import { Permissions } from "./permissions.ts";
-import { listSessions, loadSession, newSessionId, saveSession, type SessionFile } from "./sessions.ts";
+import { listSessions, loadSession, newSessionId, saveSession, ForeignSessionWriter, type SessionFile } from "./sessions.ts";
+import { acquireSessionLock, releaseSessionLock, lockConflictMessage } from "./sessionLock.ts";
 import { CONFIG_HOME, ALLOWED_MODELS } from "./config.ts";
-import { compactForce } from "./context.ts";
 import { ALL_TOOLS } from "./tools/index.ts";
 import { discoverModels } from "./models.ts";
+import { recordUsage } from "./usage.ts";
 
 export interface ReplOptions {
   config: Config;
@@ -29,7 +30,7 @@ const HELP = `${style.bold("Commands")}
   /plan                shortcut for /mode plan
   /yolo                shortcut for /mode auto (no confirmation prompts)
   /clear               reset the conversation
-  /compact             force context compaction
+  /compact [focus]     compact the conversation; focus guides the recap
   /cost                token usage for this session
   /context             context window usage
   /sessions            list saved sessions
@@ -62,6 +63,7 @@ export class Repl {
       model: this.config.model,
       maxTokens: this.config.maxTokens,
       reasoningEffort: this.config.thinkingEffort,
+      echoReasoning: Boolean(this.config.echoReasoning),
       timeoutMs: 300_000,
     });
     this.rl = readline.createInterface({
@@ -81,6 +83,17 @@ export class Repl {
     stdin.setRawMode?.(true);
     this.ui.attachReadline(this.rl);
     this.sessionId = options.session?.id ?? newSessionId();
+    // A resumed session is still open in some other writer if it is locked;
+    // the caller refuses before constructing the REPL, so taking the lock here
+    // is what makes this process the owner.
+    const claim = acquireSessionLock(this.sessionId, "terminal");
+    if (!claim.ok) throw new Error(lockConflictMessage(this.sessionId, claim.holder));
+    // A resumed conversation keeps the mode it was saved under.
+    if (options.session?.mode) this.config = { ...this.config, permissionMode: options.session.mode };
+    if (options.session?.effort) {
+      this.config = { ...this.config, thinkingEffort: options.session.effort };
+      this.client.options.reasoningEffort = options.session.effort;
+    }
     this.agent = this.buildAgent(options.session?.messages ?? []);
     this.wireKeys();
   }
@@ -114,6 +127,11 @@ export class Repl {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       messages: this.agent.messages.filter((m) => m.role !== "system"),
+      mode: this.config.permissionMode,
+      effort: this.config.thinkingEffort,
+      sandbox: this.config.sandbox,
+      networkPolicy: this.config.networkPolicy,
+      board: this.config.board,
     };
   }
 
@@ -150,6 +168,7 @@ export class Repl {
     }
     saveSession(this.sessionFile());
     this.ui.dim(`Session saved as ${this.sessionId}. Resume with: prometheus --resume ${this.sessionId}`);
+    releaseSessionLock(this.sessionId);
     this.ui.detachReadline();
     stdin.setRawMode?.(false);
     this.rl.close();
@@ -206,12 +225,50 @@ export class Repl {
 
     this.ui.echoUser(full);
 
+    const usageBefore = { ...this.agent.usage };
+    const beforeBySource = {
+      subagent: { ...this.agent.usageBySource.subagent },
+      background: { ...this.agent.usageBySource.background },
+    };
     try {
       await this.agent.run(full);
     } catch (err) {
       this.ui.error(formatError(err));
     } finally {
-      saveSession(this.sessionFile());
+      // The interactive CLI used to account for nothing, so every terminal
+      // session was invisible in the Usage page while the desktop recorded
+      // itself. One line per source per turn, the same shape the host writes.
+      try {
+        const delta = {
+          inputTokens: this.agent.usage.inputTokens - usageBefore.inputTokens,
+          outputTokens: this.agent.usage.outputTokens - usageBefore.outputTokens,
+          cachedTokens: this.agent.usage.cachedTokens - usageBefore.cachedTokens,
+        };
+        if (delta.inputTokens !== 0 || delta.outputTokens !== 0) {
+          recordUsage({ sessionId: this.sessionId, cwd: process.cwd(), model: this.agent.lastUsedModel || this.config.model, ...delta });
+        }
+        for (const kind of ["subagent", "background"] as const) {
+          const spent = this.agent.usageBySource[kind];
+          const part = {
+            inputTokens: spent.inputTokens - beforeBySource[kind].inputTokens,
+            outputTokens: spent.outputTokens - beforeBySource[kind].outputTokens,
+            cachedTokens: spent.cachedTokens - beforeBySource[kind].cachedTokens,
+          };
+          if (part.inputTokens !== 0 || part.outputTokens !== 0) {
+            recordUsage({ sessionId: this.sessionId, cwd: process.cwd(), model: this.agent.lastUsedModel || this.config.model, ...part, source: kind });
+          }
+        }
+      } catch {
+        /* accounting must never break a turn */
+      }
+      try {
+        saveSession(this.sessionFile());
+      } catch (err) {
+        // The agent error above is the interesting one; this is only reached
+        // when the transcript was taken over while the turn was running.
+        if (err instanceof ForeignSessionWriter) this.ui.error(err.message);
+        else throw err;
+      }
       if (this.ui.takeLineDirty?.()) stdout.write("\r\n");
     }
   }
@@ -298,8 +355,15 @@ export class Repl {
       }
       case "compact": {
         const before = this.agent.contextUsage().tokens;
-        this.agent.messages = compactForce(this.agent.messages);
-        this.ui.dim(`compacted (~${before} -> ~${this.agent.contextUsage().tokens} tokens)`);
+        try {
+          // The model writes the recap and the argument is passed through as
+          // the focus, so `/compact keep the API decisions` means something.
+          const result = await this.agent.compactNow(arg ? { focus: arg } : {});
+          if (!result) this.ui.dim("nothing to compact");
+          else this.ui.dim(`compacted (${result.level}, ~${before} -> ~${this.agent.contextUsage().tokens} tokens)`);
+        } catch (err) {
+          this.ui.warn(formatError(err));
+        }
         return;
       }
       case "sessions": {
@@ -323,11 +387,24 @@ export class Repl {
           this.ui.error(`session not found: ${arg}`);
           return;
         }
+        // The current session keeps its lock only until the switch succeeds:
+        // releasing first would leave both sessions writable for a moment.
+        const claim = acquireSessionLock(session.id, "terminal");
+        if (!claim.ok) {
+          this.ui.error(lockConflictMessage(session.id, claim.holder));
+          return;
+        }
+        releaseSessionLock(this.sessionId);
         this.sessionId = session.id;
         this.config = { ...this.config, model: session.model };
+        // A resumed conversation runs with the settings it was saved under.
+        if (session.mode) this.config = { ...this.config, permissionMode: session.mode };
+        if (session.effort) this.config = { ...this.config, thinkingEffort: session.effort };
         this.client.options.model = session.model;
+        if (session.effort) this.client.options.reasoningEffort = session.effort;
         this.agent = this.buildAgent(session.messages);
-        this.ui.dim(`resumed ${session.id} (${session.messages.length} messages)`);
+        const restored = [session.mode ? `${session.mode} mode` : "", session.effort ? `${session.effort} effort` : ""].filter(Boolean);
+        this.ui.dim(`resumed ${session.id} (${session.messages.length} messages${restored.length ? `, ${restored.join(", ")}` : ""})`);
         return;
       }
       case "memory": {

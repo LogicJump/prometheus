@@ -8,6 +8,12 @@
  *
  * The classification table is shared with the permission layer, so `auto` mode,
  * the audit log, and the shell tool all agree on what a command is.
+ *
+ * One shape is handled structurally even though it looks like "just another
+ * regex": after `cd` to a directory outside the workspace, every relative path
+ * in the rest of the line resolves somewhere the scan never looked. Refusing
+ * that prefix is not a rules contest — it closes the one escape hatch the path
+ * scan structurally cannot see.
  */
 
 import { homedir } from "node:os";
@@ -68,6 +74,33 @@ const RULES: Rule[] = [
 
 const NETWORK_FETCHERS = /\b(curl|wget|Invoke-WebRequest|Invoke-RestMethod|iwr|irm|git\s+clone|ssh|scp|sftp|nc|ncat|telnet)\b/i;
 
+/**
+ * Inline code passed to an interpreter: `python -c "..."`, `node -e`,
+ * `powershell -Command`, `sh -c`, `perl -e`, `ruby -e`.
+ *
+ * The path scan below reads the command line, so a script body is opaque to
+ * it: `python -c "open('/etc/passwd').read()"` contains no absolute path in an
+ * argument position. Judging the body would be a regex contest the defender
+ * loses, so the rule is structural — an inline program is a confirm, and one
+ * that names a network module is a deny when the network is off.
+ */
+const INLINE_INTERPRETER =
+  /\b(python|python3|py|node|deno|bun|perl|ruby|php|powershell|pwsh|bash|sh|zsh|cmd)\b[^|;&]*?\s(-c|-e|-Command|-command|\/c|\/C)\s+(["'])/;
+
+/**
+ * Modules and calls that reach the network from an inline script.
+ *
+ * No trailing `\b`: `require('https')` ends in `)`, which is not a word
+ * character, so a boundary there can never match — the pattern was dead on
+ * exactly the shapes it was written for.
+ */
+const INLINE_NETWORK =
+  /\b(?:urllib\.request|urllib3|http\.client|httpx|requests\.(?:get|post)|socket\.socket|aiohttp|urlopen|fetch\(|XMLHttpRequest|require\(['"]https?['"]\)|from\s+['"]https?|Invoke-WebRequest|Invoke-RestMethod|Net\.WebClient|HttpClient)/i;
+
+/** A shelling-out call inside an inline program, which the path scan cannot see. */
+const INLINE_SUBPROCESS =
+  /\b(subprocess\.|os\.system|os\.popen|child_process|execSync|spawnSync|system\(|`[^`]+`)/;
+
 export class SandboxError extends Error {
   verdict: CommandVerdict;
 
@@ -98,6 +131,50 @@ export function classifyCommand(command: string, cwd: string, policy: SandboxPol
     };
   }
 
+  // An inline program is judged as a program, not as a command line.
+  const inline = INLINE_INTERPRETER.test(command);
+  if (inline) {
+    if (policy.network === "off" && INLINE_NETWORK.test(command)) {
+      return {
+        class: "deny",
+        reason: "the inline script reaches the network, and network access is off for commands in this session",
+        violations: ["network"],
+      };
+    }
+    if (INLINE_SUBPROCESS.test(command)) {
+      return {
+        class: "confirm",
+        reason: "the inline script starts another process, which the path scan cannot inspect",
+        violations: ["inline-subprocess"],
+      };
+    }
+  }
+
+  // `proxy` is a documented policy value with no implementation behind it.
+  // Treating it as `off` silently would make the setting look like it works;
+  // an explicit confirm says what it actually does today. It is checked before
+  // the path scan so a refused-by-path command still reports the stronger rule.
+  if (policy.network === "proxy" && NETWORK_FETCHERS.test(command)) {
+    return {
+      class: "confirm",
+      reason: "the per-command proxy policy is not implemented; this will use the network directly",
+      violations: ["network"],
+    };
+  }
+
+  // `cd` out of the workspace and then read with a relative path: the target
+  // is invisible to the absolute-path scan, because `etc/passwd` is a relative
+  // path resolved by the shell, not by us. The plan for the interpreter bypass
+  // named `cd / && cat etc/passwd` as an example and it stayed allowed.
+  const cdEscape = cdOutsideWorkspace(command, cwd, policy.allowedDirs);
+  if (cdEscape) {
+    return {
+      class: "deny",
+      reason: `the command changes directory to ${cdEscape}, outside the workspace, and then runs relative paths`,
+      violations: [cdEscape],
+    };
+  }
+
   const outside = pathsOutsideWorkspace(command, cwd, policy.allowedDirs);
   if (outside.length > 0) {
     return {
@@ -107,7 +184,46 @@ export function classifyCommand(command: string, cwd: string, policy: SandboxPol
     };
   }
 
+  if (inline) {
+    return {
+      class: "confirm",
+      reason: "an inline script cannot be inspected by the path scan; approve it once you have read it",
+      violations: ["inline"],
+    };
+  }
+
   return { class: "allow", violations };
+}
+
+/**
+ * A `cd` that leaves the workspace, when the command then does anything else.
+ *
+ * A bare `cd /tmp` on its own is harmless and common in build scripts. The
+ * dangerous shape is `cd X && …` / `cd X; …`: after it, every relative path
+ * in the rest of the line resolves somewhere the file-path scan never looked.
+ * `cd && npm test` inside the workspace is fine, so only a target outside the
+ * confined roots is refused.
+ */
+export function cdOutsideWorkspace(command: string, cwd: string, allowedDirs: string[]): string | null {
+  const roots = [resolve(cwd), ...allowedDirs.map((dir) => resolve(cwd, dir))];
+  const pattern = /(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)cd(?:\s+\/d)?\s+("[^"]+"|'[^']+'|[^\s;&|]+)/gi;
+  for (const match of command.matchAll(pattern)) {
+    const raw = match[1].replace(/^["']|["']$/g, "");
+    if (!raw || raw === "-" || raw === "~") {
+      if (raw === "~" || raw === "-") return raw;
+      continue;
+    }
+    // Only an absolute target can be checked lexically; a relative one starts
+    // inside the workspace (or an ancestor the caller already controls).
+    if (!isAbsolute(raw)) continue;
+    const target = resolve(raw);
+    const inside = roots.some((root) => {
+      const rel = relative(root, target);
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    });
+    if (!inside) return raw;
+  }
+  return null;
 }
 
 /**
@@ -128,6 +244,18 @@ export function pathsOutsideWorkspace(command: string, cwd: string, allowedDirs:
     if (at > 0 && /[\w.~-]/.test(command[at - 1])) continue;
     if (/^\/\//.test(token) || /^\/dev\/null$/.test(token) || /^\/dev\/std(in|out|err)$/.test(token)) continue;
     if (/^\/tmp(\/|$)/.test(token) || /^\/var\/tmp(\/|$)/.test(token)) continue;
+    const target = resolve(cwd, token);
+    const inside = roots.some((root) => {
+      const rel = relative(root, target);
+      return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    });
+    if (!inside) outside.push(token);
+  }
+
+  // Parent-relative escapes: `cat ../../Windows/win.ini` never appears in the
+  // absolute-path scan, because the shell resolves it. A `..` that still lands
+  // inside the workspace (the common `../src` case) is fine.
+  for (const token of command.match(/(?:\.\.[\\/])+[^\s'"|;&<>()]*/g) ?? []) {
     const target = resolve(cwd, token);
     const inside = roots.some((root) => {
       const rel = relative(root, target);

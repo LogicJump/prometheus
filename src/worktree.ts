@@ -77,6 +77,11 @@ export interface Worktree {
 /**
  * Create (or reuse) a worktree for a session.
  *
+ * `base` names the revision to fork from (default `HEAD`), but the worktree
+ * records the **commit sha** it actually started at. The label is useless as a
+ * diff base later: by the time a session asks for its diff it has committed,
+ * and `git diff HEAD` is then empty by definition.
+ *
  * @param repoRoot the repository root the session's workspace belongs to
  */
 export async function createWorktree(
@@ -95,8 +100,12 @@ export async function createWorktree(
   const parent = join(top, ".prometheus", "worktrees");
   const path = join(parent, name);
 
+  // The commit the worktree forks from, resolved before any branch is made.
+  const resolved = await git(top, ["rev-parse", "--verify", `${base}^{commit}`]);
+  const baseSha = resolved.ok ? resolved.out.trim() : "";
+
   if (existsSync(path)) {
-    return { ok: true, worktree: { path, branch, base } };
+    return { ok: true, worktree: { path, branch, base: baseSha || base } };
   }
   mkdirSync(parent, { recursive: true });
 
@@ -104,7 +113,7 @@ export async function createWorktree(
   // worktree starts the branch rather than attaching to one.
   const committed = await hasCommits(top);
   const args = committed
-    ? ["worktree", "add", "-b", branch, path]
+    ? ["worktree", "add", "-b", branch, path, base]
     : ["worktree", "add", "--orphan", "-b", branch, path];
   const added = await git(top, args);
   if (added.ok) {
@@ -116,12 +125,14 @@ export async function createWorktree(
       await git(path, ["-c", "user.name=Prometheus", "-c", "user.email=prometheus@localhost", "commit", "-m", "Prometheus worktree baseline"]);
     }
     const head = await git(path, ["rev-parse", "--abbrev-ref", "HEAD"]);
-    return { ok: true, worktree: { path, branch: head.ok ? head.out.trim() : branch, base } };
+    // For an empty repository the baseline commit is the fork point.
+    const forkedAt = baseSha || (await git(path, ["rev-parse", "HEAD"])).out.trim() || base;
+    return { ok: true, worktree: { path, branch: head.ok ? head.out.trim() : branch, base: forkedAt } };
   }
 
   // The branch may already exist from an earlier session; attach to it instead.
   const retry = await git(top, ["worktree", "add", path, branch]);
-  if (retry.ok) return { ok: true, worktree: { path, branch, base } };
+  if (retry.ok) return { ok: true, worktree: { path, branch, base: baseSha || base } };
   return { ok: false, error: added.err || retry.err || "could not create a worktree" };
 }
 
@@ -139,7 +150,10 @@ export async function commitWorktree(worktree: Worktree, message: string): Promi
 
 /** The changes in a worktree relative to its base, as a unified diff. */
 export async function worktreeDiff(worktree: Worktree): Promise<string> {
-  const result = await git(worktree.path, ["diff", worktree.base]);
+  // `base` is the commit the worktree forked from, so committed work still
+  // shows. With a literal "HEAD" the diff was empty exactly when a session had
+  // just committed, which is the only time the command is called.
+  const result = await git(worktree.path, ["diff", worktree.base, "--"]);
   const untracked = await git(worktree.path, ["ls-files", "--others", "--exclude-standard"]);
   const parts = [result.out];
   if (untracked.ok && untracked.out.trim()) {

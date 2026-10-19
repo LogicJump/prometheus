@@ -11,10 +11,10 @@ import os from "node:os";
 import type { ChatMessage } from "./types.ts";
 import { ChatClient, type ApiTool } from "./llm.ts";
 import type { FallbackChatClient } from "./fallback.ts";
-import type { Config, TodoList, Tool, Usage, UserContentPart } from "./types.ts";
+import type { Config, TodoList, Tool, Usage, UsageBreakdown, UserContentPart } from "./types.ts";
 import type { TerminalUi } from "./ui.ts";
 import { Permissions } from "./permissions.ts";
-import { estimateTokens, summarizerInput, SUMMARIZE_PROMPT } from "./context.ts";
+import { compactWithModel, estimateTextTokens, estimateTokens, summarizerInput, SUMMARIZE_PROMPT, type CompactionLevel } from "./context.ts";
 import { loadMemory } from "./memory.ts";
 import { SUBAGENT_TOOLS, ALL_TOOLS } from "./tools/index.ts";
 import { loadProjectInstructions, loadRules, renderRules } from "./instructions.ts";
@@ -33,6 +33,26 @@ function toApiTools(tools: Tool[]): ApiTool[] {
   }));
 }
 
+/**
+ * What the tool schemas cost, in tokens.
+ *
+ * They are part of every request but are not messages, so the meter ignored
+ * them: with a few MCP servers attached, 40 tool definitions are ~15k tokens
+ * that were missing from the percentage and from the compaction decision.
+ */
+function toolSchemaTokens(tools: Tool[]): number {
+  let total = 0;
+  for (const tool of tools) {
+    total += estimateTextTokens(tool.name) + estimateTextTokens(tool.description);
+    try {
+      total += estimateTextTokens(JSON.stringify(tool.parameters));
+    } catch {
+      /* a schema that cannot be serialised is not counted; the request would fail anyway */
+    }
+  }
+  return total;
+}
+
 export class Agent {
   messages: ChatMessage[];
   readonly config: Config;
@@ -45,8 +65,34 @@ export class Agent {
   readonly client: ChatClient | FallbackChatClient;
   readonly todos: TodoList = { items: [] };
   usage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  /** The usage balance at the moment the current run started. */
+  private usageBase: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  /**
+   * Tokens spent by sub-agents during this run. A usage event carries only the
+   * main loop's own count, so the children's share is tracked separately and
+   * added back when the event overwrites `usage` with the base plus this run.
+   */
+  private subagentUsage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+  /**
+   * The same total, split by who spent it.
+   *
+   * `usage` answers "what did this session cost"; this answers "what did
+   * delegation cost", which is the only way to tell whether a sub-agent was
+   * worth using. Background sub-tasks are counted apart from foreground ones
+   * because they are the ones that outlive a turn and surprise a user.
+   */
+  readonly usageBySource: UsageBreakdown = {
+    main: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+    subagent: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+    background: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+  };
+  /** The model that produced the latest usage, as the client reports it. */
+  lastUsedModel = "";
+  private subagentKind: "subagent" | "background" = "subagent";
   /** Set by the host so file mutations can be checkpointed per session. */
   sessionId = "";
+  /** Balance carried into this run, and the loop's cumulative for this run. */
+  private reportedUsage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
   /** Called before a mutating tool runs; used to snapshot file state for diffs. */
   onBeforeMutate: ((toolName: string, input: Record<string, unknown>) => void) | null = null;
   /** Set by the host so a turn can stream to the renderer instead of a terminal. */
@@ -60,6 +106,13 @@ export class Agent {
 
   /** Mutable so MCP tools can be added after startup. */
   private tools: Tool[];
+  /**
+   * Names of deferred tools the model has unlocked with `tool_search`.
+   *
+   * Deferred schemas are the largest fixed cost in a request, and a session
+   * that never touches MCP should not pay for forty tool descriptions.
+   */
+  private readonly unlocked = new Set<string>();
   /** Workspace-relative paths the conversation has read or written, for scoped rules. */
   private readonly touched = new Set<string>();
   /** Background sub-tasks still running; capped so a loop cannot spawn hundreds. */
@@ -86,24 +139,93 @@ export class Agent {
     this.tools = tools;
     this.permissions = permissions;
     this.isSubagent = isSubagent;
-    this.messages = messages;
-    if (messages.length === 0) {
-      this.messages.push({ role: "system", content: this.systemPrompt() });
-    }
+    // The system prompt is rendered per request, not stored in the
+    // transcript. A resumed or forked session loads messages from disk with no
+    // system message, and a mode or rule change must apply to the next
+    // request without rewriting history. A system message left in a restored
+    // transcript (an older version wrote one) is dropped here so the request
+    // carries exactly one.
+    this.messages = messages.filter((message) => message.role !== "system");
     this.ui.setModelName?.(config.model);
     if (!isSubagent) this.hooks = loadHooks(process.cwd());
+    // The search tool is how a deferred schema becomes callable. It lives here
+    // rather than in ALL_TOOLS because it needs this agent's own catalogue;
+    // `syncSearchTool` adds or removes it so a session with no MCP server is
+    // not paying for a schema it cannot use.
+    this.syncSearchTool();
   }
 
   /**
-   * Replace the system prompt (mode, model, or output style changed mid-session).
-   * An optional note is appended once, so a mid-session style change is visible
-   * to the model instead of silently rewriting its instructions.
+   * Keep `tool_search` present exactly when something is deferred. Called
+   * after the tool set changes, so a session that adds MCP tools later grows
+   * the search tool with them.
+   */
+  private syncSearchTool(): void {
+    const index = this.tools.findIndex((tool) => tool.name === "tool_search");
+    const wanted = this.tools.some((tool) => tool.deferred);
+    if (wanted) {
+      if (index >= 0) return;
+      this.tools.push(this.searchTool());
+      return;
+    }
+    if (index >= 0) this.tools.splice(index, 1);
+  }
+
+  /** The `tool_search` definition, built once per call rather than stored. */
+  private searchTool(): Tool {
+    return {
+      name: "tool_search",
+      description:
+        "Find and enable a tool that is not currently listed. Deferred tools (MCP servers, embedded tooling) are announced here instead of in every request; searching by name or description returns their schemas and makes them callable.",
+      readonly: true,
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Text to match against tool names and descriptions; empty lists everything deferred" },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+      summarize: (input) => String(input.query ?? "").slice(0, 80),
+      execute: async (input) => {
+        const matches = this.unlockTools(String(input.query ?? ""));
+        if (matches.length === 0) {
+          const remaining = this.deferredCatalogue();
+          return {
+            content: remaining.length === 0
+              ? "No deferred tools remain; everything is already available."
+              : `No match. Still deferred:\n${remaining.map((tool) => `- ${tool.name}: ${tool.description.split("\n")[0]}`).join("\n")}`,
+          };
+        }
+        return {
+          content:
+            `Enabled ${matches.length} tool(s); they are callable from the next turn.\n` +
+            matches.map((tool) => `- ${tool.name}: ${tool.description.split("\n")[0]}`).join("\n"),
+        };
+      },
+    };
+  }
+
+  /** A one-off note appended to the system prompt after a mid-session change. */
+  private systemNote = "";
+
+  /**
+   * The system prompt for the next request, including any note left by
+   * `refreshSystemPrompt`. Rebuilt on every request so a mode change, a newly
+   * touched rule, or a board selection is never a turn behind.
+   */
+  private requestSystemPrompt(): string {
+    const base = this.systemPrompt();
+    return this.systemNote ? `${base}\n\n# Update\n${this.systemNote}` : base;
+  }
+
+  /**
+   * Replace the system prompt (mode, model, rules, or output style changed
+   * mid-session). An optional note is appended once, so a mid-session change
+   * is visible to the model instead of silently rewriting its instructions.
    */
   refreshSystemPrompt(note?: string): void {
-    if (this.messages[0]?.role === "system") {
-      const content = this.systemPrompt();
-      this.messages[0] = { role: "system", content: note ? `${content}\n\n# Update\n${note}` : content };
-    }
+    if (note !== undefined) this.systemNote = note;
   }
 
   /** Response style chosen in Settings; folded into the system prompt. */
@@ -226,6 +348,75 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   addTools(extra: Tool[]): void {
     const known = new Set(this.tools.map((tool) => tool.name));
     for (const tool of extra) if (!known.has(tool.name)) this.tools.push(tool);
+    this.syncSearchTool();
+  }
+
+  /** Tools whose schemas go into the next request: undeferred, plus unlocked. */
+  private visibleTools(): Tool[] {
+    return this.tools.filter((tool) => !tool.deferred || this.unlocked.has(tool.name));
+  }
+
+  /**
+   * `visibleTools` for tests. The real one is private because a caller that
+   * bypassed the filter would leak a deferred schema back into the request.
+   */
+  testVisibleTools(): Tool[] {
+    return this.visibleTools();
+  }
+
+  /**
+   * Unlock a deferred tool by name and return its schema.
+   *
+   * `tool_search` is the only way a deferred tool becomes callable; the search
+   * itself matches names and descriptions so a model that knows what it wants
+   * does not have to read a catalogue of forty.
+   */
+  unlockTools(query: string, limit = 8): { name: string; description: string }[] {
+    const needle = query.trim().toLowerCase();
+    const matches = this.tools.filter((tool) => {
+      if (!tool.deferred) return false;
+      if (!needle) return true;
+      return (
+        tool.name.toLowerCase().includes(needle) ||
+        tool.description.toLowerCase().includes(needle)
+      );
+    });
+    const chosen = matches.slice(0, limit);
+    for (const tool of chosen) this.unlocked.add(tool.name);
+    return chosen.map((tool) => ({ name: tool.name, description: tool.description }));
+  }
+
+  /** Deferred tools not yet unlocked, for the search tool's own description. */
+  deferredCatalogue(): { name: string; description: string }[] {
+    return this.tools
+      .filter((tool) => tool.deferred && !this.unlocked.has(tool.name))
+      .map((tool) => ({ name: tool.name, description: tool.description }));
+  }
+
+  /**
+   * Replace every tool whose name starts with `prefix`, keeping the rest.
+   *
+   * `addTools` only ever grows the list, so a server that dropped a tool — or
+   * was disabled in Settings — kept its old tools alive until the next session.
+   * Replacing a prefix is what makes an MCP `list_changed` refresh honest.
+   */
+  replaceToolsByPrefix(prefix: string, replacement: Tool[]): void {
+    const kept = this.tools.filter((tool) => !tool.name.startsWith(prefix));
+    const seen = new Set(kept.map((tool) => tool.name));
+    for (const tool of replacement) if (!seen.has(tool.name)) kept.push(tool);
+    this.tools.length = 0;
+    this.tools.push(...kept);
+    this.syncSearchTool();
+  }
+
+  /**
+   * Re-read the hook files. The project's hooks only load once the user has
+   * trusted the checkout, so a decision made in Settings during a session must
+   * take effect without a restart.
+   */
+  refreshHooks(): void {
+    if (this.isSubagent) return;
+    this.hooks = loadHooks(process.cwd());
   }
 
   /** Add a user message without running the loop (used when restoring sessions). */
@@ -302,7 +493,10 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         runSubagentInBackground: (prompt) => this.startBackgroundSubagent(prompt),
         messageIndex: () => this.messages.length,
         onTouch: (path) => this.noteTouched(path),
-        trusted: this.isSubagent,
+        // A sub-agent is not a grant. Its permission layer runs the same checks
+        // as the parent's, so approving `delegate` does not silently approve
+        // every write the child makes inside that task.
+        trusted: false,
         cwd: process.cwd(),
       },
     );
@@ -311,20 +505,46 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   private async loop(): Promise<void> {
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
+    // Tokens already spent before this run. `query()` counts from zero each
+    // run, so the balance is carried across, not reset.
+    this.usageBase = { ...this.usage };
+    this.subagentUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+    this.reportedUsage.inputTokens = 0;
+    this.reportedUsage.outputTokens = 0;
+    this.reportedUsage.cachedTokens = 0;
+    if (this.config.contextWindowAssumed && !this.isSubagent && !this.warnedAssumedWindow) {
+      // A guessed window that is too large means the first sign of trouble is
+      // an endpoint 400 partway through a long task. One line at the start is
+      // cheaper than debugging that. Silent when the value was configured.
+      this.warnedAssumedWindow = true;
+      this.ui.dim(
+        `context window not reported by the endpoint; assuming ${this.config.contextWindow.toLocaleString()} tokens. ` +
+          `Set "contextWindow" in ~/.prometheus/config.json or PROMETHEUS_CONTEXT_WINDOW if this is wrong.`,
+      );
+    }
     this.ui.spinnerStart("waiting for model");
 
     try {
       const events = query({
         messages: this.messages,
+        system: () => this.requestSystemPrompt(),
         config: this.config,
         client: this.client,
         pipeline: this.buildPipeline(),
-        apiTools: () => toApiTools(this.tools),
+        apiTools: () => toApiTools(this.visibleTools()),
         signal,
         drainQueue: () => this.queued.splice(0),
-        summarize: (old, local) => this.summarizeWithModel(old, local, signal),
+        summarize: (old, local, focus) => this.summarizeWithModel(old, local, signal, focus),
         rehydrate: () => this.rehydration(),
         maxRetries: 3,
+        beforeCompact: (info) => this.beforeCompact(info),
+        afterCompact: (info) => {
+          void this.fireSessionHooks("PostCompact", {
+            removed: info.removed,
+            after: info.after,
+            summary: info.summary.slice(0, 2000),
+          });
+        },
       });
 
       for await (const event of events) {
@@ -336,6 +556,84 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
       this.ui.assistantEnd();
       this.ui.thinkingEnd();
       this.abortController = null;
+    }
+  }
+
+  private warnedAssumedWindow = false;
+
+  /**
+   * Compact on demand (`/compact` and the desktop's compact button).
+   *
+   * This used to call the local `compactForce`, which summarised with keyword
+   * matching instead of the model — so the one command a user issues for a
+   * *better* recap produced the worst one. It now shares the model-backed path
+   * with automatic compaction, accepts a focus, and fires the same hooks.
+   */
+  async compactNow(options: { focus?: string } = {}): Promise<{
+    removed: number;
+    before: number;
+    after: number;
+    summary: string;
+    level: CompactionLevel;
+  } | null> {
+    if (this.busy) throw new Error("stop the current turn before compacting");
+    const before = estimateTokens(this.messages);
+    const verdict = await this.beforeCompact({ before, trigger: "auto" });
+    if (verdict.blocked) throw new Error(`compaction was blocked by a PreCompact hook${verdict.reason ? `: ${verdict.reason}` : ""}`);
+    const signal = new AbortController().signal;
+    const result = await compactWithModel(this.messages, this.config.contextWindow, {
+      summarize: (old, local, focus) => this.summarizeWithModel(old, local, signal, focus),
+      signal,
+      rehydrate: () => this.rehydration(),
+      ...(options.focus ? { focus: options.focus } : {}),
+      force: true,
+    });
+    if (!result) return null;
+    this.messages.splice(0, this.messages.length, ...result.messages);
+    void this.fireSessionHooks("PostCompact", {
+      removed: result.removed,
+      after: result.after,
+      summary: result.summary.slice(0, 2000),
+    });
+    this.onCompacted?.({
+      removed: result.removed,
+      before: result.before,
+      after: result.after,
+      summary: result.summary,
+      level: result.level,
+      kept: result.messages.length,
+    });
+    return {
+      removed: result.removed,
+      before: result.before,
+      after: result.after,
+      summary: result.summary,
+      level: result.level,
+    };
+  }
+
+  /**
+   * Ask the PreCompact hooks whether compaction may run.
+   *
+   * They used to fire from the `compacted` event — after the transcript had
+   * already been rewritten — and `PreCompact` was not a blocking event, so a
+   * hook that wanted to save context first always arrived too late. A hook
+   * that exits non-zero now stops the compaction instead.
+   */
+  private async beforeCompact(info: { before: number; trigger: "auto" }): Promise<{ blocked?: boolean; reason?: string }> {
+    if (this.isSubagent) return {};
+    const hooks = hooksFor(this.hooks, "PreCompact");
+    if (hooks.length === 0) return {};
+    try {
+      const results = await runHooks(hooks, "PreCompact", { ...info, sessionId: this.sessionId }, process.cwd());
+      const noise = results.map((result) => result.output).filter(Boolean).join("\n");
+      if (noise) this.ui.dim(`[PreCompact] ${noise}`);
+      const blocker = results.find((result) => result.blocked);
+      return blocker ? { blocked: true, reason: blocker.output.slice(0, 300) } : {};
+    } catch {
+      // A hook that cannot run must not silently change whether compaction
+      // happens; the default is to compact.
+      return {};
     }
   }
 
@@ -364,13 +662,23 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
    * One non-streaming request for a compaction recap. It reuses the session's
    * client (same provider, key, and model) and never touches the transcript.
    */
-  private async summarizeWithModel(old: ChatMessage[], localSummary: string, signal: AbortSignal): Promise<string> {
+  private async summarizeWithModel(
+    old: ChatMessage[],
+    localSummary: string,
+    signal: AbortSignal,
+    focus?: string,
+  ): Promise<string> {
     if (this.isSubagent) return localSummary;
     const input = summarizerInput(old);
     if (!input.trim()) return localSummary;
+    // The user's `/compact <focus>` is a request about what matters; folding it
+    // into the system half keeps the transcript half faithfully untouched.
+    const system = focus?.trim()
+      ? `${SUMMARIZE_PROMPT}\n\nThe user asked the recap to concentrate on: ${focus.trim().slice(0, 1000)}`
+      : SUMMARIZE_PROMPT;
     const request = this.client.chat(
       [
-        { role: "system", content: SUMMARIZE_PROMPT },
+        { role: "system", content: system },
         { role: "user", content: `Transcript to summarize:\n\n${input}` },
       ],
       [],
@@ -426,7 +734,8 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   }
 
   /** Translate a loop event into the terminal UI calls. */
-  private dispatch(event: QueryEvent): void {    const ui = this.ui;
+  private dispatch(event: QueryEvent): void {
+    const ui = this.ui;
     switch (event.type) {
       case "assistant_start":
         ui.spinnerStop();
@@ -442,10 +751,12 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         ui.spinnerStop();
         ui.warn(`${event.message} - retrying in ${event.delayMs / 1000}s (attempt ${event.attempt + 1})`);
         break;
+      // Both used to be fired from the `compacted` event, i.e. after the
+      // transcript had already been rewritten. PreCompact now runs in `loop()`
+      // before compaction and can block it; only the after-the-fact event is
+      // dispatched here.
       case "compacted":
         ui.dim(`compacted (${event.level}) ${event.removed} earlier messages (~${event.before} -> ~${event.after} tokens)`);
-        void this.fireSessionHooks("PreCompact", { removed: event.removed, before: event.before, after: event.after });
-        void this.fireSessionHooks("PostCompact", { removed: event.removed, after: event.after, summary: event.summary.slice(0, 2000) });
         this.onCompacted?.({
           removed: event.removed,
           before: event.before,
@@ -467,22 +778,80 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
           ui.error(event.error.message);
         }
         break;
-      case "usage":
-        this.usage = event.usage;
+      case "usage": {
+        // `event.usage` counts this run only (the loop starts at zero), so it
+        // is added to the balance carried in from earlier runs. Assigning it
+        // outright made the second turn overwrite the first, and the host's
+        // per-turn delta went negative and was clamped to zero.
+        //
+        // The delta is what belongs to `main`: the cumulative value already
+        // contains every earlier request this run, so adding the cumulative
+        // each time would count a multi-step turn several times over.
+        const delta = {
+          inputTokens: Math.max(0, event.usage.inputTokens - this.reportedUsage.inputTokens),
+          outputTokens: Math.max(0, event.usage.outputTokens - this.reportedUsage.outputTokens),
+          cachedTokens: Math.max(0, event.usage.cachedTokens - this.reportedUsage.cachedTokens),
+        };
+        this.reportedUsage = { ...event.usage };
+        const main = this.usageBySource.main;
+        main.inputTokens += delta.inputTokens;
+        main.outputTokens += delta.outputTokens;
+        main.cachedTokens += delta.cachedTokens;
+        this.lastUsedModel = this.activeModel();
+        this.usage = {
+          inputTokens: event.usage.inputTokens + this.usageBase.inputTokens + this.subagentUsage.inputTokens,
+          outputTokens: event.usage.outputTokens + this.usageBase.outputTokens + this.subagentUsage.outputTokens,
+          cachedTokens: event.usage.cachedTokens + this.usageBase.cachedTokens + this.subagentUsage.cachedTokens,
+        };
         break;
+      }
       default:
         break;
     }
   }
 
-  /** Build one isolated child agent for a sub-task, with a proxied UI. */
-  private spawnSubagent(label: string): Agent {
-    const child = new Agent(
+  /**
+   * The model that actually answered.
+   *
+   * With a fallback chain the configured model is not necessarily the one that
+   * served the request, so recording every token under `config.model` put the
+   * spend on a model that never ran. `FallbackChatClient` exposes the active
+   * client; a plain `ChatClient` names itself.
+   */
+  private activeModel(): string {
+    const client = this.client as { options?: { model?: string }; active?: { options?: { model?: string } } };
+    return client.active?.options?.model ?? client.options?.model ?? this.config.model;
+  }
+
+  private addSubagentUsage(usage: Usage, kind: "subagent" | "background" = "subagent"): void {    this.subagentUsage.inputTokens += usage.inputTokens;
+    this.subagentUsage.outputTokens += usage.outputTokens;
+    this.subagentUsage.cachedTokens += usage.cachedTokens;
+    this.usage.inputTokens += usage.inputTokens;
+    this.usage.outputTokens += usage.outputTokens;
+    this.usage.cachedTokens += usage.cachedTokens;
+    // Kept apart as well as summed: the total answers "what did this session
+    // cost", the split answers "was delegate worth it".
+    const bucket = this.usageBySource[kind];
+    bucket.inputTokens += usage.inputTokens;
+    bucket.outputTokens += usage.outputTokens;
+    bucket.cachedTokens += usage.cachedTokens;
+  }
+
+  /**
+   * Build one isolated child agent for a sub-task, with a proxied UI.
+   *
+   * The child runs with the parent's permission mode. It used to be forced to
+   * `auto` and marked trusted, so approving one `delegate` silently approved
+   * every write the child would make in that task — a grant the user never saw
+   * and never chose. In `ask` mode the child's mutations now prompt like the
+   * parent's, and in plan mode the child stays read-only.
+   */
+  private spawnSubagent(label: string): Agent {    const child = new Agent(
       { ...this.config, maxTurns: Math.min(25, this.config.maxTurns) },
       this.ui,
       this.client,
       SUBAGENT_TOOLS,
-      new Permissions({ ...this.config, permissionMode: this.config.permissionMode === "plan" ? "plan" : "auto" }, this.ui),
+      new Permissions({ ...this.config }, this.ui),
       [],
       true,
     );
@@ -511,8 +880,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
     try {
       await child.run(prompt);
       const text = [...child.messages].reverse().find((m) => m.role === "assistant" && m.content);
-      this.usage.inputTokens += child.usage.inputTokens;
-      this.usage.outputTokens += child.usage.outputTokens;
+      this.addSubagentUsage(child.usage);
       this.ui.info("  ↳ sub-agent finished");
       const report = typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
       this.ui.subagentEnd?.(true, report.slice(0, 160));
@@ -548,8 +916,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         try {
           await child.run(prompt);
           const text = [...child.messages].reverse().find((m) => m.role === "assistant" && m.content);
-          this.usage.inputTokens += child.usage.inputTokens;
-          this.usage.outputTokens += child.usage.outputTokens;
+          this.addSubagentUsage(child.usage);
           const report = typeof text?.content === "string" ? text.content : "(sub-agent produced no text report)";
           this.ui.subagentEnd?.(true, `#${index + 1} ${report.slice(0, 120)}`);
           return { ok: true, report };
@@ -585,8 +952,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         await child.run(prompt);
         const text = [...child.messages].reverse().find((m) => m.role === "assistant" && m.content);
         const report = typeof text?.content === "string" ? text.content : "(background sub-agent produced no text report)";
-        this.usage.inputTokens += child.usage.inputTokens;
-        this.usage.outputTokens += child.usage.outputTokens;
+        this.addSubagentUsage(child.usage, "background");
         this.ui.subagentEnd?.(true, `background: ${report.slice(0, 120)}`);
         this.onBackgroundReport?.(prompt, report, true);
       } catch (err) {
@@ -614,7 +980,13 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
   }
 
   contextUsage(): { tokens: number; percent: number } {
-    const tokens = estimateTokens(this.messages);
+    // Everything the request carries: the conversation, the system prompt (not
+    // stored in `messages`, it is rendered per request) and the tool schemas
+    // (not messages either, but billed on every call).
+    const tokens =
+      estimateTokens(this.messages) +
+      estimateTextTokens(this.requestSystemPrompt()) +
+      toolSchemaTokens(this.tools);
     return { tokens, percent: Math.min(100, Math.round((tokens / this.config.contextWindow) * 100)) };
   }
 }

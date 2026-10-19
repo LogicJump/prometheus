@@ -42,6 +42,13 @@ export interface Config {
   allowedDirs: string[];
   /** Tool names auto-approved in ask mode. */
   autoApprove: string[];
+  /**
+   * A non-interactive run that was told it may act without a person
+   * (`--dont-ask`, or `--allowed-tools`). Only tools in `autoApprove` are then
+   * granted; everything else is refused with a reason the model can act on
+   * instead of a prompt nobody can answer.
+   */
+  unattended?: boolean;
   /** Command sandbox strength. "enforce" classifies and confines commands. */
   sandbox?: "off" | "enforce";
   /** Network access for commands: off rejects fetchers and injects a dead proxy. */
@@ -50,6 +57,19 @@ export interface Config {
   fallbackModels?: string[];
   /** Board selected in the UI; tools use it as a default when an argument is omitted. */
   board?: BoardSelection;
+  /**
+   * Set when `contextWindow` came from the built-in default rather than a
+   * configured value. The agent warns once at the first turn, because a
+   * gateway that serves a smaller window than the default would otherwise
+   * reject a long request with no earlier signal.
+   */
+  contextWindowAssumed?: boolean;
+  /**
+   * Send `reasoning_content` back on later turns. Only for providers whose
+   * tool loop needs the previous reasoning; an unknown field is a 400 risk on
+   * every other gateway.
+   */
+  echoReasoning?: boolean;
 }
 
 export interface ToolCall {
@@ -72,7 +92,20 @@ export type UserContentPart = TextPart | ImagePart;
 export type ChatMessage =
   | { role: "system"; content: string }
   | { role: "user"; content: string | UserContentPart[] }
-  | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
+  | {
+      role: "assistant";
+      content: string | null;
+      tool_calls?: ToolCall[];
+      /**
+       * Reasoning the model produced for this turn, kept so it can be sent back.
+       *
+       * Some endpoints require the reasoning of the previous tool call to be
+       * echoed verbatim; others reject an unknown field. `Agent` sends it only
+       * when the provider is known to accept it (`Config.echoReasoning`), so
+       * the default request shape stays exactly what it was.
+       */
+      reasoning_content?: string;
+    }
   | { role: "tool"; tool_call_id: string; content: string };
 
 export interface ToolResult {
@@ -94,6 +127,8 @@ export interface ToolContext {
   permissions: PermissionManager;
   ui: Ui;
   todo: TodoList;
+  /** Session id, so a long tool result can be written next to the transcript. */
+  sessionId?: string;
   runSubagent: (prompt: string) => Promise<string>;
   /** Run several independent sub-tasks concurrently; results are in input order. */
   runSubagents?: (prompts: string[]) => Promise<{ ok: boolean; report: string }[]>;
@@ -107,6 +142,25 @@ export interface Tool {
   parameters: Record<string, unknown>;
   /** Read-only tools never prompt in ask mode and are the only ones allowed in plan mode. */
   readonly: boolean;
+  /**
+   * Safe to run alongside another call in the same batch.
+   *
+   * Defaults to `readonly`: reads do not observe each other's effects, and a
+   * mutating tool is serialized so two writes cannot interleave. A tool that
+   * is not readonly but is still safe to batch (todo_write, remember) says so.
+   */
+  parallelSafe?: boolean;
+  /** Keep the full output on disk and tell the model where, when it is truncated. */
+  persistOutput?: boolean;
+  /**
+   * Hide the full schema until the model asks for it.
+   *
+   * Every tool definition is part of every request, and forty MCP tools cost
+   * roughly fifteen thousand tokens whether or not they are used. A deferred
+   * tool is announced by name in `tool_search` instead; calling that tool
+   * returns the schemas and makes them callable for the rest of the session.
+   */
+  deferred?: boolean;
   summarize: (input: Record<string, unknown>) => string;
   execute: (input: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 }
@@ -137,7 +191,20 @@ export interface Ui {
   thinking(delta: string): void;
   thinkingEnd(): void;
   todos(items: TodoItem[]): void;
-  confirm(question: string): Promise<"yes" | "always" | "no">;
+  /**
+   * Ask before a tool runs. `detail` is what the approval is about — for a
+   * file edit, the before/after so the user can see the change instead of
+   * approving a path.
+   */
+  confirm(question: string, detail?: PermissionDetail): Promise<"yes" | "always" | "no">;
+  /** False for a UI with no user behind it (headless JSON output). */
+  canPrompt?: boolean;
+  /**
+   * Release timers and streams before the process exits. Exiting with a
+   * spinner interval still armed trips a libuv assertion on Windows, which
+   * turns a finished run into a crash with no useful message.
+   */
+  dispose?(): void;
   spinnerStart(text: string): void;
   spinnerStop(): void;
   setModelName?(name: string): void;
@@ -155,11 +222,50 @@ export interface Ui {
 
 export interface PermissionManager {
   mode: PermissionMode;
-  check(tool: Tool, input: Record<string, unknown>): Promise<{ allowed: boolean; reason?: string }>;
+  check(
+    tool: Tool,
+    input: Record<string, unknown>,
+    detail?: PermissionDetail,
+  ): Promise<{ allowed: boolean; reason?: string }>;
+}
+
+/** The change a permission prompt is asking about. */
+export interface PermissionDetail {
+  path: string;
+  /** Absent for a file that does not exist yet. */
+  before: string | null;
+  after: string | null;
+  additions: number;
+  deletions: number;
+}
+
+/**
+ * A permission prompt that can show what is about to change.
+ *
+ * `detail` is optional so a manager that has nothing to add (a test double, a
+ * tool that touches no file) is unchanged; a UI that does not render it can
+ * ignore it.
+ */
+export interface PermissionAsk {
+  question: string;
+  detail?: PermissionDetail;
 }
 
 export interface Usage {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+}
+
+/**
+ * Usage split by who spent it.
+ *
+ * The main loop and its sub-agents share one bill today, so `delegate` cannot
+ * be judged on cost. `Agent.usageBySource` keeps the split so a host can record
+ * one line per source instead of one opaque total.
+ */
+export interface UsageBreakdown {
+  main: Usage;
+  subagent: Usage;
+  background: Usage;
 }

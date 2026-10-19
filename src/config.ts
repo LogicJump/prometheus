@@ -8,6 +8,9 @@ const HOME_DIR = join(homedir(), ".prometheus");
 export const CONFIG_HOME = HOME_DIR;
 export const SESSIONS_DIR = join(HOME_DIR, "sessions");
 
+/** Roughly the smallest window a current tool-calling model ships with. */
+export const DEFAULT_CONTEXT_WINDOW = 128_000;
+
 export const DEFAULT_MODEL = "glm-5.3-flash";
 /**
  * Optional allowlist. Empty (the default) means "whatever the endpoint
@@ -43,6 +46,7 @@ interface FileConfig {
   networkPolicy?: "off" | "proxy" | "open";
   fallbackModels?: string[];
   board?: unknown;
+  echoReasoning?: boolean;
 }
 
 function readJson(path: string): FileConfig {
@@ -88,8 +92,7 @@ function text(value: unknown, max: number): string | undefined {
  * of being passed to a spawn, and the baud is clamped to a range a UART can
  * actually use.
  */
-export function validBoard(value: unknown): BoardSelection | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+export function validBoard(value: unknown): BoardSelection | undefined {  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   const board: BoardSelection = {};
   const port = text(raw.port, 64);
@@ -107,8 +110,16 @@ export function validBoard(value: unknown): BoardSelection | undefined {
   return Object.keys(board).length > 0 ? board : undefined;
 }
 
-export function loadConfig(cli: Partial<Config> = {}): Config {
-  mkdirSync(HOME_DIR, { recursive: true });
+/** Split a comma- or space-separated tool list; empty entries are dropped. */
+export function parseToolList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(/[,\s]+/)
+    .map((name) => name.trim())
+    .filter(Boolean);
+}
+
+export function loadConfig(cli: Partial<Config> = {}): Config {  mkdirSync(HOME_DIR, { recursive: true });
   const global = readJson(join(HOME_DIR, "config.json"));
   const project = readJson(join(process.cwd(), ".prometheus", "config.json"));
   const file: FileConfig = { ...global, ...project };
@@ -144,10 +155,16 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
       validEffort(process.env.PROMETHEUS_THINKING_EFFORT) ??
       validEffort(file.thinkingEffort) ??
       "auto",
-    contextWindow: cli.contextWindow ?? file.contextWindow ?? 1_000_000,
+    contextWindow:
+      cli.contextWindow ??
+      file.contextWindow ??
+      (Number.isFinite(Number(process.env.PROMETHEUS_CONTEXT_WINDOW)) && Number(process.env.PROMETHEUS_CONTEXT_WINDOW) > 0
+        ? Number(process.env.PROMETHEUS_CONTEXT_WINDOW)
+        : DEFAULT_CONTEXT_WINDOW),
     maxTurns: cli.maxTurns ?? file.maxTurns ?? 60,
     allowedDirs: cli.allowedDirs ?? file.allowedDirs ?? [],
     autoApprove: cli.autoApprove ?? file.autoApprove ?? [],
+    unattended: cli.unattended,
     sandbox:
       cli.sandbox ??
       validSandbox(process.env.PROMETHEUS_SANDBOX) ??
@@ -160,6 +177,13 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
       "off",
     fallbackModels: cli.fallbackModels ?? file.fallbackModels ?? [],
     board: validBoard(cli.board ?? file.board),
+    // A default window is a guess. Say so once, so a gateway with a smaller
+    // window produces a warning at startup instead of a 400 mid-task.
+    contextWindowAssumed:
+      cli.contextWindow === undefined &&
+      file.contextWindow === undefined &&
+      !Number.isFinite(Number(process.env.PROMETHEUS_CONTEXT_WINDOW)),
+    echoReasoning: cli.echoReasoning ?? file.echoReasoning ?? false,
   };
 
   if (!config.apiKey) {
@@ -171,9 +195,4 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
     );
   }
   return config;
-}
-
-export function saveSession(id: string, data: unknown): void {
-  mkdirSync(SESSIONS_DIR, { recursive: true });
-  writeFileSync(join(SESSIONS_DIR, `${id}.json`), JSON.stringify(data, null, 2), "utf8");
 }

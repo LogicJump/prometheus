@@ -15,15 +15,17 @@
  *
  * The hook receives a JSON object on stdin describing the event and the
  * workspace. A non-zero exit from PreToolUse blocks the tool and its stderr
- * becomes the reason the model sees; other hooks only report their output.
+ * becomes the reason the model sees; UserPromptSubmit can veto the prompt and
+ * PreCompact can cancel the compaction. Other hooks only report their output.
  *
  * Hooks are a trust boundary: they run arbitrary local commands, so they are
  * only loaded from files the user controls, never from a remote source.
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
 
 export type HookEvent =
@@ -38,7 +40,7 @@ export type HookEvent =
   | "Stop";
 
 /** Events whose non-zero exit blocks the action rather than only reporting. */
-const BLOCKING: HookEvent[] = ["PreToolUse", "UserPromptSubmit"];
+const BLOCKING: HookEvent[] = ["PreToolUse", "UserPromptSubmit", "PreCompact"];
 
 export interface Hook {
   event: HookEvent;
@@ -96,7 +98,104 @@ function readFile(file: string): Hook[] {
 
 /** Global hooks first, then project hooks; both run. */
 export function loadHooks(cwd: string): Hook[] {
-  return [...readFile(join(CONFIG_HOME, "hooks.json")), ...readFile(join(cwd, ".prometheus", "hooks.json"))];
+  const global = readFile(join(CONFIG_HOME, "hooks.json"));
+  // A cloned repository is not a trust decision. A project hook runs an
+  // arbitrary command, so it stays dormant until the user has looked at this
+  // checkout's hook file and accepted it.
+  const project = projectHooksTrusted(cwd) ? readFile(projectHooksFile(cwd)) : [];
+  return [...global, ...project];
+}
+
+function projectHooksFile(cwd: string): string {
+  return join(cwd, ".prometheus", "hooks.json");
+}
+
+/** Where the decision is recorded. Local to the machine, one entry per path. */
+function trustFile(): string {
+  return join(CONFIG_HOME, "trusted-hooks.json");
+}
+
+function readTrust(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(trustFile(), "utf8")) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [dir, hash] of Object.entries(parsed)) if (typeof hash === "string") out[dir] = hash;
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function hashFile(file: string): string {
+  try {
+    return createHash("sha256").update(readFileSync(file)).digest("hex").slice(0, 32);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Whether this checkout's project hooks may run.
+ *
+ * A boolean per folder is not enough: `git pull` can add a hook, and the user
+ * never approved that file. The recorded hash is of the hook file itself, so
+ * any change — a new entry, an edited command — asks again.
+ */
+export function projectHooksTrusted(cwd: string): boolean {
+  const file = projectHooksFile(cwd);
+  if (!existsSync(file)) return false;
+  const recorded = readTrust()[resolve(cwd)];
+  return Boolean(recorded) && recorded === hashFile(file);
+}
+
+/** Accept this checkout's hooks as they are now. */
+export function trustProjectHooks(cwd: string): void {
+  const file = projectHooksFile(cwd);
+  const hash = hashFile(file);
+  if (!hash) return;
+  const trust = readTrust();
+  trust[resolve(cwd)] = hash;
+  try {
+    mkdirSync(CONFIG_HOME, { recursive: true });
+    writeFileSync(trustFile(), JSON.stringify(trust, null, 2), "utf8");
+  } catch {
+    /* a trust file we cannot write means nothing runs, which is the safe side */
+  }
+}
+
+/** Withdraw a decision (the Settings page's "revoke" action). */
+export function revokeProjectHooks(cwd: string): void {
+  const trust = readTrust();
+  delete trust[resolve(cwd)];
+  try {
+    writeFileSync(trustFile(), JSON.stringify(trust, null, 2), "utf8");
+  } catch {
+    /* nothing to do */
+  }
+}
+
+export interface HookStatus {
+  file: string;
+  exists: boolean;
+  trusted: boolean;
+  /** What the project file asks to run, one line per hook. */
+  entries: { event: string; command: string }[];
+  global: number;
+}
+
+/** What the user needs to see before deciding whether to trust this checkout. */
+export function hooksStatus(cwd: string): HookStatus {
+  const file = projectHooksFile(cwd);
+  const exists = existsSync(file);
+  return {
+    file,
+    exists,
+    trusted: projectHooksTrusted(cwd),
+    entries: exists
+      ? readFile(file).map((hook) => ({ event: hook.event, command: hook.command }))
+      : [],
+    global: readFile(join(CONFIG_HOME, "hooks.json")).length,
+  };
 }
 
 export function hooksFor(hooks: Hook[], event: HookEvent, toolName = ""): Hook[] {

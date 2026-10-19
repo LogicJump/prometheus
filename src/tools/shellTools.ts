@@ -4,6 +4,9 @@ import { spawn } from "node:child_process";
 import type { Tool, ToolResult, TodoItem } from "../types.ts";
 import { resolveSafePath } from "../permissions.ts";
 import { SandboxError, classifyCommand, sandboxEnv, shellFor, type SandboxPolicy } from "../sandbox.ts";
+import { trimToolOutput } from "../context.ts";
+import { spillToolOutput } from "../spill.ts";
+import { jobContainmentSupported, killTree, openJob, type JobHandle } from "../winsandbox.ts";
 
 const DEFAULT_TIMEOUT = 120_000;
 
@@ -13,7 +16,7 @@ function sandboxHint(violations: string[]): string {
 }
 
 export { SandboxError };
-const MAX_OUTPUT = 30_000;
+const MAX_OUTPUT = 120_000;
 
 export const bashTool: Tool = {
   name: "bash",
@@ -31,7 +34,16 @@ export const bashTool: Tool = {
     required: ["command"],
     additionalProperties: false,
   },
-  summarize: (input) => String(input.description ?? input.command ?? "").slice(0, 120),
+  // The approval prompt has to show the command, not the model's description
+  // of it. `description` was preferred, so a call could say "run tests" and
+  // execute anything: the user approved a sentence, not a command line. The
+  // description is appended only as a trailing hint, after the real text.
+  summarize: (input) => {
+    const command = String(input.command ?? "").replace(/\s+/g, " ").trim();
+    const hint = typeof input.description === "string" && input.description.trim() ? ` — ${input.description.trim()}` : "";
+    return `${command.slice(0, 120)}${hint}`.slice(0, 200);
+  },
+  persistOutput: true,
   async execute(input, ctx): Promise<ToolResult> {
     const cwd = resolveSafePath(String(input.cwd ?? "."), ctx.cwd, ctx.config.allowedDirs);
     const command = String(input.command);
@@ -53,7 +65,7 @@ export const bashTool: Tool = {
       };
     }
 
-    return new Promise<ToolResult>((resolve) => {
+    return new Promise<ToolResult>(async (resolve) => {
       const { shell, args } = shellFor(command, policy);
       const child = spawn(shell, args, {
         cwd,
@@ -62,16 +74,65 @@ export const bashTool: Tool = {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
+      // The policy layer judges the command line; the job stops the process
+      // tree from outliving the call. A build that leaves a watcher running, or
+      // an install whose postinstall keeps going after the turn is aborted, was
+      // surviving because `child.kill()` only reaches the direct child.
+      //
+      // Assignment happens after the child exists, so a command that finishes
+      // in a few milliseconds can complete before the job is ready; that window
+      // is why `killAll` falls back to `taskkill /T` when no handle exists yet.
+      let job: JobHandle | null = null;
+      // Set when the tool is already finished, so a host that opens afterwards
+      // is closed instead of leaked. `openJob` spawns a PowerShell process per
+      // call; without this every fast command left one behind.
+      let done = false;
+      if (jobContainmentSupported() && policy.mode !== "off") {
+        void openJob()
+          .then(async (handle) => {
+            if (!handle) return;
+            if (done || !child.pid) {
+              handle.dispose();
+              return;
+            }
+            job = handle;
+            if (!handle.assign(child.pid)) {
+              handle.dispose();
+              job = null;
+            }
+          })
+          .catch(() => {
+            /* containment is optional; the direct kill still runs */
+          });
+      }
+
+      const killAll = () => {
+        // The job reaches grandchildren; the fallback does too through taskkill,
+        // but only while the direct child is still alive to anchor the tree.
+        if (job) job.terminate();
+        else killTree(child.pid);
+        try {
+          child.kill();
+        } catch {
+          /* already gone */
+        }
+      };
+
+      // Keep everything up to a generous cap and trim at the end instead of
+      // dropping the tail as it arrives: a compiler's error summary is the
+      // last thing it prints, and the old streaming cut removed exactly that.
       let output = "";
-      let truncated = false;
+      let dropped = 0;
       let settled = false;
       const append = (chunk: Buffer) => {
-        if (truncated) return;
-        output += chunk.toString("utf8");
-        if (output.length > MAX_OUTPUT) {
-          output = output.slice(0, MAX_OUTPUT);
-          truncated = true;
+        const text = chunk.toString("utf8");
+        if (output.length + text.length > MAX_OUTPUT) {
+          const room = MAX_OUTPUT - output.length;
+          output += text.slice(0, Math.max(0, room));
+          dropped += text.length - Math.max(0, room);
+          return;
         }
+        output += text;
       };
       child.stdout.on("data", append);
       child.stderr.on("data", append);
@@ -79,30 +140,44 @@ export const bashTool: Tool = {
       const finish = (result: ToolResult) => {
         if (settled) return;
         settled = true;
+        done = true;
         clearTimeout(timer);
         ctx.signal.removeEventListener("abort", onAbort);
+        // A finished command still has a live job handle. Closing it is what
+        // guarantees nothing it spawned is left behind.
+        if (job) {
+          job.terminate();
+          job.dispose();
+        }
         resolve(result);
       };
 
       const onAbort = () => {
-        child.kill();
+        killAll();
         finish({ isError: true, content: `${output}\n[interrupted]`.trim() });
       };
       ctx.signal.addEventListener("abort", onAbort, { once: true });
 
       const timer = setTimeout(() => {
-        child.kill();
+        killAll();
         finish({ isError: true, content: `${output}\n[timed out after ${timeout / 1000}s]`.trim() });
       }, timeout);
 
       child.on("error", (err) => finish({ isError: true, content: `Failed to run command: ${err.message}` }));
       child.on("close", (code) => {
-        const body = output || "(no output)";
-        const tail = truncated ? "\n[output truncated at 30k characters]" : "";
+        const body = output ? trimToolOutput(output, 30_000) : "(no output)";
+        const tail = dropped > 0 ? `\n[${dropped} more characters were not captured]` : "";
+        // The full output goes to disk when it is long, so a failure whose
+        // explanation sits past the cap can be read back instead of re-run.
+        const full = output;
+        const withPointer = (content: string): string => {
+          const path = spillToolOutput(ctx.sessionId ?? "", "bash", full);
+          return path ? `${content}\n\n[full output: ${path}]` : content;
+        };
         if (code === 0) {
-          finish({ content: `${body}${tail}`, display: `exit 0` });
+          finish({ content: withPointer(`${body}${tail}`), display: `exit 0` });
         } else {
-          finish({ isError: true, content: `${body}${tail}\n[exit code ${code}]`, display: `exit ${code}` });
+          finish({ isError: true, content: withPointer(`${body}${tail}\n[exit code ${code}]`), display: `exit ${code}` });
         }
       });
     });

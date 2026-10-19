@@ -31,6 +31,11 @@ export class JsonUi implements Ui {
   private thought = "";
   /** Set when a permission prompt arrives; headless runs cannot answer one. */
   denied = 0;
+  /**
+   * Always false: this UI has no one to ask. `Permissions` reads it so a
+   * refusal says "nobody to ask" rather than inventing a user denial.
+   */
+  readonly canPrompt = false;
 
   constructor(options: { stream?: boolean; out?: NodeJS.WriteStream } = {}) {
     this.stream = Boolean(options.stream);

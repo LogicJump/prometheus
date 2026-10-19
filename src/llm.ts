@@ -12,6 +12,14 @@ export interface ChatCompletionMessage {
   tool_calls?: ApiToolCall[];
   tool_call_id?: string;
   name?: string;
+  /**
+   * Reasoning from a previous assistant turn, echoed back.
+   *
+   * Never set unless `ChatClientOptions.echoReasoning` is on: an endpoint that
+   * does not know the field may reject the request, and the safe default is
+   * the shape every compatible server accepts.
+   */
+  reasoning_content?: string;
 }
 
 export interface ApiToolCall {
@@ -31,6 +39,8 @@ export interface ApiTool {
 
 export interface StreamResult {
   content: string;
+  /** Reasoning streamed by the model, kept so it can be echoed back in history. */
+  reasoning: string;
   toolCalls: ApiToolCall[];
   finishReason: string | null;
   usage: Usage;
@@ -43,6 +53,14 @@ export interface ChatClientOptions {
   maxTokens: number;
   /** "auto" leaves the endpoint default; low/medium/high are sent as reasoning_effort. */
   reasoningEffort?: "auto" | "low" | "medium" | "high";
+  /**
+   * Echo `reasoning_content` from earlier assistant turns back to the endpoint.
+   *
+   * On for providers whose tool loop needs the previous reasoning (DeepSeek
+   * style). Off by default: an unknown field is a new way for a strict gateway
+   * to answer 400, and only the provider that requires it should see it.
+   */
+  echoReasoning?: boolean;
   timeoutMs?: number;
 }
 
@@ -71,6 +89,26 @@ export class ChatClient {
     return headers;
   }
 
+  /**
+   * The messages as they go on the wire.
+   *
+   * `reasoning_content` is stored on the transcript for every model (so
+   * compaction and export can see it) but is stripped here unless the option
+   * is on. A gateway that does not know the field is within its rights to
+   * reject the whole request.
+   */
+  private outgoingMessages(messages: ChatCompletionMessage[]): ChatCompletionMessage[] {
+    if (this.options.echoReasoning) return messages;
+    let changed = false;
+    const out = messages.map((message) => {
+      if (message.role !== "assistant" || message.reasoning_content === undefined) return message;
+      changed = true;
+      const { reasoning_content: _drop, ...rest } = message;
+      return rest;
+    });
+    return changed ? out : messages;
+  }
+
   async chat(
     messages: ChatCompletionMessage[],
     tools: ApiTool[],
@@ -80,7 +118,7 @@ export class ChatClient {
   ): Promise<StreamResult> {
     const body: Record<string, unknown> = {
       model: this.options.model,
-      messages,
+      messages: this.outgoingMessages(messages),
       max_tokens: this.options.maxTokens,
       stream: this.stream,
     };
@@ -124,20 +162,28 @@ export class ChatClient {
   private async parseNonStreaming(res: Response): Promise<StreamResult> {
     const json = (await res.json()) as {
       choices?: {
-        message?: { content?: string | null; tool_calls?: ApiToolCall[] };
+        message?: { content?: string | null; tool_calls?: ApiToolCall[]; reasoning_content?: string | null; reasoning?: string | null };
         finish_reason?: string;
       }[];
-      usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } };
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        cache_read_input_tokens?: number;
+        prompt_tokens_details?: { cached_tokens?: number };
+        prompt_cache_hit_tokens?: number;
+        cached_tokens?: number;
+      };
     };
     const choice = json.choices?.[0];
     return {
       content: choice?.message?.content ?? "",
+      reasoning: choice?.message?.reasoning_content ?? choice?.message?.reasoning ?? "",
       toolCalls: choice?.message?.tool_calls ?? [],
       finishReason: choice?.finish_reason ?? null,
       usage: {
         inputTokens: json.usage?.prompt_tokens ?? 0,
         outputTokens: json.usage?.completion_tokens ?? 0,
-        cachedTokens: json.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+        cachedTokens: cachedTokensFrom(json.usage),
       },
     };
   }
@@ -153,6 +199,7 @@ export class ChatClient {
     const decoder = new TextDecoder();
     let buffer = "";
     let content = "";
+    let reasoning = "";
     let finishReason: string | null = null;
     const usage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
     const toolCalls = new Map<number, ApiToolCall>();
@@ -172,7 +219,14 @@ export class ChatClient {
           };
           finish_reason?: string | null;
         }[];
-        usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } };
+        usage?: {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          cache_read_input_tokens?: number;
+          prompt_tokens_details?: { cached_tokens?: number };
+          prompt_cache_hit_tokens?: number;
+          cached_tokens?: number;
+        };
       };
       try {
         chunk = JSON.parse(data);
@@ -183,14 +237,21 @@ export class ChatClient {
       if (chunk.usage) {
         usage.inputTokens = chunk.usage.prompt_tokens ?? usage.inputTokens;
         usage.outputTokens = chunk.usage.completion_tokens ?? usage.outputTokens;
-        usage.cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? usage.cachedTokens;
+        const cached = cachedTokensFrom(chunk.usage);
+        if (cached > 0) usage.cachedTokens = cached;
       }
 
       const choice = chunk.choices?.[0];
       if (!choice) return;
       const delta = choice.delta;
-      if (delta?.reasoning_content) onThinking(delta.reasoning_content);
-      if (delta?.reasoning) onThinking(delta.reasoning);
+      if (delta?.reasoning_content) {
+        reasoning += delta.reasoning_content;
+        onThinking(delta.reasoning_content);
+      }
+      if (delta?.reasoning) {
+        reasoning += delta.reasoning;
+        onThinking(delta.reasoning);
+      }
       if (delta?.content) {
         content += delta.content;
         onText(delta.content);
@@ -232,8 +293,37 @@ export class ChatClient {
         function: call.function,
       }));
 
-    return { content, toolCalls: calls, finishReason, usage };
+    return { content, reasoning, toolCalls: calls, finishReason, usage };
   }
+}
+
+/**
+ * Cached input tokens, across the field names the OpenAI-compatible ecosystem
+ * actually uses.
+ *
+ * Only one spelling was read (`prompt_tokens_details.cached_tokens`). DeepSeek
+ * reports `prompt_cache_hit_tokens`, Anthropic-style gateways report
+ * `cache_read_input_tokens`, and some proxies put `cached_tokens` at the top
+ * level. Missing them recorded a cache hit as zero, which made the Usage page
+ * overstate cost by several times for exactly the providers this client targets.
+ */
+function cachedTokensFrom(usage: {
+  prompt_tokens_details?: { cached_tokens?: number };
+  prompt_cache_hit_tokens?: number;
+  cache_read_input_tokens?: number;
+  cached_tokens?: number;
+} | undefined): number {
+  if (!usage) return 0;
+  const candidates = [
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.prompt_cache_hit_tokens,
+    usage.cache_read_input_tokens,
+    usage.cached_tokens,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  }
+  return 0;
 }
 
 export class ApiError extends Error {

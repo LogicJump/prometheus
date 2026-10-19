@@ -14,10 +14,12 @@
  * or checkpointing, and the loop never has to re-implement ordering.
  */
 
-import type { Config, Tool, ToolContext, ToolResult, TodoList } from "../types.ts";
+import type { Config, PermissionDetail, Tool, ToolContext, ToolResult, TodoList } from "../types.ts";
 import type { Ui, PermissionManager } from "../types.ts";
 import { captureBefore } from "../checkpoints.ts";
 import { hooksFor, runHooks, type Hook } from "../hooks.ts";
+import { diffFile } from "../diff.ts";
+import { withSpillPointer } from "../spill.ts";
 
 export interface PipelineDeps {
   config: Config;
@@ -80,6 +82,11 @@ export class ToolPipeline {
     this.deps = { ...deps, ui: { ...SILENT_UI, ...(deps.ui ?? {}) } };
   }
 
+  /** The current tool list, so the loop can tell which calls may run together. */
+  available(): Tool[] {
+    return this.tools();
+  }
+
   async run(name: string, rawArgs: string, signal: AbortSignal): Promise<PipelineOutcome> {
     const ui = this.deps.ui as Ui;
 
@@ -114,8 +121,12 @@ export class ToolPipeline {
 
     // 2. guard - hooks run first so a guard script can veto even in auto mode.
     if (!this.deps.trusted) {
+      // A file edit is approved on what it does, not on the path it names.
+      // The plan is computed here, before the write, with the same matching
+      // code the tool will run, so the diff shown is the diff that lands.
+      const detail = name === "edit_file" ? await this.editDetail(input) : undefined;
       try {
-        const verdict = await this.deps.permissions.check(tool, input);
+        const verdict = await this.deps.permissions.check(tool, input, detail);
         if (!verdict.allowed) {
           ui.toolEnd(name, false, verdict.reason ?? "denied");
           return { ok: false, content: `Error: ${verdict.reason ?? "permission denied"}. Do not retry; adjust your approach.` };
@@ -168,6 +179,7 @@ export class ToolPipeline {
       permissions: this.deps.permissions,
       ui,
       todo: this.deps.todos,
+      sessionId: this.deps.sessionId,
       runSubagent: this.deps.runSubagent,
       ...(this.deps.runSubagents ? { runSubagents: this.deps.runSubagents } : {}),
       ...(this.deps.runSubagentInBackground ? { runSubagentInBackground: this.deps.runSubagentInBackground } : {}),
@@ -186,6 +198,12 @@ export class ToolPipeline {
     // 5. settle
     ui.toolEnd(name, !result.isError, result.display ?? "");
     ui.toolOutput?.(name, result.content);
+    // A tool that may produce a very long result keeps the whole thing on disk
+    // and names the file, so a truncated message is not a dead end.
+    let content = result.content;
+    if (tool.persistOutput && this.deps.sessionId) {
+      content = withSpillPointer(result, this.deps.sessionId, name, result.content).content;
+    }
     // A structured result goes to a UI that can render it; the transcript text
     // above is still what the model reads, so this is additive and optional.
     if (result.data !== undefined) ui.toolDetail?.(name, result.data);
@@ -202,7 +220,25 @@ export class ToolPipeline {
         if (noise) ui.toolOutput?.(name, noise);
       }
     }
-    return { ok: !result.isError, content: result.isError ? `Error: ${result.content}` : result.content };
+    return { ok: !result.isError, content: result.isError ? `Error: ${content}` : content };
+  }
+
+  /**
+   * The diff an `edit_file` approval is about.
+   *
+   * Absent when it cannot be computed; the approval then falls back to the
+   * plain summary and the tool reports its own error after the answer.
+   */
+  private async editDetail(input: Record<string, unknown>): Promise<PermissionDetail | undefined> {
+    try {
+      const { planEdit } = await import("./fileTools.ts");
+      const plan = await planEdit(input, this.deps.cwd, this.deps.config.allowedDirs ?? []);
+      if (typeof plan === "string") return undefined;
+      const summary = diffFile(plan.path, plan.before, plan.after);
+      return { path: plan.path, before: plan.before, after: plan.after, additions: summary.additions, deletions: summary.deletions };
+    } catch {
+      return undefined;
+    }
   }
 }
 

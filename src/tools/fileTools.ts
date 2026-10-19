@@ -146,58 +146,72 @@ export const editFileTool: Tool = {
     return `${input.path ?? ""}${typeof count === "number" && count > 1 ? ` (${count} edits)` : ""}`;
   },
   async execute(input, ctx): Promise<ToolResult> {
+    const plan = await planEdit(input, ctx.cwd, ctx.config.allowedDirs);
+    if (typeof plan === "string") return { isError: true, content: plan };
     const abs = resolveSafePath(String(input.path), ctx.cwd, ctx.config.allowedDirs);
-    const specs = collectEdits(input);
-    if (typeof specs === "string") return { isError: true, content: specs };
+    const { writeTextFile: write } = await import("./fsUtil.ts");
+    await write(abs, plan.after);
 
-    const { readTextFile: read, writeTextFile: write } = await import("./fsUtil.ts");
-    const before = await read(abs);
-    let text = before;
-    const applied: AppliedEdit[] = [];
-
-    for (let index = 0; index < specs.length; index++) {
-      const spec = specs[index];
-      if (!spec.old_string) return { isError: true, content: `edit ${index + 1}: old_string must not be empty` };
-      if (spec.old_string === spec.new_string) {
-        return { isError: true, content: `edit ${index + 1}: old_string and new_string are identical` };
-      }
-
-      const found = findMatch(text, spec.old_string, Boolean(spec.replace_all));
-      if (!found.ok) {
-        const where = found.failure.candidates.length > 0 ? ` Closest lines: ${found.failure.candidates.join(", ")}.` : "";
-        const verdict = found.failure.reason === "ambiguous" ? "ambiguous" : "not found";
-        return {
-          isError: true,
-          content: `edit ${index + 1} failed in ${input.path}: ${verdict} - ${found.failure.message}.${where} Nothing was written; re-read the file and retry.`,
-        };
-      }
-
-      const { match } = found;
-      const replacement = match.rung === "indent" ? reindent(match.matchedText, spec.old_string, spec.new_string) : spec.new_string;
-      if (spec.replace_all) {
-        const occurrences = text.split(match.matchedText).length - 1;
-        text = text.split(match.matchedText).join(replacement);
-        applied.push({ rung: match.rung, occurrences });
-      } else {
-        text = `${text.slice(0, match.start)}${replacement}${text.slice(match.end)}`;
-        applied.push({ rung: match.rung, occurrences: 1 });
-      }
-    }
-
-    if (text === before) return { content: `No change to ${input.path}.`, display: "unchanged" };
-    await write(abs, text);
-
-    const summary = diffFile(relPath(abs, ctx.cwd), before, text);
-    const rungs = [...new Set(applied.map((entry) => entry.rung))];
-    const softened = rungs.filter((rung) => rung !== "exact");
+    const summary = diffFile(relPath(abs, ctx.cwd), plan.before, plan.after);
+    const softened = plan.rungs.filter((rung) => rung !== "exact");
     return {
       content:
-        `Edited ${relPath(abs, ctx.cwd)}: +${summary.additions} -${summary.deletions} in ${applied.length} edit(s).` +
+        `Edited ${relPath(abs, ctx.cwd)}: +${summary.additions} -${summary.deletions} in ${plan.rungs.length} edit(s).` +
         (softened.length ? ` Matching was tolerant on: ${softened.join(", ")}.` : ""),
       display: `+${summary.additions} -${summary.deletions}${softened.length ? ` (${softened.join("/")})` : ""}`,
     };
   },
 };
+
+/**
+ * The file edit_file would produce, computed without writing anything.
+ *
+ * Permissions needs this before it asks: approving `edit_file: src/app.ts`
+ * without seeing the change is not a decision, it is a formality. Running the
+ * same matching code twice (once for the prompt, once for the write) is the
+ * price of not writing before the user says yes; the function is pure, so the
+ * second run cannot disagree with the first.
+ */
+export async function planEdit(
+  input: Record<string, unknown>,
+  cwd: string,
+  allowedDirs: string[],
+): Promise<{ path: string; before: string; after: string; rungs: string[] } | string> {
+  const abs = resolveSafePath(String(input.path), cwd, allowedDirs);
+  const specs = collectEdits(input);
+  if (typeof specs === "string") return specs;
+
+  const { readTextFile: read } = await import("./fsUtil.ts");
+  const before = await read(abs);
+  let text = before;
+  const rungs: string[] = [];
+
+  for (let index = 0; index < specs.length; index++) {
+    const spec = specs[index];
+    if (!spec.old_string) return `edit ${index + 1}: old_string must not be empty`;
+    if (spec.old_string === spec.new_string) {
+      return `edit ${index + 1}: old_string and new_string are identical`;
+    }
+
+    const found = findMatch(text, spec.old_string, Boolean(spec.replace_all));
+    if (!found.ok) {
+      const where = found.failure.candidates.length > 0 ? ` Closest lines: ${found.failure.candidates.join(", ")}.` : "";
+      const verdict = found.failure.reason === "ambiguous" ? "ambiguous" : "not found";
+      return `edit ${index + 1} failed in ${input.path}: ${verdict} - ${found.failure.message}.${where} Nothing was written; re-read the file and retry.`;
+    }
+
+    const { match } = found;
+    const replacement = match.rung === "indent" ? reindent(match.matchedText, spec.old_string, spec.new_string) : spec.new_string;
+    if (spec.replace_all) {
+      text = text.split(match.matchedText).join(replacement);
+    } else {
+      text = `${text.slice(0, match.start)}${replacement}${text.slice(match.end)}`;
+    }
+    rungs.push(match.rung);
+  }
+
+  return { path: relPath(abs, cwd), before, after: text, rungs };
+}
 
 /** Turn the three accepted input shapes into one ordered list of edits. */
 function collectEdits(input: Record<string, unknown>): EditSpec[] | string {
