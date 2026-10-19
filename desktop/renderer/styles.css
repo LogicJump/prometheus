@@ -182,6 +182,9 @@ svg {
   background: var(--sidebar);
   border-right: 1px solid var(--border);
   padding: 0 10px 10px;
+  /* The single left edge for every row in this column. Declared here so the
+     header and the button row below it read the same number. */
+  --rail-inset: 12px;
   -webkit-app-region: drag;
   transition: width 180ms ease, flex-basis 180ms ease, padding 180ms ease;
 }
@@ -205,18 +208,22 @@ svg {
   pointer-events: none;
 }
 
+/* 侧栏的一条对齐线：logo 的左边距和上边距是同一个数。
+ *
+ * 这里曾经用三个不同的数算同一件事：头部横向补到 14px，纵向靠
+ * `(height - 22px) / 2` 居中，而侧栏顶部 padding 是 0 —— 结果是 logo
+ * 距左 14px、距顶 2px，纵向几乎贴边。它下面的「新建对话」又落在 12px。
+ *
+ * 现在只有一个变量 --rail-inset：侧栏自带 10px 横向 padding，头部再补
+ * 2px，logo 左缘就是 12px；上padding 取同一个 12px。按钮行也用同一个
+ * 变量，所以整列共用一条左缘，改侧栏 padding 不会让它们重新错开。 */
 .sidebar-head {
-  /* 图标到上边、到左边的距离必须是同一个数。它不是"某个值写错了"，
-     而是水平内边距和垂直居中本来就是两套算法：左边是 padding 给的，
-     上边是 (高度 − 图标高) / 2 算出来的。只要两者分开写，改高度或改
-     图标尺寸就会再次失配。所以这里让垂直间距由同一个变量推导。 */
-  --head-gap: 14px;
-  height: calc(var(--mark-size) + var(--head-gap) * 2);
+  /* 侧栏横向已有 10px，这里只补差，让 logo 左缘落在 --rail-inset 上；
+     上下用同一个数，所以「左侧」和「顶部」的距离相等。 */
+  padding: var(--rail-inset) calc(var(--rail-inset) - 10px);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  /* 侧栏本身有 10px 左内边距，所以这里补到 --head-gap。 */
-  padding: 0 4px 0 calc(var(--head-gap) - 10px);
 }
 
 .sidebar-head-actions {
@@ -245,7 +252,9 @@ svg {
 }
 
 .sidebar-actions {
-  padding: 2px 2px 6px;
+  /* Same left edge as the logo: the sidebar already contributes 10px, so this
+     only makes up the difference to --rail-inset. */
+  padding: 2px calc(var(--rail-inset) - 10px) 6px;
 }
 
 .new-chat {

@@ -166,7 +166,24 @@ export class Permissions implements PermissionManager {
       this.audit(tool, summary, "denied");
       return { allowed: false, reason: "the user denied this tool call" };
     }
-    if (answer === "always") this.always.add(tool);
+    if (answer === "always") {
+      // Persist, not just remember. A session-level Set used to be the whole
+      // story, which meant "always allow" silently expired with the window and
+      // the Settings page's Saved approvals list could never fill up.
+      //
+      // The rule matches the exact summary the user saw (a path, a command
+      // line) rather than the whole tool: "always allow rm" is not a preference
+      // anyone means to express by approving one `rm build/`. A tool with no
+      // summary is safely tool-wide, because there is nothing to narrow to.
+      this.always.add(tool);
+      try {
+        ruleFromChoice(tool, summary, "project", process.cwd(), "always-detail");
+        this.rules.push(...rulesFor(process.cwd()).slice(this.rules.length));
+      } catch {
+        /* A rule file that cannot be written must not block the approval the
+           user just gave; the in-memory grant still applies to this session. */
+      }
+    }
     this.audit(tool, summary, answer === "always" ? "allowed (always)" : "allowed");
     return { allowed: true };
   }
