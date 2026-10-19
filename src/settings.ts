@@ -7,8 +7,9 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { CONFIG_HOME } from "./config.ts";
+import type { BoardSelection } from "./types.ts";
 
 export type ThemePreference = "dark" | "light" | "system";
 
@@ -67,22 +68,60 @@ export interface EditableConfig {
   maxTokens?: number;
   contextWindow?: number;
   fallbackModels?: string[];
+  board?: BoardSelection | null;
 }
 
-/** Merge the given fields into ~/.prometheus/config.json, preserving everything else. */
-export function writeConfigFile(patch: EditableConfig): void {
-  mkdirSync(CONFIG_HOME, { recursive: true });
+/**
+ * Merge the given fields into a config.json, preserving everything else.
+ *
+ * A `null` value deletes the key, which is how the UI clears a board
+ * selection; `undefined` and `""` leave it alone so that a patch built from a
+ * partially filled form cannot erase settings it did not mean to touch.
+ */
+export function mergeConfigFile(path: string, patch: object): void {
+  mkdirSync(dirname(path), { recursive: true });
   let existing: Record<string, unknown> = {};
   try {
-    if (existsSync(CONFIG_FILE)) existing = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+    if (existsSync(path)) existing = JSON.parse(readFileSync(path, "utf8"));
   } catch {
     existing = {};
   }
   for (const [key, value] of Object.entries(patch)) {
-    if (value === undefined || value === null || value === "") continue;
+    if (value === null) {
+      delete existing[key];
+      continue;
+    }
+    if (value === undefined || value === "") continue;
     existing[key] = value;
   }
-  writeFileSync(CONFIG_FILE, JSON.stringify(existing, null, 2), "utf8");
+  writeFileSync(path, JSON.stringify(existing, null, 2), "utf8");
+}
+
+/** Merge the given fields into ~/.prometheus/config.json, preserving everything else. */
+export function writeConfigFile(patch: EditableConfig): void {
+  mergeConfigFile(CONFIG_FILE, patch);
+}
+
+/**
+ * Where a board selection belongs.
+ *
+ * A project that already carries `.prometheus/config.json` has stated its own
+ * settings, and `loadConfig` merges that file over the global one. Writing the
+ * selection to the global file in that case would look like it worked and be
+ * silently overridden on the next load, so the project file wins here too.
+ */
+export function boardConfigPath(cwd?: string): string {
+  if (cwd) {
+    const project = join(cwd, ".prometheus", "config.json");
+    if (existsSync(project)) return project;
+  }
+  return CONFIG_FILE;
+}
+
+export function writeBoardConfig(selection: BoardSelection | null, cwd?: string): string {
+  const path = boardConfigPath(cwd);
+  mergeConfigFile(path, { board: selection });
+  return path;
 }
 
 /** Mask a key for display: keep the first 4 and last 4 characters. */

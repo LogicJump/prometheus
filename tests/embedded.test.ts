@@ -8,10 +8,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { parseDiagnostics, sortDiagnostics, summarizeDiagnostics, collapseCascades } from "../src/embedded/diagnostics.ts";
 import { detectProject, buildCommand } from "../src/embedded/project.ts";
 import { matchTarget, parsePyocdTargets, pyocdProbes } from "../src/embedded/probe.ts";
-import { capture, parseLine } from "../src/embedded/serial.ts";
+import { capture, parseLine, windowsSerialScript } from "../src/embedded/serial.ts";
 import { classifyOutput, commandFor, flash, parseSize, validate } from "../src/embedded/flash.ts";
 import { findArtifacts } from "../src/embedded/build.ts";
 import { miFields, miList, parseMiLine, parseStackFrames, parseStopReason, parseVariables, SERVER_PORTS, serverCommand } from "../src/embedded/debug.ts";
@@ -253,6 +254,56 @@ test("an attached probe yields name, serial and target", () => {
   assert.equal(probes[0].target, "STM32F412RETx");
 });
 
+test("the table header and rule are not probes", () => {
+  // Real output, CRLF and all. The header used to survive as a probe named
+  // "#" attached to a chip called "Probe/Board".
+  const output =
+    "  #   Probe/Board    Unique ID                  Target  \r\n" +
+    "--------------------------------------------------------\r\n" +
+    "  0   STM32 STLink   37FF71064E573436C88F1A43   n/a     \r\n";
+  const probes = pyocdProbes(output);
+  assert.equal(probes.length, 1);
+  assert.equal(probes[0].name, "STM32 STLink");
+  assert.equal(probes[0].serial, "37FF71064E573436C88F1A43");
+  // `n/a` is the absence of a target, not a target.
+  assert.equal(probes[0].target, undefined);
+});
+
+test("the Windows serial script is valid PowerShell", () => {
+  // This is the test that would have caught the original bug: the script used
+  // to be joined with "; ", which produces `while($true){; try {...}; catch ...`
+  // and PowerShell rejects a catch that does not follow the closing brace.
+  // Nothing else in the suite ran real PowerShell, so serial capture shipped
+  // broken on Windows.
+  const script = windowsSerialScript(false);
+  assert.equal(script.includes("}; catch"), false);
+
+  const powershell = process.platform === "win32" ? "powershell" : null;
+  if (!powershell) return;
+  // Encode as UTF-16LE base64: the script contains newlines and braces, and
+  // -EncodedCommand is the only spelling that survives quoting intact.
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const probe = spawnSync(
+    powershell,
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `$errors=$null; $null=[System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}')), [ref]$null, [ref]$errors); if ($errors.Count) { $errors | ForEach-Object { $_.Message }; exit 1 }`,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(probe.status, 0, `PowerShell rejected the serial script:\n${probe.stdout}${probe.stderr}`);
+});
+
+test("the serial script reads raw bytes, not lines", () => {
+  // ReadLine discards its buffer on every timeout, which is how a firmware
+  // printing without a newline lost data in 500 ms slices.
+  const script = windowsSerialScript(false);
+  assert.equal(script.includes("BaseStream.Read"), true);
+  assert.equal(script.includes("ReadLine"), false);
+});
+
 // ---- serial ----------------------------------------------------------------
 
 test("the four console formats parse into level, tag and timestamp", () => {
@@ -380,7 +431,10 @@ test("a flash is refused before running when it would be ambiguous", () => {
 
 test("the command vector matches what each tool actually expects", () => {
   const pyocd = commandFor({ kind: "pyocd", program: "pyocd", firmware: "fw.elf", target: "stm32f412xe" });
-  assert.deepEqual(pyocd, ["flash", "-f", "fw.elf", "--target", "stm32f412xe"]);
+  // The image is positional; pyOCD's -f is --frequency (the SWD clock), and
+  // handing it a filename aborts the command before the probe is touched.
+  assert.deepEqual(pyocd, ["flash", "fw.elf", "--target", "stm32f412xe"]);
+  assert.equal(pyocd.includes("-f"), false);
 
   const openocd = commandFor({
     kind: "openocd",

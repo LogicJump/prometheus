@@ -249,6 +249,14 @@
                         <button role="menuitemradio" data-effort="high" data-i18n="effortHigh">High</button>
                       </div>
                     </div>
+                    <div class="board-control" id="board-control" hidden>
+                      <button class="chip-button board-picker" id="board-picker" aria-haspopup="menu" aria-expanded="false">
+                        <span class="chip-key" data-i18n="boardChipLabel">Board</span>
+                        <span id="board-chip-value">—</span>
+                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                      </button>
+                      <div class="board-menu" id="board-menu" role="menu" hidden></div>
+                    </div>
                   </div>
                   <div class="meter" id="usage-meter" tabindex="0" role="button" aria-haspopup="dialog" aria-expanded="false" data-i18n-title="usageTitle">
                     <span id="context-label">0%</span>
@@ -293,6 +301,8 @@
                 <button role="tab" data-pane="history" data-i18n="tabHistory">History</button>
                 <button role="tab" data-pane="artifact" data-i18n="tabArtifacts">Artifacts</button>
                 <button role="tab" data-pane="terminal" data-i18n="paneTerminal">Terminal</button>
+                <button role="tab" data-pane="board" data-i18n="paneBoard">Board</button>
+                <button role="tab" data-pane="serial" data-i18n="paneSerial">Serial</button>
                 <button role="tab" data-pane="browser" data-i18n="paneBrowser">Browser</button>
               </div>
               <div class="workbench-meta" id="workbench-meta"></div>
@@ -359,6 +369,52 @@
                   />
                   <button class="btn btn-quiet small" id="terminal-restart" data-i18n="terminalRestart">Restart</button>
                 </div>
+              </div>
+              <div class="board-root" id="board-root" hidden>
+                <div class="board-toolbar">
+                  <button class="btn btn-quiet small" id="board-refresh" data-i18n="boardRefresh">Refresh</button>
+                  <button class="btn btn-quiet small" id="board-load-targets" data-i18n="boardLoadTargets">Load targets</button>
+                </div>
+                <div class="board-body" id="board-body"></div>
+              </div>
+              <div class="serial-root" id="serial-root" hidden>
+                <div class="serial-toolbar">
+                  <label class="serial-field">
+                    <span class="serial-field-key" data-i18n="serialPort">Port</span>
+                    <select class="serial-select" id="serial-port"></select>
+                  </label>
+                  <label class="serial-field">
+                    <span class="serial-field-key" data-i18n="serialBaud">Baud</span>
+                    <select class="serial-select" id="serial-baud"></select>
+                  </label>
+                  <span class="serial-spacer"></span>
+                  <button class="btn btn-primary small" id="serial-toggle" data-i18n="serialStart">Start</button>
+                </div>
+                <div class="serial-toolbar serial-toolbar-controls">
+                  <div class="serial-filter" id="serial-filter" role="radiogroup" aria-label="Filter">
+                    <button role="radio" data-filter="all" class="active" data-i18n="serialFilterAll">All</button>
+                    <button role="radio" data-filter="warn" data-i18n="serialFilterWarn">Warnings</button>
+                    <button role="radio" data-filter="error" data-i18n="serialFilterError">Errors</button>
+                  </div>
+                  <span class="serial-spacer"></span>
+                  <button class="icon-button small" id="serial-pause" data-i18n-title="serialPause">
+                    <svg class="icon" aria-hidden="true"><use href="#i-pause"></use></svg>
+                  </button>
+                  <button class="icon-button small" id="serial-clear" data-i18n-title="serialClear">
+                    <svg class="icon" aria-hidden="true"><use href="#i-trash"></use></svg>
+                  </button>
+                  <button class="icon-button small" id="serial-export" data-i18n-title="serialExport">
+                    <svg class="icon" aria-hidden="true"><use href="#i-download"></use></svg>
+                  </button>
+                  <button class="serial-follow" id="serial-follow" aria-pressed="true" data-i18n-title="serialFollow">
+                    <svg class="icon" aria-hidden="true"><use href="#i-pin"></use></svg>
+                    <span data-i18n="serialFollowLabel">Follow</span>
+                  </button>
+                </div>
+                <div class="serial-status-row">
+                  <span class="serial-status" id="serial-status"></span>
+                </div>
+                <div class="serial-output" id="serial-output" tabindex="0"></div>
               </div>
               <div class="artifact-root" id="artifact-root" hidden></div>
               <div class="browser-root" id="browser-root" hidden>

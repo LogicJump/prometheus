@@ -186,6 +186,9 @@ export class ToolPipeline {
     // 5. settle
     ui.toolEnd(name, !result.isError, result.display ?? "");
     ui.toolOutput?.(name, result.content);
+    // A structured result goes to a UI that can render it; the transcript text
+    // above is still what the model reads, so this is additive and optional.
+    if (result.data !== undefined) ui.toolDetail?.(name, result.data);
     if (!this.deps.trusted) {
       const postHooks = hooksFor(this.deps.hooks, "PostToolUse", name);
       if (postHooks.length > 0) {

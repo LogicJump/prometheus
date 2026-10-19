@@ -20,7 +20,7 @@ contextBridge.exposeInMainWorld("prometheus", {
     return () => ipcRenderer.removeListener("window-state", listener);
   },
   restartHost: () => ipcRenderer.send("host-restart"),
-  saveFile: (suggestedName, content) => ipcRenderer.invoke("save-file", { suggestedName, content }),
+  saveFile: (suggestedName, content, filters) => ipcRenderer.invoke("save-file", { suggestedName, content, filters }),
   browserOpen: (url) => ipcRenderer.invoke("browser-open", url),
   browserBounds: (bounds) => ipcRenderer.invoke("browser-bounds", bounds),
   browserNavigate: (action, arg) => ipcRenderer.invoke("browser-navigate", action, arg),

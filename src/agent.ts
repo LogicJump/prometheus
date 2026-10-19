@@ -136,6 +136,19 @@ export class Agent {
           ? "- Explain the reasoning behind non-obvious changes in a short paragraph, naming the tradeoff you chose."
           : "";
 
+    // The board the user picked, described in whatever terms they set. Nothing
+    // here assumes a vendor or a part: a selection may name only a port, only a
+    // target, or both, and the sentence is built from whatever is present.
+    const board = this.config.board ?? {};
+    const boardParts = [
+      board.target ? `target ${board.target}` : "",
+      board.port ? `port ${board.port}${board.baud ? ` at ${board.baud} baud` : ""}` : "",
+      board.flasher ? `flasher ${board.flasher}` : "",
+    ].filter(Boolean);
+    const boardNote = boardParts.length
+      ? `\n- Board selected in the Board pane: ${boardParts.join(", ")}. embed_flash, embed_serial and embed_debug use it when you omit the matching argument; an explicit argument still wins.`
+      : "";
+
     return `You are Prometheus, a general-purpose software engineering agent running in a terminal.
 
 # Environment
@@ -144,6 +157,7 @@ export class Agent {
 - Shell: ${process.platform === "win32" ? "cmd.exe via Git Bash-compatible invocations" : "/bin/sh"}
 - Model: ${this.config.model}
 - ${modeNote}
+${boardNote}
 
 # How to work
 - Read before you write. Never guess file contents; inspect them.

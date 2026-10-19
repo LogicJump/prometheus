@@ -16,7 +16,7 @@
  *   - A build that produced no artifact does not silently proceed to flash.
  */
 
-import type { Tool, ToolContext, ToolResult } from "../types.ts";
+import type { BoardSelection, Tool, ToolContext, ToolResult } from "../types.ts";
 import { toolEnv } from "../embedded/toolEnv.ts";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -75,6 +75,23 @@ function flasherHint(paths: Partial<Record<FlasherKind, string>>): string {
     : "None installed. pyOCD (pip install pyocd) or probe-rs (cargo install probe-rs-tools) are the easiest starting points.";
 }
 
+/** The board the user selected in the Board pane, or an empty object. */
+function selectedBoard(ctx: ToolContext): BoardSelection {
+  return ctx.config.board ?? {};
+}
+
+/**
+ * An explicit argument wins over the pane selection, and the selection wins
+ * over nothing at all.
+ *
+ * Only three tools consult this, because only these three do something whose
+ * meaning depends on which board is attached. `embed_build` takes a Zephyr
+ * board name, which is a different namespace from the flasher's chip name.
+ */
+function useBoard<T>(explicit: T | undefined, fromBoard: T | undefined): T | undefined {
+  return explicit !== undefined ? explicit : fromBoard;
+}
+
 // ---- embed_build -----------------------------------------------------------
 
 const buildTool: Tool = {
@@ -113,6 +130,16 @@ const buildTool: Tool = {
       ...(result.ok ? {} : { isError: true }),
       content,
       display: result.ok ? `built in ${(result.durationMs / 1000).toFixed(1)}s` : "build failed",
+      data: {
+        ok: result.ok,
+        ...(result.usage ? { usage: { flash: result.usage.flash, ram: result.usage.ram } } : {}),
+        artifacts: result.artifacts.map((artifact) => ({
+          path: artifact.relative,
+          bytes: artifact.bytes,
+          kind: artifact.kind,
+        })),
+        diagnostics: result.diagnostics.length,
+      },
     };
   },
 };
@@ -166,7 +193,20 @@ const targetsTool: Tool = {
       lines.push(`  ${target.name}  ${target.vendor}${target.part && target.part !== target.name ? ` / ${target.part}` : ""}`);
     }
 
-    return { content: lines.join("\n"), display: `${probes.probes.length} probe(s), ${targets.total} targets` };
+    return {
+      content: lines.join("\n"),
+      display: `${probes.probes.length} probe(s), ${targets.total} targets`,
+      data: {
+        project: project.kind,
+        toolchains: {
+          found: report.tools.map((entry) => ({ kind: entry.kind, version: entry.version ?? null })),
+          missing: report.missing,
+        },
+        probes: probes.probes,
+        ports,
+        targets: { total: targets.total, notes: targets.notes },
+      },
+    };
   },
 };
 
@@ -175,7 +215,7 @@ const targetsTool: Tool = {
 const flashTool: Tool = {
   name: "embed_flash",
   description:
-    "Write firmware to the attached board and verify it. Build first — this does not build. Returns whether the write succeeded, whether the tool verified it, and the exact command. Refuses when no probe is attached, when the target is ambiguous, or when a raw .bin is given without a load address.",
+    "Write firmware to the attached board and verify it. Build first — this does not build. Returns whether the write succeeded, whether the tool verified it, and the exact command. Refuses when no probe is attached, when the target is ambiguous, or when a raw .bin is given without a load address. Defaults to the board selected in the Board pane when omitted.",
   readonly: false,
   parameters: {
     type: "object",
@@ -194,8 +234,10 @@ const flashTool: Tool = {
   },
   summarize: (input) => String(input.firmware ?? ""),
   async execute(input, ctx): Promise<ToolResult> {
+    const board = selectedBoard(ctx);
     const { paths } = await flasherPaths();
-    const kind = chooseFlasher(input.flasher ? String(input.flasher) : undefined, paths);
+    const requestedFlasher = useBoard(input.flasher ? String(input.flasher) : undefined, board.flasher);
+    const kind = chooseFlasher(requestedFlasher, paths);
     if (!kind) {
       return {
         isError: true,
@@ -223,13 +265,15 @@ const flashTool: Tool = {
       }
     }
 
+    const target = useBoard(input.target ? String(input.target) : undefined, board.target);
+    const probe = useBoard(input.probe ? String(input.probe) : undefined, board.probe);
     const result = await flash({
       kind,
       program,
       firmware: String(input.firmware),
-      ...(input.target ? { target: String(input.target) } : {}),
+      ...(target ? { target } : {}),
       ...(input.address !== undefined ? { address: Number(input.address) } : {}),
-      ...(input.probe ? { probe: String(input.probe) } : {}),
+      ...(probe ? { probe } : {}),
       ...(input.interface_config ? { interfaceConfig: String(input.interface_config) } : {}),
       ...(input.target_config ? { targetConfig: String(input.target_config) } : {}),
       ...(input.reset !== undefined ? { reset: Boolean(input.reset) } : {}),
@@ -246,6 +290,13 @@ const flashTool: Tool = {
       ...(result.ok ? {} : { isError: true }),
       content: lines.join("\n"),
       display: result.ok ? "flashed" : "flash failed",
+      data: {
+        ok: result.ok,
+        ...(result.verified !== undefined ? { verified: result.verified } : {}),
+        ...(target ? { target } : {}),
+        firmware: String(input.firmware),
+        durationMs: result.durationMs,
+      },
     };
   },
 };
@@ -255,7 +306,7 @@ const flashTool: Tool = {
 const serialTool: Tool = {
   name: "embed_serial",
   description:
-    "Read the board's serial console for a bounded time and return parsed log lines with timestamps, levels and tags. Use it to see whether the firmware booted, to catch a panic, or to wait for a readiness message. The read always stops: on the timeout, on a matching pattern, or at a line cap.",
+    "Read the board's serial console for a bounded time and return parsed log lines with timestamps, levels and tags. Use it to see whether the firmware booted, to catch a panic, or to wait for a readiness message. The read always stops: on the timeout, on a matching pattern, or at a line cap. Defaults to the board selected in the Board pane when omitted.",
   readonly: true,
   parameters: {
     type: "object",
@@ -275,9 +326,10 @@ const serialTool: Tool = {
     additionalProperties: false,
   },
   summarize: (input) => String(input.port ?? "serial"),
-  async execute(input, _ctx): Promise<ToolResult> {
+  async execute(input, ctx): Promise<ToolResult> {
+    const board = selectedBoard(ctx);
     const ports = await listSerialPorts();
-    let port = input.port ? String(input.port) : undefined;
+    let port = useBoard(input.port ? String(input.port) : undefined, board.port);
     if (!port) {
       if (ports.length === 0) {
         return { isError: true, content: "No serial ports found. Is the board plugged in?", display: "no port" };
@@ -304,10 +356,11 @@ const serialTool: Tool = {
     }
 
     const timeoutMs = Math.min(60_000, Math.max(100, Number(input.timeout_ms ?? 5000)));
-    const assertDtr = Boolean(input.reset_on_connect);
-    const result = await capture((path, baud) => openPort(path, baud, { assertDtr }), port, {
+    const baud = Number(useBoard(input.baud !== undefined ? Number(input.baud) : undefined, board.baud) ?? 115200);
+    const assertDtr = Boolean(useBoard(input.reset_on_connect !== undefined ? Boolean(input.reset_on_connect) : undefined, board.assertDtr));
+    const result = await capture((path, rate) => openPort(path, rate, { assertDtr }), port, {
       timeoutMs,
-      baud: Number(input.baud ?? 115200),
+      baud,
       ...(until ? { until } : {}),
       ...(input.max_lines !== undefined ? { maxLines: Number(input.max_lines) } : {}),
     });
@@ -326,7 +379,21 @@ const serialTool: Tool = {
     if (lines.length > 500) body.push(`… and ${lines.length - 500} more`);
     if (result.errors.length) body.push(`errors: ${result.errors.join("; ")}`);
 
-    return { content: body.join("\n"), display: `${lines.length} line(s)` };
+    return {
+      content: body.join("\n"),
+      display: `${lines.length} line(s)`,
+      data: {
+        port,
+        baud,
+        lines: lines.length,
+        matched: result.matched,
+        timedOut: result.timedOut,
+        levels: {
+          error: lines.filter((line) => line.level === "error").length,
+          warn: lines.filter((line) => line.level === "warn").length,
+        },
+      },
+    };
   },
 };
 
@@ -390,7 +457,7 @@ const projectTool: Tool = {
 const debugTool: Tool = {
   name: "embed_debug",
   description:
-    "Start a debug session on the attached board: halt at a breakpoint, read the call stack, inspect variables, step, and continue. Starts the probe's GDB server itself (OpenOCD, pyOCD, probe-rs or J-Link) and drives GDB over its machine interface. Returns structured frames and variables, not GDB's formatted text. Use it when the firmware runs but misbehaves — a wrong value, a hang, a hard fault — instead of adding print statements.",
+    "Start a debug session on the attached board: halt at a breakpoint, read the call stack, inspect variables, step, and continue. Starts the probe's GDB server itself (OpenOCD, pyOCD, probe-rs or J-Link) and drives GDB over its machine interface. Returns structured frames and variables, not GDB's formatted text. Use it when the firmware runs but misbehaves — a wrong value, a hang, a hard fault — instead of adding print statements. Defaults to the target selected in the Board pane when omitted.",
   readonly: false,
   parameters: {
     type: "object",
@@ -413,6 +480,8 @@ const debugTool: Tool = {
   },
   summarize: (input) => String(input.action ?? "debug"),
   async execute(input, ctx): Promise<ToolResult> {
+    const board = selectedBoard(ctx);
+    const target = useBoard(input.target ? String(input.target) : undefined, board.target);
     const elf = String(input.elf);
     const { paths } = await flasherPaths();
     const gdb = await gdbPath();
@@ -437,7 +506,7 @@ const debugTool: Tool = {
         return { isError: true, content: `${serverKind} is not installed.`, display: "no server" };
       }
       const command = serverCommand(serverKind, program, {
-        ...(input.target ? { target: String(input.target) } : {}),
+        ...(target ? { target } : {}),
         ...(elf ? { elf } : {}),
         ...(input.interface_config ? { interfaceConfig: String(input.interface_config) } : {}),
         ...(input.target_config ? { targetConfig: String(input.target_config) } : {}),

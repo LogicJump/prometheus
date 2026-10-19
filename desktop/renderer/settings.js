@@ -1493,11 +1493,36 @@ function settingsRail() {
   }
 }
 
-function openSettings(tab = "general") {
+/** The rail, the search placeholder, and the profile block — every part of the
+ *  chrome outside the pane itself. Kept in one place because the locale
+ *  rebuild needs exactly this set to follow a language change. */
+function renderChrome() {
   settingsRail();
   $("settings-search").placeholder = S().searchSettings;
   $("settings-profile-name").textContent = state.cwd ? basename(state.cwd) : S().noWorkspace;
   $("settings-profile-sub").textContent = S().railProfileSub;
+}
+
+/**
+ * Follow a language change while the page is open.
+ *
+ * Page builders read `S()` once, when they run, and none of their text carries
+ * `data-i18n`, so the renderer's global pass cannot reach them. Rebuilding the
+ * pane and the rail is the only way the labels can change without closing and
+ * reopening Settings. Only the locale path calls this: a rebuild discards any
+ * in-progress edit in a text field, which is exactly what a language switch
+ * already implies.
+ */
+function applyLocaleChange() {
+  if (settingsDialog.hidden) return;
+  const scroll = $("settings-panes").scrollTop;
+  renderChrome();
+  selectSettingsTab(state.settingsTab);
+  $("settings-panes").scrollTop = scroll;
+}
+
+function openSettings(tab = "general") {
+  renderChrome();
   selectSettingsTab(tab);
   openModal(settingsDialog);
   api.send({ cmd: "getSettings" });
@@ -1773,6 +1798,7 @@ function basename(path) {
     open: openSettings,
     openSetup,
     handleEvent,
+    applyLocaleChange,
     refreshVersion,
     close: () => closeModal(settingsDialog),
     isOpen: () => !settingsDialog.hidden,

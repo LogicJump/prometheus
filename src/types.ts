@@ -3,6 +3,30 @@
 export type PermissionMode = "ask" | "auto" | "plan";
 export type ThinkingEffort = "auto" | "low" | "medium" | "high";
 
+/**
+ * The board the user is working with, chosen in the Board pane.
+ *
+ * Persisted in config rather than UI preferences because it changes what the
+ * agent does: `embed_flash` and `embed_serial` fall back to it when the model
+ * does not name a port or target. A UI preference never reaches `ToolContext`.
+ */
+export interface BoardSelection {
+  /** Serial console, e.g. `COM7`. */
+  port?: string;
+  /** Baud for that port. */
+  baud?: number;
+  /**
+   * Target name the flashing tool understands (pyOCD's `stm32f103rc`), not a
+   * Zephyr board or an Arduino FQBN — `embed_build` has its own `target`.
+   */
+  target?: string;
+  /** Probe unique id, used to disambiguate when several are attached. */
+  probe?: string;
+  flasher?: "pyocd" | "probe-rs" | "openocd" | "esptool" | "st-flash" | "dfu-util" | "avrdude" | "jlink";
+  /** Assert DTR when opening the console. Resets most boards; off by default. */
+  assertDtr?: boolean;
+}
+
 export interface Config {
   baseUrl: string;
   apiKey: string;
@@ -24,6 +48,8 @@ export interface Config {
   networkPolicy?: "off" | "proxy" | "open";
   /** Model ids tried in order when the active model is unavailable. */
   fallbackModels?: string[];
+  /** Board selected in the UI; tools use it as a default when an argument is omitted. */
+  board?: BoardSelection;
 }
 
 export interface ToolCall {
@@ -54,6 +80,11 @@ export interface ToolResult {
   isError?: boolean;
   /** Short human-readable summary for the transcript UI. */
   display?: string;
+  /**
+   * Structured result for a UI that can do more than print text. Small enough
+   * to send over the event stream; the CLI and sub-agents ignore it.
+   */
+  data?: unknown;
 }
 
 export interface ToolContext {
@@ -101,6 +132,8 @@ export interface Ui {
   toolEnd(name: string, ok: boolean, summary: string): void;
   /** Full, possibly long tool output for inspection. */
   toolOutput?(name: string, content: string): void;
+  /** Structured result from a tool, for UIs that render it rather than print it. */
+  toolDetail?(name: string, data: unknown): void;
   thinking(delta: string): void;
   thinkingEnd(): void;
   todos(items: TodoItem[]): void;

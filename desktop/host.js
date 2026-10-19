@@ -28,7 +28,7 @@ import { detectLocale, isLocale } from "../src/i18n.ts";
 import { buildChange } from "../src/diff.ts";
 import { loadCheckpoints, restoreTo, restoreAfterMessage, clearCheckpoints, captureBefore } from "../src/checkpoints.ts";
 import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src/workspace.ts";
-import { maskKey, readUiSettings, writeConfigFile, writeUiSettings } from "../src/settings.ts";
+import { maskKey, readUiSettings, writeBoardConfig, writeConfigFile, writeUiSettings } from "../src/settings.ts";
 import { loadRules, removeRule } from "../src/rules.ts";
 import { publicProviders, providerFor } from "../src/providers.ts";
 import { recordUsage, usageSummary } from "../src/usage.ts";
@@ -47,7 +47,12 @@ import { installFromManifest, installPack } from "../src/packs/install.ts";
 import { packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
 import { catalogFor, isInstallable, toInstallEntry } from "../src/packs/catalog.ts";
 import { runGoal, runTaskLoop } from "../src/autoloop.ts";
-import { resetToolchainCache } from "../src/embedded/toolchain.ts";
+import { detectToolchains, resetToolchainCache } from "../src/embedded/toolchain.ts";
+import { detectProject } from "../src/embedded/project.ts";
+import { listProbes, listTargets } from "../src/embedded/probe.ts";
+import { listSerialPorts, openPort } from "../src/embedded/serial.ts";
+import { SerialLineBuffer } from "../src/embedded/serialStream.ts";
+import { assembleBoardState, boardTargetStatus } from "../src/embedded/board.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
@@ -328,6 +333,24 @@ class HostUi {
   toolOutput(name, content) {
     send({ type: "tool_output", name, content: String(content).slice(0, 20000) });
   }
+  /**
+   * A tool's structured result.
+   *
+   * Only embed_build sends something the panes need between calls — the
+   * flash/RAM numbers come from the last build, not from a fresh one — so this
+   * both records it and forwards it. The renderer ignores names it does not know.
+   */
+  toolDetail(name, data) {
+    if (name === "embed_build" && data && typeof data === "object") {
+      const usage = data.usage && typeof data.usage === "object" ? data.usage : null;
+      lastBuild = {
+        ok: Boolean(data.ok),
+        ...(usage ? { usage: { flash: Number(usage.flash) || 0, ram: Number(usage.ram) || 0 } } : {}),
+        at: new Date().toISOString(),
+      };
+    }
+    send({ type: "tool_detail", name, data });
+  }
   todos(items) {
     send({ type: "todos", items });
   }
@@ -499,6 +522,14 @@ function emitState() {
     baseUrl: config.baseUrl,
     context: agent ? agent.contextUsage() : { tokens: 0, percent: 0 },
     usage: agent ? agent.usage : { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+    // Both are cheap: the project detection is synchronous and the serial
+    // monitor is our own state. The machine scan is not included — the Board
+    // pane asks for it when it opens, so a pure web project pays nothing.
+    board: {
+      selection: config.board ?? {},
+      projectKind: detectProject(cwd).kind,
+    },
+    serial: serialStatus(),
   });
 }
 
@@ -561,6 +592,222 @@ function ensureTerminal() {
 function disposeTerminal() {
   terminal?.dispose();
   terminal = null;
+}
+
+// ---- Board and serial monitor ---------------------------------------------
+//
+// Two panes read from here. The board pane wants a picture of the machine
+// (project, toolchains, probes, ports); the serial pane wants a stream. Both
+// are expensive enough that doing them on every request would make the pane
+// feel broken, so the inventory is cached and single-flighted, and the target
+// list is loaded only when the user asks for it.
+
+/** Probes, ports and toolchains, with the time they were last read. */
+let boardCache = null;
+/** One inventory scan at a time; concurrent callers share the result. */
+let boardInflight = null;
+/** The target table, once loaded. Never expires within a session. */
+let targetCache = null;
+/** The monitor's open port, if any. */
+let serial = null;
+/** The build the agent last ran in this session, shown by the Board pane. */
+let lastBuild = null;
+
+const BOARD_TTL_MS = 30_000;
+
+/** Invalidate everything a folder switch or a toolchain change makes stale. */
+function forgetBoard() {
+  boardCache = null;
+  targetCache = null;
+}
+
+async function boardInventory(force = false) {
+  if (!force && boardCache && Date.now() - boardCache.at < BOARD_TTL_MS) return boardCache;
+  // Two panes opening at once must not spawn two pairs of probes.
+  if (boardInflight) return boardInflight;
+  boardInflight = (async () => {
+    const report = await detectToolchains();
+    const byKind = new Map(report.tools.map((entry) => [entry.kind, entry.path]));
+    const [probes, ports] = await Promise.all([
+      listProbes({ pyocd: byKind.get("pyocd"), "probe-rs": byKind.get("probe-rs"), jlink: byKind.get("jlink") }),
+      listSerialPorts(),
+    ]);
+    boardCache = {
+      at: Date.now(),
+      tools: report.tools,
+      missing: report.missing,
+      probes: probes.probes,
+      probeNotes: probes.notes,
+      ports,
+      paths: {
+        pyocd: byKind.get("pyocd"),
+        "probe-rs": byKind.get("probe-rs"),
+      },
+    };
+    return boardCache;
+  })().finally(() => {
+    boardInflight = null;
+  });
+  return boardInflight;
+}
+
+/**
+ * The project half of the board state, which is cheap and synchronous.
+ *
+ * It is sent first so the pane can draw immediately; the inventory follows as
+ * a second message. Awaiting both together would leave the pane blank for a
+ * second on a cold start and for twenty seconds when the probe tool hangs.
+ */
+function boardStateProject() {
+  const project = detectProject(cwd);
+  return assembleBoardState({
+    project,
+    selection: config?.board ?? {},
+    scannedAt: null,
+    build: lastBuild,
+  });
+}
+
+/**
+ * Whether the selected target exists in the table, or that nobody has looked.
+ *
+ * Computed here rather than in the renderer because the distinction is subtle
+ * enough to be worth testing, and `boardTargetStatus` is already tested.
+ */
+function targetStatusFor(selection) {
+  return boardTargetStatus(selection?.target, targetCache ? targetCache.targets : null);
+}
+
+/**
+ * The project phase, enriched with the last inventory if one has been scanned.
+ *
+ * A bare project state is right on first open — it draws immediately and the
+ * inventory follows. Sending one later (after loading targets, say) would wipe
+ * the toolchain and probe rows that are already on screen, so whenever a scan
+ * exists it rides along.
+ */
+function boardStateCached() {
+  const base = boardStateProject();
+  if (!boardCache) return base;
+  return {
+    ...base,
+    tools: boardCache.tools,
+    missing: boardCache.missing,
+    probes: boardCache.probes,
+    probeNotes: boardCache.probeNotes,
+    ports: boardCache.ports,
+    scannedAt: new Date(boardCache.at).toISOString(),
+  };
+}
+
+function sendBoardState(phase, state) {
+  send({ type: "board_state", phase, state, targetStatus: targetStatusFor(state.selection) });
+}
+
+async function emitBoardState(refresh = "auto") {
+  // Phase one is always sent, even when the inventory is cached: the selection
+  // may have changed since the last message and the pane rebuilds from it.
+  sendBoardState("project", boardStateProject());
+  try {
+    const inventory = await boardInventory(refresh === "all");
+    sendBoardState("inventory", {
+      ...boardStateProject(),
+      tools: inventory.tools,
+      missing: inventory.missing,
+      probes: inventory.probes,
+      probeNotes: inventory.probeNotes,
+      ports: inventory.ports,
+      scannedAt: new Date(inventory.at).toISOString(),
+    });
+  } catch (err) {
+    send({ type: "notice", level: "warn", text: `board scan failed: ${err.message}` });
+  }
+}
+
+/** The target table, or the reason there is none. Only on explicit request. */
+async function emitBoardTargets(filter) {
+  try {
+    if (!targetCache) {
+      const inventory = await boardInventory(false);
+      const result = await listTargets({ pyocd: inventory.paths.pyocd }, { limit: 0 });
+      targetCache = { targets: result.targets, notes: result.notes, total: result.total };
+    }
+    const needle = filter ? String(filter).trim().toLowerCase() : "";
+    const targets = needle
+      ? targetCache.targets.filter(
+          (entry) =>
+            entry.name.toLowerCase().includes(needle) ||
+            entry.vendor?.toLowerCase().includes(needle) ||
+            entry.part?.toLowerCase().includes(needle),
+        )
+      : targetCache.targets;
+    send({
+      type: "board_targets",
+      total: targetCache.total,
+      notes: targetCache.notes,
+      // A filtered list is what the picker shows; it is capped because the
+      // unfiltered table is 206 entries and the picker is not a table.
+      targets: targets.slice(0, 200),
+      filter: filter ?? "",
+    });
+    // Loading the table turns "unloaded" into a real verdict about the selected
+    // target — that is the whole point of loading it — so the pane hears again.
+    sendBoardState("project", boardStateCached());
+  } catch (err) {
+    send({ type: "board_targets", total: 0, notes: [err.message], targets: [], filter: filter ?? "", error: err.message });
+  }
+}
+
+/** Persist a new selection, tell the agent, and echo the new state. */
+function applyBoardSelection(selection) {
+  const clean = selection && typeof selection === "object" ? selection : null;
+  const path = writeBoardConfig(clean, cwd);
+  config.board = clean ?? undefined;
+  if (agent) {
+    agent.config.board = config.board;
+    agent.refreshSystemPrompt(
+      clean
+        ? `The user changed the board selection in the Board pane${clean.port ? ` to port ${clean.port}` : ""}${clean.target ? `, target ${clean.target}` : ""}.`
+        : "The user cleared the board selection in the Board pane.",
+    );
+  }
+  send({ type: "board_selection", selection: config.board ?? {}, path });
+  sendBoardState("project", boardStateCached());
+  void emitBoardState("auto");
+}
+
+function serialStatus() {
+  return {
+    open: Boolean(serial),
+    port: serial?.port ?? null,
+    baud: serial?.baud ?? null,
+    buffered: serial ? serial.buffer.peek().length : 0,
+    queued: serial ? serial.buffer.queued : 0,
+  };
+}
+
+function flushSerial() {
+  if (!serial) return;
+  const batch = serial.buffer.drain(300);
+  if (batch.lines.length > 0 || batch.dropped > 0) {
+    send({ type: "serial_lines", port: serial.port, dropped: batch.dropped, lines: batch.lines });
+  }
+  if (serial && batch.remaining > 0) setImmediate(flushSerial);
+}
+
+function disposeSerial() {
+  if (!serial) return;
+  if (serial.timer) clearInterval(serial.timer);
+  try {
+    serial.handle.close();
+  } catch {
+    /* already gone */
+  }
+  serial = null;
+}
+
+function serialError(message) {
+  send({ type: "serial_state", open: false, port: null, baud: null, error: message });
 }
 
 /**
@@ -1290,6 +1537,87 @@ async function handle(cmd) {
       if (!deleted) send({ type: "notice", level: "error", text: `session not found: ${cmd.id}` });
       return;
     }
+    // ---- 目标板与串口 ----
+    case "getBoardState": {
+      void emitBoardState(cmd.refresh === "all" ? "all" : "auto");
+      return;
+    }
+    case "getBoardTargets": {
+      void emitBoardTargets(cmd.filter);
+      return;
+    }
+    case "setBoardSelection": {
+      try {
+        applyBoardSelection(cmd.selection);
+      } catch (err) {
+        send({ type: "notice", level: "error", text: `could not save the board selection: ${err.message}` });
+      }
+      return;
+    }
+    case "serialOpen": {
+      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn before opening the serial port" });
+      disposeSerial();
+      const state = boardStateProject();
+      const port = cmd.port ? String(cmd.port) : state.effective.port;
+      const baud = Number(cmd.baud ?? state.effective.baud ?? 115200);
+      if (!port) {
+        return serialError("no serial port selected. Pick one in the Board pane.");
+      }
+      let handle;
+      try {
+        handle = openPort(port, baud, { assertDtr: Boolean(cmd.assertDtr ?? state.effective.assertDtr) });
+      } catch (err) {
+        // "Already open in this process" is the monitor-versus-agent conflict;
+        // the raw message names the port, which is what the user needs.
+        return serialError(err.message);
+      }
+      const buffer = new SerialLineBuffer();
+      serial = { port, baud, handle, buffer, timer: null };
+      handle.onData((chunk) => serial?.buffer.push(chunk));
+      handle.onExit(({ code, error }) => {
+        // A disposed handle is expected to exit; only a port that died while
+        // we were still using it is worth reporting.
+        if (!serial || serial.handle !== handle) return;
+        flushSerial();
+        disposeSerial();
+        send({
+          type: "serial_state",
+          open: false,
+          port,
+          baud,
+          error: error || `the port closed (exit ${code ?? "?"})`,
+        });
+      });
+      // 50 ms batches, 300 lines each: a talkative firmware becomes a handful of
+      // messages per second instead of one per line.
+      serial.timer = setInterval(flushSerial, 50);
+      send({ type: "serial_state", open: true, port, baud, buffered: 0 });
+      return;
+    }
+    case "serialClose": {
+      const port = serial?.port ?? null;
+      flushSerial();
+      disposeSerial();
+      send({ type: "serial_state", open: false, port, baud: null });
+      return;
+    }
+    case "serialClear": {
+      serial?.buffer.clear();
+      send({ type: "serial_cleared", port: serial?.port ?? null });
+      return;
+    }
+    case "serialStatus": {
+      send({ type: "serial_snapshot", ...serialStatus(), lines: serial ? serial.buffer.peek() : [] });
+      return;
+    }
+    case "shutdown": {
+      disposeSerial();
+      disposeTerminal();
+      stopMcp();
+      // Give the last writes a tick to reach stdout before the process goes away.
+      setTimeout(() => process.exit(0), 30);
+      return;
+    }
     case "setCwd": {
       if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
       if (cmd.cwd && existsSync(cmd.cwd)) {
@@ -1299,10 +1627,9 @@ async function handle(cmd) {
         sessionId = newSessionId();
         try {
           // The live mode may have been changed from the composer without being
-        // written to disk; keep it unless this save explicitly sets a new one.
-        const liveMode = config.permissionMode;
-        config = loadConfig();
-        if (!["ask", "auto", "plan"].includes(patch.mode)) config.permissionMode = liveMode;
+          // written to disk; switching folders is not a settings save, so the
+          // live mode is the one to keep.
+          config = loadConfig({ permissionMode: config.permissionMode });
           client = makeClient();
         } catch (err) {
           send({ type: "fatal", message: err.message });
@@ -1314,6 +1641,9 @@ async function handle(cmd) {
         void emitGitStatus();
         stopMcp();
         void startMcp();
+        // Caches describe the machine, not the folder, but the project half of
+        // the board state does change here; invalidate so the next read rebuilds.
+        forgetBoard();
       }
       return;
     }
@@ -1681,11 +2011,15 @@ process.stdin.on("data", (chunk) => {
 process.stdin.on("end", () => {
   stopMcp();
   disposeTerminal();
+  disposeSerial();
   process.exit(0);
 });
 
 process.on("uncaughtException", (err) => {
   send({ type: "error", message: `host crashed: ${err.message}` });
+  // A crash must not orphan the PowerShell holding COM7: the next open would
+  // fail with "access denied" and look like a hardware fault.
+  disposeSerial();
   process.exit(1);
 });
 

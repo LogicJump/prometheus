@@ -322,14 +322,58 @@ export interface CaptureResult {
  * Both are separate processes. That is deliberate: a wedged driver cannot take
  * the agent down with it, and killing the child closes the port.
  */
+
+/**
+ * Ports this process has open. Two readers on one port is not a thing the OS
+ * allows, and without this check the second one fails with a native access
+ * error that says nothing about who is holding it. The serial monitor and the
+ * `embed_serial` tool share a process, so they are the usual pair in conflict.
+ */
+const activePorts = new Set<string>();
+
 export function openPort(path: string, baud: number, options: { assertDtr?: boolean } = {}): PortHandle {
+  const key = portKey(path);
+  if (activePorts.has(key)) throw new Error(`${path} is already open in this process`);
   const assertDtr = options.assertDtr ?? false;
-  if (process.platform === "win32") return openWindowsPort(path, baud, assertDtr);
-  return openPosixPort(path, baud);
+  const inner = process.platform === "win32" ? openWindowsPort(path, baud, assertDtr) : openPosixPort(path, baud);
+  activePorts.add(key);
+  return {
+    onData: (listener) => inner.onData(listener),
+    onExit: (listener) => inner.onExit?.(listener),
+    close() {
+      activePorts.delete(key);
+      inner.close();
+    },
+  };
 }
 
-function openWindowsPort(path: string, baud: number, assertDtr: boolean): PortHandle {
-  const script = [
+/**
+ * Windows keys are case-insensitive, so `com7` and `COM7` are the same port.
+ * Two handles to one port is the failure this registry exists to prevent.
+ */
+function portKey(path: string): string {
+  return process.platform === "win32" ? path.toUpperCase() : path;
+}
+
+/**
+ * The PowerShell that reads the port.
+ *
+ * This is built as separate lines and joined with newlines, not `"; "`. The
+ * semicolon form is what used to be here and it does not parse: joining
+ * `while($true){ try {…} catch {…} }` with semicolons produces
+ * `while($true){;  try {…};  catch {…} }`, and PowerShell rejects a `catch`
+ * that does not directly follow the closing brace ("MissingCatchOrFinally").
+ * Serial capture was broken on Windows for exactly this reason.
+ *
+ * `BaseStream.Read` rather than `ReadLine`: ReadLine discards the bytes it has
+ * buffered every time ReadTimeout fires, so a firmware that prints without a
+ * trailing newline loses data in 500 ms slices. Read returns as soon as any
+ * byte arrives and never throws the buffered part away.
+ *
+ * Exported so the test can hand it to PowerShell's own parser.
+ */
+export function windowsSerialScript(assertDtr: boolean): string {
+  return [
     "$ErrorActionPreference='Stop'",
     "$p=New-Object System.IO.Ports.SerialPort $env:PROM_PORT,$env:PROM_BAUD",
     // DTR is wired to RESET through a capacitor on most dev boards, so
@@ -337,37 +381,61 @@ function openWindowsPort(path: string, baud: number, assertDtr: boolean): PortHa
     // catch a boot banner) and sometimes destroys the test (you lose the
     // message you were waiting for). The caller decides.
     `$p.DtrEnable=${assertDtr ? "$true" : "$false"}`,
-    "$p.ReadTimeout=500",
-    "$p.Open()",
-    "while($true){",
-    "  try { $s=$p.ReadLine(); [Console]::Out.WriteLine($s); [Console]::Out.Flush() }",
-    "  catch [System.TimeoutException] { }",
-    "  catch { break }",
+    "$p.ReadTimeout=1000",
+    "try {",
+    "  $p.Open()",
+    "  $out=[Console]::OpenStandardOutput()",
+    "  $buf=New-Object byte[] 4096",
+    "  while($true) {",
+    "    try {",
+    "      $n=$p.BaseStream.Read($buf,0,$buf.Length)",
+    "      if($n -gt 0) { $out.Write($buf,0,$n); $out.Flush() }",
+    "    } catch [System.TimeoutException] { }",
+    "  }",
+    "} finally {",
+    "  if($p.IsOpen) { $p.Close() }",
     "}",
-    "$p.Close()",
-  ].join("; ");
+  ].join("\n");
+}
+
+function openWindowsPort(path: string, baud: number, assertDtr: boolean): PortHandle {
+  const script = windowsSerialScript(assertDtr);
 
   const child = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
     env: { ...process.env, PROM_PORT: path, PROM_BAUD: String(baud) },
     windowsHide: true,
   });
 
+  // PowerShell's errors used to be merged into the data stream, so a failed
+  // open looked like the device printing gibberish in Chinese. Keep them apart.
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (stderr.length < 8192) stderr += chunk.toString("utf8");
+  });
+
+  const exitListeners: ((info: { code: number | null; error?: string }) => void)[] = [];
+  let exited = false;
+  child.on("exit", (code) => {
+    if (exited) return;
+    exited = true;
+    const error = stderr.trim() || undefined;
+    for (const listener of exitListeners) listener({ code, error });
+  });
+  // A spawn failure (powershell missing) surfaces here, not on "exit".
+  child.on("error", (err) => {
+    if (exited) return;
+    exited = true;
+    for (const listener of exitListeners) listener({ code: null, error: err.message });
+  });
+
   return {
     onData(listener) {
-      let pending = "";
-      const emit = (chunk: Buffer) => {
-        pending += chunk.toString("utf8");
-        // PowerShell's WriteLine already adds a newline; pass it through so the
-        // line splitter sees the same shape as a POSIX read.
-        let index = pending.indexOf("\n");
-        while (index >= 0) {
-          listener(`${pending.slice(0, index)}\n`);
-          pending = pending.slice(index + 1);
-          index = pending.indexOf("\n");
-        }
-      };
-      child.stdout.on("data", emit);
-      child.stderr.on("data", (chunk: Buffer) => emit(chunk));
+      // Raw device bytes. Line splitting belongs to the caller, who decides
+      // what a "line" means and how much of it to keep.
+      child.stdout.on("data", (chunk: Buffer) => listener(chunk.toString("utf8")));
+    },
+    onExit(listener) {
+      exitListeners.push(listener);
     },
     close() {
       try {
@@ -390,9 +458,23 @@ function openPosixPort(path: string, baud: number): PortHandle {
   }
 
   const stream = createReadStream(path, { encoding: "utf8" });
+  const exitListeners: ((info: { code: number | null; error?: string }) => void)[] = [];
+  let exited = false;
+  const reportExit = (error?: string) => {
+    if (exited) return;
+    exited = true;
+    for (const listener of exitListeners) listener({ code: null, error });
+  };
+  // A stream error is emitted asynchronously, so a caller that only guards the
+  // synchronous open would never see it.
+  stream.on("error", (err) => reportExit(err.message));
+  stream.on("close", () => reportExit());
   return {
     onData(listener) {
       stream.on("data", (chunk) => listener(String(chunk)));
+    },
+    onExit(listener) {
+      exitListeners.push(listener);
     },
     close() {
       stream.destroy();
@@ -411,7 +493,10 @@ function openPosixPort(path: string, baud: number): PortHandle {
  * need a physical port.
  */
 export interface PortHandle {
+  /** Raw bytes as they arrive. Line splitting is the caller's job. */
   onData(listener: (chunk: string) => void): void;
+  /** Fired once when the reader stops, with the reason when there is one. */
+  onExit?(listener: (info: { code: number | null; error?: string }) => void): void;
   close(): void;
 }
 

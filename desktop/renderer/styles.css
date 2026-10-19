@@ -3743,6 +3743,452 @@ mark.find-hit.current {
   }
 }
 
+/* ---------- board pane ----------
+   The settings page already established this rhythm: a label on the left, a
+   monospaced value on the right, a hairline under each row. Reusing it here is
+   what keeps the pane reading as part of the same product rather than an
+   embedded widget. Colour appears only where it means something — an absent
+   target is amber, a failed toolchain is red, an exact match is green. */
+
+.board-root {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg);
+}
+
+.board-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.board-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px;
+  font-family: var(--sans);
+}
+
+.board-section {
+  margin-bottom: 22px;
+}
+
+.board-section:last-child {
+  margin-bottom: 4px;
+}
+
+.board-section-title {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--text-faint);
+  margin-bottom: 6px;
+}
+
+.board-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.board-row:last-child {
+  border-bottom: none;
+}
+
+.board-label {
+  font-size: var(--text-base);
+  color: var(--text);
+  flex: 0 0 auto;
+}
+
+.board-value {
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  text-align: right;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-value.ok {
+  color: var(--success);
+}
+
+.board-value.warn {
+  color: var(--warn);
+}
+
+.board-value.bad {
+  color: var(--danger);
+}
+
+.board-note {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  margin-top: 2px;
+  text-align: right;
+}
+
+.board-empty {
+  padding: 24px;
+  text-align: center;
+  font-size: var(--text-base);
+  color: var(--text-faint);
+}
+
+.board-empty strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.board-targets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.board-target {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.board-target:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.board-target.active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.board-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* ---------- serial pane ----------
+   Laid out like the terminal pane, because it is the same thing: a fixed-width
+   transcript fed by a stream. The toolbar is the only addition. */
+
+.serial-root {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg);
+}
+
+.serial-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 6px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+/* The second row holds the stream controls; it keeps its own border so the
+   two rows read as one toolbar rather than two unrelated strips. */
+.serial-toolbar-controls {
+  padding-top: 0;
+  border-bottom: none;
+}
+
+.serial-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.serial-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.serial-field-key {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.serial-select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  padding: 3px 6px;
+  outline: none;
+  min-width: 0;
+  max-width: 108px;
+}
+
+.serial-select:focus {
+  border-color: var(--border-strong);
+}
+
+.serial-select:disabled {
+  opacity: 0.5;
+}
+
+.serial-filter {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.serial-filter button {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.serial-filter button.active {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.serial-spacer {
+  flex: 1;
+}
+
+.serial-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.serial-status {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.serial-status.live {
+  color: var(--success);
+}
+
+.serial-status.bad {
+  color: var(--danger);
+}
+
+.serial-follow {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.serial-follow svg {
+  width: 12px;
+  height: 12px;
+}
+
+.serial-follow[aria-pressed="true"] {
+  color: var(--text-secondary);
+}
+
+.serial-follow:hover {
+  background: var(--surface-hover);
+}
+
+.serial-output {
+  flex: 1;
+  overflow: auto;
+  padding: 8px 12px;
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--text);
+  outline: none;
+}
+
+.serial-line {
+  display: flex;
+  gap: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.serial-time {
+  flex: 0 0 78px;
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.serial-level {
+  flex: 0 0 34px;
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.serial-level.error {
+  color: var(--danger);
+}
+
+.serial-level.warn {
+  color: var(--warn);
+}
+
+.serial-level.info {
+  color: var(--text-faint);
+}
+
+.serial-tag {
+  flex: 0 0 auto;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.serial-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.serial-line.error .serial-text {
+  color: var(--danger);
+}
+
+.serial-line.warn .serial-text {
+  color: var(--warn);
+}
+
+.serial-notice {
+  padding: 6px 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* ---------- board chip in the composer ---------- */
+
+.board-control {
+  position: relative;
+}
+
+.board-picker {
+  max-width: 210px;
+  white-space: nowrap;
+}
+
+.board-picker span:not(.chip-key) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+
+.board-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  width: 320px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-popover);
+  z-index: 20;
+  animation: slide-up 120ms ease-out;
+}
+
+.board-menu[hidden] {
+  display: none;
+}
+
+.board-menu .model-option {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+}
+
+.board-menu .model-option:hover {
+  background: var(--surface-hover);
+}
+
+.board-menu .model-option.active {
+  background: var(--accent-soft);
+}
+
+.board-menu .menu-sep {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+
+.board-menu .menu-action {
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.board-menu .menu-action:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.board-menu .menu-empty {
+  padding: 10px 12px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

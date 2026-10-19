@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Config, PermissionMode, ThinkingEffort } from "./types.ts";
+import type { BoardSelection, Config, PermissionMode, ThinkingEffort } from "./types.ts";
 import { resolveProvider } from "./providers.ts";
 
 const HOME_DIR = join(homedir(), ".prometheus");
@@ -42,6 +42,7 @@ interface FileConfig {
   sandbox?: "off" | "enforce";
   networkPolicy?: "off" | "proxy" | "open";
   fallbackModels?: string[];
+  board?: unknown;
 }
 
 function readJson(path: string): FileConfig {
@@ -68,6 +69,42 @@ function validNetwork(value: string | undefined): "off" | "proxy" | "open" | und
 
 function validEffort(value: string | undefined): ThinkingEffort | undefined {
   return value === "auto" || value === "low" || value === "medium" || value === "high" ? value : undefined;
+}
+
+const FLASHERS = ["pyocd", "probe-rs", "openocd", "esptool", "st-flash", "dfu-util", "avrdude", "jlink"] as const;
+
+function text(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > max) return undefined;
+  return trimmed;
+}
+
+/**
+ * Sanitise a board selection read from a config file.
+ *
+ * The file is hand-editable and may come from another version, so every field
+ * is checked rather than trusted. An unrecognised flasher is dropped instead
+ * of being passed to a spawn, and the baud is clamped to a range a UART can
+ * actually use.
+ */
+export function validBoard(value: unknown): BoardSelection | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const board: BoardSelection = {};
+  const port = text(raw.port, 64);
+  if (port) board.port = port;
+  const target = text(raw.target, 120);
+  if (target) board.target = target;
+  const probe = text(raw.probe, 120);
+  if (probe) board.probe = probe;
+  const baud = typeof raw.baud === "number" ? Math.round(raw.baud) : Number.parseInt(String(raw.baud ?? ""), 10);
+  if (Number.isFinite(baud) && baud > 0) board.baud = Math.min(4_000_000, Math.max(300, baud));
+  if (typeof raw.flasher === "string" && (FLASHERS as readonly string[]).includes(raw.flasher)) {
+    board.flasher = raw.flasher as BoardSelection["flasher"];
+  }
+  if (typeof raw.assertDtr === "boolean") board.assertDtr = raw.assertDtr;
+  return Object.keys(board).length > 0 ? board : undefined;
 }
 
 export function loadConfig(cli: Partial<Config> = {}): Config {
@@ -122,6 +159,7 @@ export function loadConfig(cli: Partial<Config> = {}): Config {
       file.networkPolicy ??
       "off",
     fallbackModels: cli.fallbackModels ?? file.fallbackModels ?? [],
+    board: validBoard(cli.board ?? file.board),
   };
 
   if (!config.apiKey) {

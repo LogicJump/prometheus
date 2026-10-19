@@ -33,6 +33,7 @@ const ICONS = {
   download: '<path d="M12 4v11"/><path d="m8 11 4 4 4-4"/><path d="M5 19.5h14"/>',
   upload: '<path d="M12 20V9"/><path d="m8 13 4-4 4 4"/><path d="M5 4.5h14"/>',
   play: '<path d="M8 5.6v12.8L19 12Z"/>',
+  pause: '<path d="M9.5 5.5v13"/><path d="M14.5 5.5v13"/>',
   stop: '<rect x="7" y="7" width="10" height="10" rx="2"/>',
   filter: '<path d="M4 6h16l-6.2 7.2V20l-3.6-2v-4.8Z"/>',
 

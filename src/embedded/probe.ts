@@ -74,6 +74,13 @@ export function pyocdProbes(output: string): Probe[] {
   for (const rawLine of output.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || /^No available debug probes/i.test(line)) continue;
+    // Dashed rules only separate the header from the table.
+    if (/^-{3,}$/.test(line)) continue;
+    // `  #   Probe/Board    Unique ID                  Target`
+    //
+    // Without this the header parses as a probe named `#` attached to a chip
+    // called `Probe/Board`, which then appears in the UI as real hardware.
+    if (CELL_HEADER.test(line)) continue;
     // `  0   STLink V2  0673FF...   STM32F411RETx   ...`
     const cells = line.split(/\s{2,}/).map((cell) => cell.trim()).filter(Boolean);
     if (cells.length < 2) continue;
@@ -82,13 +89,24 @@ export function pyocdProbes(output: string): Probe[] {
     if (body.length < 1) continue;
     const probe: Probe = { kind: "pyocd", name: body[0] };
     // A serial is a long hex/uppercase token; a target is the last cell.
+    // pyOCD prints `n/a` when the probe does not know what it is attached to;
+    // that is the absence of a target, not a target named "n/a".
     for (const cell of body.slice(1)) {
+      if (isNoValue(cell)) continue;
       if (!probe.serial && /^[0-9A-F]{8,}$/i.test(cell.replace(/[^0-9A-Za-z]/g, ""))) probe.serial = cell;
       else if (!probe.target) probe.target = cell;
     }
     probes.push(probe);
   }
   return probes;
+}
+
+/** The column titles pyOCD prints above the probe table. */
+const CELL_HEADER = /(^|\s)(Probe\/Board|Unique ID)(\s|$)/i;
+
+/** Placeholders that mean "this tool has nothing to report here". */
+function isNoValue(cell: string): boolean {
+  return /^(n\/?a|none|unknown|-{1,2}|—)$/i.test(cell.trim());
 }
 
 /** probe-rs prints one block per probe; the useful line is the name. */

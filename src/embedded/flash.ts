@@ -145,7 +145,10 @@ export function commandFor(request: FlashRequest): string[] {
 
   switch (request.kind) {
     case "pyocd": {
-      const args = ["flash", "-f", request.firmware];
+      // The image is a positional argument. `-f` here is --frequency, the SWD
+      // clock, so passing a path to it makes pyOCD reject the whole command
+      // with "invalid convert_frequency value" before it touches the probe.
+      const args = ["flash", request.firmware];
       if (request.target) args.push("--target", request.target);
       if (request.probe) args.push("--uid", request.probe);
       if (!reset) args.push("--no-reset");

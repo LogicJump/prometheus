@@ -77,7 +77,6 @@ const state = {
   selectedChange: null,
   selectedFile: null,
   tree: [],
-  pane: "diff",
   cwd: "",
   context: { tokens: 0, percent: 0 },
   sandbox: "enforce",
@@ -86,7 +85,7 @@ const state = {
   expandedProjects: new Set(JSON.parse(localStorage.getItem("prometheus.expandedProjects") || "[]")),
   collapsedProjects: new Set(JSON.parse(localStorage.getItem("prometheus.collapsedProjects") || "[]")),
   workbenchOpen: savedWorkbench === "1",
-  pane: ["files", "diff", "history", "artifact", "terminal", "browser", "file"].includes(savedPane) ? savedPane : "diff",
+  pane: ["files", "diff", "history", "artifact", "terminal", "browser", "file", "board", "serial"].includes(savedPane) ? savedPane : "diff",
   git: null,
   worktree: null,
   worktreeDiffText: "",
@@ -101,11 +100,46 @@ const state = {
   commands: [],
   diffScope: "session",
   currentSubagent: null,
+  /** Selection and project kind from the last state event; cheap, always current. */
+  board: { selection: {}, projectKind: "unknown" },
+  /** The last assembled board state (project, then inventory). */
+  boardState: null,
+  /** Whether the target table has been loaded, and the status that follows. */
+  boardTargetStatus: { kind: "unloaded", candidates: [], total: 0 },
+  /** The serial monitor is renderer-local except for the stream itself. */
+  serial: {
+    open: false,
+    port: null,
+    baud: null,
+    /** Pausing stops DOM updates; data keeps arriving in the host's ring. */
+    paused: false,
+    pausedBacklog: 0,
+    filter: "all",
+    follow: true,
+    lines: [],
+    /** Lines the host could not keep up with, since the last clear. */
+    dropped: 0,
+    /** Lines the current filter hides, recomputed on each render. */
+    filtered: 0,
+    /** Why the port closed or failed to open, shown in the status row. */
+    lastError: "",
+  },
 };
 
 let t = getDict(state.locale);
 
 /* ---------- localization ---------- */
+
+/**
+ * Rebuilds the open Settings page after a language change, or does nothing.
+ *
+ * Settings assembles its pages from `settingsStrings` at build time and gives
+ * none of that text a `data-i18n` attribute, so the sweep below cannot reach
+ * it. The page has to be rebuilt instead, which is why this is a hook rather
+ * than part of `applyLocale`: it only exists once the settings module has been
+ * constructed at the bottom of this file.
+ */
+let applySettingsLocale = () => {};
 
 function applyLocale(locale, { announce = false } = {}) {
   state.locale = locale;
@@ -140,7 +174,11 @@ function applyLocale(locale, { announce = false } = {}) {
   search.placeholder = t.searchSessions;
   search.title = t.searchSessions;
   $("find-input").placeholder = t.findPlaceholder;
-  $("check-update").textContent = t.checkUpdate;
+  // The update button lives in the About page and is built on demand, so there
+  // is nothing to relabel here; touching a missing node used to abort the rest
+  // of this function with a TypeError.
+  const updateButton = $("check-update");
+  if (updateButton) updateButton.textContent = t.checkUpdate;
   modelPicker.title = t.refreshModels;
   // applyLocale also runs during startup, before the voice state is declared.
   $("voice-button").title = $("voice-button").classList.contains("recording") ? t.voiceStop : t.voiceStart;
@@ -154,6 +192,17 @@ function applyLocale(locale, { announce = false } = {}) {
   const commitButton = $("git-commit-button");
   if (commitButton) commitButton.textContent = t.commitAll;
   if (state.git) renderGitBar();
+  applySettingsLocale();
+  // The board and serial panes assemble their text from `t` when they render
+  // and carry no `data-i18n` on it, so the sweep above cannot reach them.
+  if (!workbench.hidden && (state.pane === "board" || state.pane === "serial")) {
+    if (state.pane === "board") renderBoard();
+    else {
+      fillSerialControls();
+      renderSerialStatus();
+    }
+  }
+  renderBoardChip();
   void announce;
 }
 
@@ -304,6 +353,15 @@ const TOOL_LABELS = {
   remember: "Remember",
   delegate: "Delegate",
   web_fetch: "Fetch",
+  embed_build: "Build firmware",
+  embed_flash: "Flash board",
+  embed_serial: "Read serial",
+  embed_ports: "Serial ports",
+  embed_targets: "Find target",
+  embed_project: "Detect project",
+  embed_debug: "Debug",
+  embed_registers: "Registers",
+  embed_analyze: "Analyze firmware",
 };
 
 function toolLabel(name) {
@@ -324,8 +382,16 @@ function toolGlyph(name) {
   if (name === "todo_write") return "list-check";
   if (name === "remember") return "book";
   if (name === "write_file" || name === "edit_file") return "edit";
-  if (name === "search_codebase" || name === "grep") return "search";
-  if (name === "glob" || name === "list_files") return "folder";
+  if (name === "search_codebase" || name === "grep" || name === "embed_targets") return "search";
+  if (name === "glob" || name === "list_files" || name === "embed_project") return "folder";
+  // The embedded tools get their own glyphs so a build-and-flash pass reads as
+  // a sequence rather than a run of identical rows.
+  if (name === "embed_build") return "layers";
+  if (name === "embed_flash" || name === "embed_ports") return "plug";
+  if (name === "embed_serial") return "terminal";
+  if (name === "embed_debug") return "robot";
+  if (name === "embed_registers") return "sliders";
+  if (name === "embed_analyze") return "chart";
   return "file";
 }
 
@@ -349,12 +415,30 @@ function addToolRow(name, summary) {
       openFile(summary);
     });
   }
+  // The embedded inventory tools answer a question the panes also answer; the
+  // row opens the pane rather than a file.
+  const paneForTool = EMBED_TOOL_PANES[name];
+  if (paneForTool) {
+    row.classList.add("openable");
+    row.title = paneForTool === "board" ? t.boardOpenPane : t.paneSerial;
+    row.addEventListener("click", (event) => {
+      if (event.target.closest(".tool-expand")) return;
+      openWorkbench(paneForTool);
+    });
+  }
   state.currentTool = { node: row, name, summary };
   state.lastToolNode = row;
   return row;
 }
 
 const FILE_TOOLS = new Set(["read_file", "write_file", "edit_file"]);
+/** Rows that lead somewhere: the pane showing the same facts, in full. */
+const EMBED_TOOL_PANES = {
+  embed_targets: "board",
+  embed_ports: "board",
+  embed_serial: "serial",
+  embed_build: "board",
+};
 
 function lastToolRow() {
   return state.lastToolNode && state.lastToolNode.isConnected ? state.lastToolNode : null;
@@ -949,6 +1033,12 @@ function handleEvent(message) {
       setMode(message.mode);
       setEffort(message.effort || "auto");
       if (message.sandbox) state.sandbox = message.sandbox;
+      // Board selection and project kind are cheap, so every state event carries
+      // them; the machine scan waits until the pane asks for it.
+      if (message.board) {
+        state.board = { ...state.board, ...message.board };
+        renderBoardChip();
+      }
       // A state event may arrive before the catalogue has been fetched; keep
       // whatever we already have rather than blanking the picker back to
       // "loading models…".
@@ -960,6 +1050,71 @@ function handleEvent(message) {
       state.cwd = message.cwd;
       renderTopbarLocation();
       updateMeter(message.context, message.usage);
+      break;
+
+    case "board_state":
+      setBoardState(message);
+      break;
+
+    case "board_targets": {
+      const button = $("board-load-targets");
+      button.disabled = false;
+      button.textContent = t.boardLoadTargets;
+      state.boardTargets = {
+        total: message.total ?? 0,
+        notes: message.notes ?? [],
+        targets: message.targets ?? [],
+        error: message.error ?? "",
+      };
+      if (message.error) {
+        addNotice("error", message.error);
+      } else {
+        addNotice("dim", `${message.total} ${t.boardTargetsLoaded}`);
+      }
+      // The host follows with a fresh board_state carrying the new verdict.
+      renderBoard();
+      break;
+    }
+
+    case "board_selection":
+      state.board = { ...state.board, selection: message.selection ?? {} };
+      renderBoardChip();
+      break;
+
+    case "serial_snapshot":
+      state.serial.open = Boolean(message.open);
+      state.serial.port = message.port ?? null;
+      state.serial.baud = message.baud ?? null;
+      state.serial.lines = message.lines ?? [];
+      fillSerialControls();
+      rerenderSerialLines();
+      break;
+
+    case "serial_state":
+      setSerialState(message);
+      break;
+
+    case "serial_lines":
+      state.serial.dropped = (state.serial.dropped ?? 0) + (message.dropped ?? 0);
+      if (state.serial.paused) {
+        // Data still arrives; the DOM just stops moving. The ring is the host's,
+        // so resuming re-reads nothing — the backlog count is what the user sees.
+        state.serial.lines.push(...(message.lines ?? []));
+        if (state.serial.lines.length > SERIAL_MAX_LINES) {
+          state.serial.lines.splice(0, state.serial.lines.length - SERIAL_MAX_LINES);
+        }
+        state.serial.pausedBacklog += (message.lines ?? []).length;
+        renderSerialStatus();
+      } else {
+        appendSerialLines(message.lines ?? []);
+      }
+      break;
+
+    case "serial_cleared":
+      state.serial.lines = [];
+      state.serial.filtered = 0;
+      $("serial-output").innerHTML = "";
+      renderSerialStatus();
       break;
 
     case "models":
@@ -1205,6 +1360,12 @@ function handleEvent(message) {
       endThinking();
       if (state.currentAssistant) flushAssistant();
       addToolRow(message.name, message.summary);
+      break;
+
+    case "tool_detail":
+      // The transcript already shows the tool's text; this is the structured
+      // side, which the panes use. Only a build changes what they display.
+      if (message.name === "embed_build") api.send({ cmd: "getBoardState" });
       break;
 
     case "tool_end": {
@@ -1504,6 +1665,8 @@ function openWorkbench(pane) {
   const showFiles = state.pane === "files";
   const showHistory = state.pane === "history";
   const showFile = state.pane === "file";
+  const showBoard = state.pane === "board";
+  const showSerial = state.pane === "serial";
   $("diff-pane").hidden = !showDiff;
   diffRoot.hidden = !showDiff;
   diffFilelist.hidden = !showDiff || state.changes.files.length === 0;
@@ -1516,12 +1679,22 @@ function openWorkbench(pane) {
   terminalRoot.hidden = !showTerminal;
   $("artifact-root").hidden = !showArtifact || !state.selectedArtifact;
   $("browser-root").hidden = !showBrowser;
+  $("board-root").hidden = !showBoard;
+  $("serial-root").hidden = !showSerial;
   if (showDiff) renderDiff();
   if (showFiles) api.send({ cmd: "getTree", path: "." });
   if (showHistory) api.send({ cmd: "getCheckpoints" });
   if (showArtifact) api.send({ cmd: "getArtifacts" });
   if (showTerminal) {
     openTerminal();
+  }
+  if (showBoard) {
+    // Two-phase: the host answers synchronously with the project half and
+    // fills the inventory in when the machine scan finishes.
+    api.send({ cmd: "getBoardState" });
+  }
+  if (showSerial) {
+    openSerialPane();
   }
   if (showBrowser) {
     void api.browserOpen();
@@ -1656,6 +1829,528 @@ function renderDiff() {
     }
   }
 }
+
+/* ---------- board pane ---------- */
+
+/**
+ * The Board pane is a report, not a control panel: it answers "what is attached
+ * and what will the tools use". The one thing it can change is the selection,
+ * because that is what the agent falls back to — and that selection is saved by
+ * the host, not held here.
+ */
+function renderBoard() {
+  const body = $("board-body");
+  const board = state.boardState;
+  if (!board) {
+    body.innerHTML = `<div class="board-empty">${escapeHtml(t.boardLoading)}</div>`;
+    return;
+  }
+
+  const parts = [];
+  const row = (label, value, cls = "", note = "") => {
+    parts.push(
+      `<div class="board-row"><span class="board-label">${escapeHtml(label)}</span>` +
+        `<span class="board-value${cls ? ` ${cls}` : ""}" title="${escapeHtml(value)}">${escapeHtml(value)}</span></div>` +
+        (note ? `<div class="board-note">${escapeHtml(note)}</div>` : ""),
+    );
+  };
+
+  const scanned = Boolean(board.scannedAt);
+  const project = board.project ?? { kind: "unknown", evidence: [] };
+
+  // Project. An unknown kind is not an error: it only means this folder is not
+  // firmware, and the probes and ports below are still true.
+  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardProject)}</div>`);
+  if (project.kind === "unknown") {
+    parts.push(`<div class="board-empty"><strong>${escapeHtml(t.boardNoProject)}</strong>${escapeHtml(t.boardNoProjectHint)}</div>`);
+  } else {
+    row(t.boardKind, project.kind, "ok");
+    if (project.evidence?.length) row(t.boardEvidence, project.evidence.join(", "));
+    if (project.root) row(t.boardRoot, project.root);
+  }
+  parts.push(`</div>`);
+
+  // Toolchains.
+  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardToolchains)}</div>`);
+  if (!scanned) {
+    parts.push(`<div class="board-empty">${escapeHtml(t.boardScanning)}</div>`);
+  } else if ((board.tools ?? []).length === 0) {
+    row(t.boardToolchains, t.boardNone, "bad");
+  } else {
+    for (const tool of board.tools) {
+      // A tool that ran but reported a problem is amber: it exists, and it may
+      // still be the reason a build or flash fails.
+      row(tool.kind, tool.version || tool.path || t.boardInstalled, tool.problem ? "warn" : "ok", tool.problem ?? "");
+    }
+  }
+  if ((board.missing ?? []).length > 0) {
+    row(t.boardMissing, board.missing.join(", "), "warn");
+  }
+  parts.push(`</div>`);
+
+  // Probes.
+  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardProbes)}</div>`);
+  if (!scanned) {
+    parts.push(`<div class="board-empty">${escapeHtml(t.boardScanning)}</div>`);
+  } else if ((board.probes ?? []).length === 0) {
+    row(t.boardProbe, t.boardNoProbe, "warn");
+    for (const note of board.probeNotes ?? []) parts.push(`<div class="board-note">${escapeHtml(note)}</div>`);
+  } else {
+    for (const probe of board.probes) {
+      const id = probe.serial ? ` · ${probe.serial}` : "";
+      // `target: n/a` used to be shown verbatim; it means the tool did not
+      // report one, which is different from a target named "n/a".
+      const target = probe.target ? `${t.boardReported} ${probe.target}` : t.boardNoReportedTarget;
+      row(probe.name || probe.kind, `${probe.kind}${id}`, "", target);
+    }
+  }
+  parts.push(`</div>`);
+
+  // Serial ports.
+  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardPorts)}</div>`);
+  if (!scanned) {
+    parts.push(`<div class="board-empty">${escapeHtml(t.boardScanning)}</div>`);
+  } else if ((board.ports ?? []).length === 0) {
+    row(t.boardPort, t.boardNoPort, "warn");
+  } else {
+    for (const port of board.ports) {
+      const detail = port.board || port.description || (port.vid ? `${port.vid}:${port.pid ?? "?"}` : "");
+      row(port.path, detail || t.boardPort, "", "");
+    }
+  }
+  parts.push(`</div>`);
+
+  // Selection and what it means.
+  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardSelection)}</div>`);
+  const effective = board.effective ?? {};
+  row(t.boardTarget, effective.target || t.boardUnset, effective.target ? "" : "warn", targetStatusNote());
+  row(t.boardSerial, effective.port ? `${effective.port} · ${effective.baud ?? 115200}` : t.boardUnset, effective.port ? "" : "warn");
+  if (effective.flasher) row(t.boardFlasher, effective.flasher);
+  const candidates = state.boardTargetStatus?.candidates ?? [];
+  if (candidates.length > 0 && state.boardTargetStatus.kind !== "exact") {
+    parts.push(`<div class="board-targets">`);
+    for (const candidate of candidates) {
+      const active = candidate.name === effective.target ? " active" : "";
+      parts.push(
+        `<button type="button" class="board-target${active}" data-target="${escapeHtml(candidate.name)}">${escapeHtml(candidate.name)}</button>`,
+      );
+    }
+    parts.push(`</div>`);
+  }
+  const portChoices = (board.ports ?? []).filter((port) => port.path !== effective.port);
+  if (portChoices.length > 0) {
+    parts.push(`<div class="board-targets">`);
+    for (const port of portChoices) {
+      parts.push(
+        `<button type="button" class="board-port" data-port="${escapeHtml(port.path)}">${escapeHtml(port.path)}</button>`,
+      );
+    }
+    parts.push(`</div>`);
+  }
+  parts.push(`</div>`);
+
+  // The last build. Absent until the agent builds in this session — an empty
+  // section would suggest the numbers exist and are zero.
+  if (board.build) {
+    parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardLastBuild)}</div>`);
+    if (board.build.usage) {
+      row(t.boardFlash, formatBytes(board.build.usage.flash));
+      row(t.boardRam, formatBytes(board.build.usage.ram));
+    } else {
+      row(t.boardBuild, board.build.ok ? t.boardBuildOk : t.boardBuildFailed, board.build.ok ? "ok" : "bad");
+    }
+    parts.push(`<div class="board-note">${escapeHtml(t.boardFromBuild)}</div>`);
+    parts.push(`</div>`);
+  }
+
+  body.innerHTML = parts.join("");
+  body.querySelectorAll("[data-target]").forEach((button) => {
+    button.addEventListener("click", () => saveBoardSelection({ target: button.dataset.target }));
+  });
+  body.querySelectorAll("[data-port]").forEach((button) => {
+    button.addEventListener("click", () => saveBoardSelection({ port: button.dataset.port }));
+  });
+}
+
+/** The one-line verdict under the Target row; this is the pane's whole point. */
+function targetStatusNote() {
+  const status = state.boardTargetStatus;
+  if (!status || status.kind === "unloaded") return t.boardTargetsUnloaded;
+  if (status.kind === "exact") return t.boardTargetExact;
+  if (status.kind === "candidates") return t.boardTargetCandidates;
+  return t.boardTargetAbsent;
+}
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function saveBoardSelection(patch) {
+  const next = { ...(state.board.selection ?? {}), ...patch };
+  api.send({ cmd: "setBoardSelection", selection: next });
+}
+
+function setBoardState(message) {
+  // The project phase arrives first and the inventory second; each replaces the
+  // previous wholesale, so a mode change or folder switch cannot leave stale
+  // toolchains on screen.
+  state.boardState = message.state;
+  state.board = state.boardState;
+  if (message.targetStatus) state.boardTargetStatus = message.targetStatus;
+  renderBoard();
+  renderBoardChip();
+}
+
+/* ---------- board chip in the composer ---------- */
+
+/** Hidden until there is something to say: a web project gets no extra chip. */
+function renderBoardChip() {
+  const control = $("board-control");
+  const selection = state.board.selection ?? {};
+  const projectKind = state.board.projectKind ?? "unknown";
+  const hasPorts = (state.boardState?.ports ?? []).length > 0;
+  const relevant = Boolean(selection.port || selection.target) || projectKind !== "unknown" || hasPorts;
+  control.hidden = !relevant;
+  if (!relevant) return;
+
+  const parts = [];
+  if (selection.port) parts.push(`${selection.port}${selection.baud ? ` · ${selection.baud}` : ""}`);
+  if (selection.target) parts.push(selection.target);
+  // This node carries no data-i18n on purpose: the locale sweep would overwrite
+  // it with placeholder text. Same reason as the model id label.
+  $("board-chip-value").textContent = parts.join(" · ") || t.boardChipNone;
+  $("board-chip-value").title = parts.join(" · ");
+}
+
+function openBoardMenu() {
+  const menu = $("board-menu");
+  const selection = state.board.selection ?? {};
+  const ports = state.boardState?.ports ?? [];
+  const parts = [];
+  if (ports.length === 0) {
+    parts.push(`<div class="menu-empty">${escapeHtml(t.boardNoPort)}</div>`);
+  } else {
+    for (const port of ports) {
+      const detail = port.board || port.description || (port.vid ? `${port.vid}:${port.pid ?? "?"}` : "");
+      const active = port.path === selection.port ? " active" : "";
+      parts.push(
+        `<button type="button" role="menuitem" class="model-option${active}" data-port="${escapeHtml(port.path)}">` +
+          `<span>${escapeHtml(port.path)}</span>` +
+          (detail ? `<span class="model-meta">${escapeHtml(detail)}</span>` : "") +
+          `</button>`,
+      );
+    }
+  }
+  parts.push(`<div class="menu-sep"></div>`);
+  parts.push(`<button type="button" role="menuitem" class="menu-action" data-action="board">${escapeHtml(t.boardOpenPane)}</button>`);
+  parts.push(`<button type="button" role="menuitem" class="menu-action" data-action="refresh">${escapeHtml(t.boardRefresh)}</button>`);
+  menu.innerHTML = parts.join("");
+  menu.hidden = false;
+  $("board-picker").setAttribute("aria-expanded", "true");
+
+  menu.querySelectorAll("[data-port]").forEach((button) => {
+    button.addEventListener("click", () => {
+      saveBoardSelection({ port: button.dataset.port });
+      closeBoardMenu();
+    });
+  });
+  menu.querySelector('[data-action="board"]').addEventListener("click", () => {
+    closeBoardMenu();
+    openWorkbench("board");
+  });
+  menu.querySelector('[data-action="refresh"]').addEventListener("click", () => {
+    closeBoardMenu();
+    api.send({ cmd: "getBoardState", refresh: "all" });
+  });
+}
+
+function closeBoardMenu() {
+  $("board-menu").hidden = true;
+  $("board-picker").setAttribute("aria-expanded", "false");
+}
+
+$("board-picker").addEventListener("click", (event) => {
+  event.stopPropagation();
+  if ($("board-menu").hidden) openBoardMenu();
+  else closeBoardMenu();
+});
+
+$("board-refresh").addEventListener("click", () => api.send({ cmd: "getBoardState", refresh: "all" }));
+$("board-load-targets").addEventListener("click", () => {
+  // Loading the table is the one expensive call in this pane; it happens here
+  // and nowhere else.
+  $("board-load-targets").disabled = true;
+  $("board-load-targets").textContent = t.boardLoadingTargets;
+  api.send({ cmd: "getBoardTargets" });
+});
+
+/* ---------- serial pane ---------- */
+
+const SERIAL_BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
+const SERIAL_MAX_LINES = 4000;
+
+function openSerialPane() {
+  fillSerialControls();
+  // Never open the port automatically: asserting DTR resets most boards, and
+  // the agent may be using it. A status read only fetches the ring.
+  api.send({ cmd: "serialStatus" });
+}
+
+function fillSerialControls() {
+  const portSelect = $("serial-port");
+  const baudSelect = $("serial-baud");
+  const ports = state.boardState?.ports ?? [];
+  const selection = state.board.selection ?? {};
+  const wantedPort = state.serial.port || selection.port || (ports.length === 1 ? ports[0].path : "");
+
+  portSelect.innerHTML = "";
+  if (ports.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = t.boardNoPort;
+    portSelect.appendChild(option);
+  }
+  for (const port of ports) {
+    const option = document.createElement("option");
+    option.value = port.path;
+    option.textContent = port.path;
+    portSelect.appendChild(option);
+  }
+  // A selection may name a port that is not currently attached; keeping it on
+  // the list lets the user see what they picked instead of silently dropping it.
+  if (wantedPort && !ports.some((port) => port.path === wantedPort)) {
+    const option = document.createElement("option");
+    option.value = wantedPort;
+    option.textContent = wantedPort;
+    portSelect.appendChild(option);
+  }
+  if (wantedPort) portSelect.value = wantedPort;
+
+  if (baudSelect.options.length === 0) {
+    for (const baud of SERIAL_BAUDS) {
+      const option = document.createElement("option");
+      option.value = String(baud);
+      option.textContent = String(baud);
+      baudSelect.appendChild(option);
+    }
+  }
+  baudSelect.value = String(state.serial.baud || selection.baud || 115200);
+  portSelect.disabled = state.serial.open;
+  baudSelect.disabled = state.serial.open;
+  $("serial-toggle").textContent = state.serial.open ? t.serialStop : t.serialStart;
+  $("serial-toggle").classList.toggle("btn-primary", !state.serial.open);
+  renderSerialStatus();
+}
+
+function renderSerialStatus() {
+  const status = $("serial-status");
+  const serial = state.serial;
+  const parts = [];
+  if (serial.open) {
+    parts.push(`${t.serialConnected} · ${serial.port} · ${serial.baud}`);
+    status.className = "serial-status live";
+  } else {
+    parts.push(t.serialDisconnected);
+    status.className = serial.lastError ? "serial-status bad" : "serial-status";
+  }
+  if (serial.lastError) parts.push(serial.lastError);
+  if (serial.paused) {
+    parts.push(`${t.serialPausedState}${serial.pausedBacklog ? ` · ${serial.pausedBacklog} ${t.serialNewLines}` : ""}`);
+  } else if (serial.dropped) {
+    parts.push(`${serial.dropped} ${t.serialDropped}`);
+  }
+  if (serial.filtered) parts.push(`${serial.filtered} ${t.serialFiltered}`);
+  status.textContent = parts.join(" · ");
+  $("serial-pause").disabled = !serial.open;
+  setIcon($("serial-pause").querySelector("svg"), serial.paused ? "play" : "pause");
+  $("serial-follow").setAttribute("aria-pressed", String(serial.follow));
+}
+
+/** One row per line; `serial_text` keeps the message, the rest is gutter. */
+function serialLineNode(line) {
+  const row = document.createElement("div");
+  row.className = `serial-line${line.level ? ` ${line.level}` : ""}`;
+  const time = new Date(line.at).toTimeString().slice(0, 8);
+  const millis = String(new Date(line.at).getMilliseconds()).padStart(3, "0");
+
+  const timeEl = document.createElement("span");
+  timeEl.className = "serial-time";
+  timeEl.textContent = `${time}.${millis}`;
+
+  const levelEl = document.createElement("span");
+  levelEl.className = `serial-level${line.level ? ` ${line.level}` : ""}`;
+  levelEl.textContent = line.level ? line.level.toUpperCase().slice(0, 5) : "";
+
+  const tagEl = document.createElement("span");
+  tagEl.className = "serial-tag";
+  tagEl.textContent = line.tag ?? "";
+
+  const textEl = document.createElement("span");
+  textEl.className = "serial-text";
+  textEl.textContent = line.text;
+
+  row.append(timeEl, levelEl, tagEl, textEl);
+  if (line.level) row.dataset.level = line.level;
+  return row;
+}
+
+/** Whether a line survives the current filter. An unlevelled line is info. */
+function serialVisible(line) {
+  if (state.serial.filter === "all") return true;
+  const level = line.level ?? "info";
+  if (state.serial.filter === "warn") return level === "error" || level === "warn";
+  return level === "error";
+}
+
+function appendSerialLines(lines) {
+  const output = $("serial-output");
+  const pinned = output.scrollTop + output.clientHeight >= output.scrollHeight - 24;
+  const serial = state.serial;
+  serial.lines.push(...lines);
+  // Keep the renderer's ring in step with the host's, so a re-render after a
+  // long run does not grow without bound.
+  if (serial.lines.length > SERIAL_MAX_LINES) {
+    const excess = serial.lines.length - SERIAL_MAX_LINES;
+    serial.lines.splice(0, excess);
+    for (let index = 0; index < excess; index++) output.firstElementChild?.remove();
+  }
+
+  serial.filtered = 0;
+  for (const line of lines) {
+    if (!serialVisible(line)) {
+      serial.filtered += 1;
+      continue;
+    }
+    output.appendChild(serialLineNode(line));
+  }
+  while (output.childElementCount > SERIAL_MAX_LINES) output.firstElementChild?.remove();
+  if (serial.follow && pinned) output.scrollTop = output.scrollHeight;
+  renderSerialStatus();
+}
+
+/** Rebuild the visible rows from the ring: used after a filter or a resume. */
+function rerenderSerialLines() {
+  const output = $("serial-output");
+  output.innerHTML = "";
+  state.serial.filtered = 0;
+  const fragment = document.createDocumentFragment();
+  for (const line of state.serial.lines) {
+    if (!serialVisible(line)) {
+      state.serial.filtered += 1;
+      continue;
+    }
+    fragment.appendChild(serialLineNode(line));
+  }
+  output.appendChild(fragment);
+  if (state.serial.follow) output.scrollTop = output.scrollHeight;
+  renderSerialStatus();
+}
+
+function setSerialState(message) {
+  const serial = state.serial;
+  if ("open" in message) serial.open = Boolean(message.open);
+  if ("port" in message) serial.port = message.port ?? null;
+  if ("baud" in message) serial.baud = message.baud ?? null;
+  if (message.error) serial.lastError = message.error;
+  else if (serial.open) serial.lastError = "";
+  if (!serial.open) {
+    serial.paused = false;
+    serial.pausedBacklog = 0;
+  } else {
+    // Opening a port starts a fresh ring on the host.
+    $("serial-output").innerHTML = "";
+    serial.lines = [];
+    serial.filtered = 0;
+    serial.dropped = 0;
+    serial.follow = true;
+  }
+  fillSerialControls();
+  renderSerialStatus();
+}
+
+$("serial-toggle").addEventListener("click", () => {
+  const serial = state.serial;
+  if (serial.open) {
+    api.send({ cmd: "serialClose" });
+    return;
+  }
+  const port = $("serial-port").value;
+  if (!port) return;
+  const baud = Number($("serial-baud").value) || 115200;
+  state.serial.port = port;
+  state.serial.baud = baud;
+  // Opening the monitor also states the port the agent should use; the two are
+  // the same decision, and making the user repeat it is how they diverge.
+  if ((state.board.selection ?? {}).port !== port) saveBoardSelection({ port, baud });
+  api.send({ cmd: "serialOpen", port, baud });
+});
+
+$("serial-pause").addEventListener("click", () => {
+  const serial = state.serial;
+  serial.paused = !serial.paused;
+  if (!serial.paused) {
+    serial.pausedBacklog = 0;
+    rerenderSerialLines();
+  }
+  renderSerialStatus();
+});
+
+$("serial-clear").addEventListener("click", () => {
+  state.serial.lines = [];
+  state.serial.filtered = 0;
+  $("serial-output").innerHTML = "";
+  api.send({ cmd: "serialClear" });
+  renderSerialStatus();
+});
+
+$("serial-export").addEventListener("click", () => {
+  const lines = state.serial.lines.map((line) => {
+    const time = new Date(line.at).toISOString();
+    const level = line.level ? line.level.toUpperCase().padEnd(5) : "     ";
+    const tag = line.tag ? `${line.tag}: ` : "";
+    return `${time} ${level} ${tag}${line.text}`;
+  });
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  void api.saveFile(`serial-${state.serial.port ?? "monitor"}-${stamp}.log`, `${lines.join("\n")}\n`, [
+    { name: "Log", extensions: ["log", "txt"] },
+  ]);
+});
+
+$("serial-follow").addEventListener("click", () => {
+  state.serial.follow = !state.serial.follow;
+  if (state.serial.follow) {
+    const output = $("serial-output");
+    output.scrollTop = output.scrollHeight;
+  }
+  renderSerialStatus();
+});
+
+$("serial-output").addEventListener("scroll", () => {
+  const output = $("serial-output");
+  const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 24;
+  // Scrolling up is the same gesture as unpinning in the terminal; the explicit
+  // button is for people who want it to stay put.
+  if (!atBottom && state.serial.follow) {
+    state.serial.follow = false;
+    renderSerialStatus();
+  }
+});
+
+$("serial-filter").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-filter]");
+  if (!button) return;
+  state.serial.filter = button.dataset.filter;
+  $("serial-filter").querySelectorAll("button").forEach((entry) => {
+    entry.classList.toggle("active", entry === button);
+  });
+  rerenderSerialLines();
+});
+
+$("serial-port").addEventListener("change", () => {
+  saveBoardSelection({ port: $("serial-port").value, baud: Number($("serial-baud").value) || 115200 });
+});
 
 /* ---------- inline review comments ---------- */
 
@@ -2814,6 +3509,8 @@ function paletteEntries() {
     { label: t.tabArtifacts, run: () => openWorkbench("artifact") },
     { label: t.tabHistory, run: () => openWorkbench("history") },
     { label: t.paneTerminal, run: () => openWorkbench("terminal") },
+    { label: t.paneBoard, run: () => openWorkbench("board") },
+    { label: t.paneSerial, run: () => openWorkbench("serial") },
     { label: t.paneBrowser, run: () => openWorkbench("browser") },
     { label: t.shortcutFind, run: openFind },
     { label: t.worktreeLabel, run: () => { $("worktree-panel").hidden = false; } },
@@ -3160,6 +3857,7 @@ const settings = createSettings({
 const openSettings = (tab) => settings.open(tab);
 const openSetup = () => settings.openSetup();
 const refreshVersion = () => settings.refreshVersion();
+applySettingsLocale = () => settings.applyLocaleChange();
 $("settings-button").addEventListener("click", () => openSettings());
 
 /* ---------- shortcuts sheet ---------- */

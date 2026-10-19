@@ -223,6 +223,35 @@ function startWindow() {
     sendToHost({ cmd: "init", cwd: hostCwd, mode: process.env.PROMETHEUS_PERMISSION_MODE });
   }
 
+  /**
+   * Stop the agent process without orphaning its grandchildren.
+   *
+   * `kill()` on Windows is TerminateProcess: the host never runs its stdin-end
+   * handler, so the PowerShell reading a serial port survives and keeps COM7
+   * open. The host therefore has a `shutdown` command that disposes its ports
+   * and exits; this asks for it, closes stdin as a second signal, and only
+   * falls back to a hard kill if the process is still there after 500 ms.
+   */
+  function stopHost() {
+    const target = host;
+    host = null;
+    if (!target) return;
+    try {
+      if (target.stdin.writable) target.stdin.write(`${JSON.stringify({ cmd: "shutdown" })}\n`);
+      target.stdin.end();
+    } catch {
+      /* already gone */
+    }
+    const timer = setTimeout(() => {
+      try {
+        target.kill();
+      } catch {
+        /* already gone */
+      }
+    }, 500);
+    target.once("exit", () => clearTimeout(timer));
+  }
+
   // IPC is app-wide; route each window's commands to its own host. Without
   // this a second window would drive the first window's agent.
   ipcMain.on("host-send", (event, payload) => {
@@ -231,11 +260,7 @@ function startWindow() {
 
   ipcMain.on("host-restart", (event) => {
     if (win.isDestroyed() || event.sender !== win.webContents) return;
-    try {
-      host?.kill();
-    } catch {
-      /* already gone */
-    }
+    stopHost();
     startHost(hostCwd);
   });
 
@@ -243,11 +268,7 @@ function startWindow() {
     if (explicitWorkspace) rememberWorkspace(explicitWorkspace, true);
   });
   win.on("closed", () => {
-    try {
-      host?.kill();
-    } catch {
-      /* already gone */
-    }
+    stopHost();
   });
   startHost(startCwd);
 
@@ -331,10 +352,16 @@ app.whenReady().then(() => {
     if (existsSync(path)) shell.showItemInFolder(path);
   });
 
-  ipcMain.handle("save-file", async (_event, { suggestedName, content }) => {
+  ipcMain.handle("save-file", async (_event, { suggestedName, content, filters }) => {
+    // The transcript exports Markdown; the serial monitor exports a .log. The
+    // extension of the suggested name is the honest default, and a caller that
+    // knows better passes its own filters.
+    const chosen = Array.isArray(filters) && filters.length > 0
+      ? filters
+      : [{ name: "Markdown", extensions: ["md"] }];
     const result = await dialog.showSaveDialog({
       defaultPath: suggestedName || "export.md",
-      filters: [{ name: "Markdown", extensions: ["md"] }],
+      filters: chosen,
     });
     if (result.canceled || !result.filePath) return { saved: false };
     writeFileSync(result.filePath, String(content ?? ""), "utf8");
