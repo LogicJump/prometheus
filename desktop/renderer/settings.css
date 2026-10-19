@@ -933,6 +933,120 @@
 
 /* ---------- toolchain packs ---------- */
 
+/* 本机检测到的工具链：一行一个工具，左边一个状态点。
+   用 pack-row 的节奏，但更矮 —— 这一页可能有 23 行，太重会变成表格墙。 */
+.tc-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tc-row:last-child {
+  border-bottom: none;
+}
+
+.tc-row.tc-missing {
+  opacity: 0.62;
+}
+
+.tc-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-faint);
+}
+
+.tc-dot.ok {
+  background: var(--success);
+}
+
+.tc-dot.warn {
+  background: var(--warn);
+}
+
+.tc-purpose {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.tc-path {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tc-source {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.tc-count {
+  float: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+/* 搜索路径是可展开的说明，不是内容。折叠状态只有一行。 */
+.tc-searched {
+  margin-top: 4px;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.tc-searched > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 4px 0;
+}
+
+.tc-searched > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tc-searched > summary::before {
+  content: "▸ ";
+}
+
+.tc-searched[open] > summary::before {
+  content: "▾ ";
+}
+
+.tc-search-paths {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 4px 0 8px 12px;
+}
+
+.tc-search-paths code {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  word-break: break-all;
+}
+
+/* "怎么装"紧挨着"未安装"，而不是要滚到页尾再自己对名字。 */
+.tc-install {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.pack-none {
+  margin-top: 10px;
+}
+
 .pack-summary {
   display: flex;
   align-items: baseline;

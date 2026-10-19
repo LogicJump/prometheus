@@ -47,7 +47,7 @@ import { installFromManifest, installPack } from "../src/packs/install.ts";
 import { packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
 import { catalogFor, isInstallable, toInstallEntry } from "../src/packs/catalog.ts";
 import { runGoal, runTaskLoop } from "../src/autoloop.ts";
-import { detectToolchains, resetToolchainCache } from "../src/embedded/toolchain.ts";
+import { detectToolchains, resetToolchainCache, TOOLCHAIN_INFO } from "../src/embedded/toolchain.ts";
 import { detectProject } from "../src/embedded/project.ts";
 import { listProbes, listTargets } from "../src/embedded/probe.ts";
 import { listSerialPorts, openPort } from "../src/embedded/serial.ts";
@@ -1040,11 +1040,35 @@ async function handle(cmd) {
     case "getPacks": {
       try {
         const summary = packsSummary();
+        // 本机检测结果与已安装的 pack 一起发：用户打开这一页想知道的是
+        // "我有什么、还缺什么"，而不是"这个应用自己下过什么"。两者分开
+        // 显示会让人误以为 Board 面板里看到的 pyocd 不归这里管。
+        let detected = null;
+        try {
+          const report = await detectToolchains();
+          detected = {
+            tools: report.tools.map((tool) => ({
+              kind: tool.kind,
+              path: tool.path,
+              version: tool.version,
+              source: tool.source,
+              problem: tool.problem,
+            })),
+            missing: report.missing,
+            searchPaths: report.searchPaths,
+          };
+        } catch {
+          /* detection is optional; the pack list is still worth showing */
+        }
         send({
           type: "packs",
           root: summary.root,
           freeBytes: summary.freeBytes,
           totalBytes: summary.totalBytes,
+          detected,
+          // The renderer cannot import the TypeScript module, and the labels
+          // are part of the answer rather than decoration: send the table.
+          toolchains: Object.entries(TOOLCHAIN_INFO).map(([kind, info]) => ({ kind, ...info })),
           packs: summary.packs.map((pack) => ({
             manifest: {
               id: pack.manifest.id,

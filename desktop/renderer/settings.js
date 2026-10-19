@@ -1181,10 +1181,14 @@ function formatPackBytes(bytes) {
   return `${value.toFixed(unit >= 3 ? 2 : 1)} ${units[unit]}`;
 }
 
-function buildToolsPage() {  const s = S();
+function buildToolsPage() {
+  const s = S();
   const pane = sPage(s.pageTools, s.pageToolsDesc);
-  // 顺序即优先级：根目录与占用在第一行，进度条其次，包列表最后。
+  // 顺序即优先级：本机有什么、装了什么、还能装什么。用户打开这一页问的
+  // 就是这三个问题，按这个顺序回答。
+  const detectedBox = el("section", "setting-group");
   const summary = el("div", "pack-summary");
+  pane.appendChild(detectedBox);
   pane.appendChild(summary);
 
   const list = el("div", "pack-list");
@@ -1192,7 +1196,111 @@ function buildToolsPage() {  const s = S();
 
   const formatBytes = formatPackBytes;
 
+  /** kind → the one-line purpose, from the host's table. */
+  const infoFor = (kind) => Object.values(state.toolchainInfo ?? {}).find((entry) => entry.kind === kind) ?? { kind, label: kind, purpose: "", group: "build" };
+
+  /** `14.2.Rel1 (Build arm-14.52)) 14.2.1 20241119` is three versions in a trench coat. */
+  const shortVersion = (text) => {
+    const first = String(text ?? "").split(/[\s(]/).filter(Boolean)[0] ?? "";
+    return first.length > 24 ? `${first.slice(0, 24)}…` : first;
+  };
+
+  /** A catalog entry that would satisfy `kind` and is not installed yet. */
+  const availableEntryFor = (kind) => {
+    const installed = new Set((state.packState?.packs ?? []).map((pack) => pack.manifest.id));
+    return (state.packCatalog ?? []).find(
+      (entry) => entry.installable && !installed.has(entry.id) && (entry.provides ?? []).includes(kind),
+    );
+  };
+
+  /**
+   * 本机检测到的工具链。
+   *
+   * 这一段以前不存在，于是 Board 面板里能看到 pyocd、设置页里却看不到 ——
+   * 用户会以为设置页只负责"下载"，而不是"告诉我手上有什么"。每一行都带
+   * 一句这个工具是干什么的：`gcc-arm` 对做这个应用的人是常识，对刚装上
+   * 的人是噪音。
+   */
+  const renderDetected = (detected) => {
+    detectedBox.innerHTML = "";
+    if (!detected) return;
+
+    const found = new Map(detected.tools.map((tool) => [tool.kind, tool]));
+    const groups = [
+      { id: "build", title: s.tcGroupBuild },
+      { id: "flash", title: s.tcGroupFlash },
+      { id: "monitor", title: s.tcGroupMonitor },
+      { id: "analyze", title: s.tcGroupAnalyze },
+    ];
+    for (const group of groups) {
+      const kinds = (state.toolchainKinds ?? []).filter((kind) => infoFor(kind).group === group.id);
+      if (kinds.length === 0) continue;
+      const section = el("section", "setting-group");
+      const heading = el("h3", "setting-group-title", group.title);
+      const counts = kinds.filter((kind) => found.has(kind)).length;
+      heading.appendChild(el("span", "tc-count", `${counts}/${kinds.length}`));
+      section.appendChild(heading);
+
+      for (const kind of kinds) {
+        const tool = found.get(kind);
+        const row = el("div", `tc-row${tool ? "" : " tc-missing"}`);
+        row.dataset.search = `${infoFor(kind).label} ${kind} ${infoFor(kind).purpose}`.toLowerCase();
+
+        const dot = el("span", `tc-dot${tool ? (tool.problem ? " warn" : " ok") : ""}`);
+        dot.title = tool ? (tool.problem || s.tcFound) : s.tcMissing;
+        row.appendChild(dot);
+
+        const main = el("div", "pack-main");
+        const title = el("div", "pack-title");
+        title.appendChild(el("strong", "", infoFor(kind).label));
+        if (tool?.version) title.appendChild(el("span", "pack-version", shortVersion(tool.version)));
+        main.appendChild(title);
+        main.appendChild(el("div", "tc-purpose", infoFor(kind).purpose));
+
+        if (tool?.path) {
+          const path = el("div", "tc-path", tool.path);
+          path.title = tool.path;
+          main.appendChild(path);
+        } else if (tool?.problem) {
+          main.appendChild(el("div", "pack-problem", tool.problem));
+        }
+        row.appendChild(main);
+
+        // 来源：PATH、安装目录、还是 Prometheus 装的 pack。用户在排查
+        // "为什么用的是旧版本"时，这一列就是答案。
+        if (tool?.source) row.appendChild(el("span", "tc-source", s.tcSource?.[tool.source] ?? tool.source));
+
+        // 未安装的工具若正好在可安装目录里，就在这里给一个入口 ——
+        // 用户看到"未安装"的下一个念头就是"那怎么装"，不该让他滚到页面
+        // 底部再自己把名字对上。
+        if (!tool) {
+          const entry = availableEntryFor(kind);
+          if (entry) {
+            const install = sButton(s.packInstall, () => api.send({ cmd: "installPack", id: entry.id }), { quiet: true });
+            install.classList.add("tc-install");
+            row.appendChild(install);
+          }
+        }
+        section.appendChild(row);
+      }
+      detectedBox.appendChild(section);
+    }
+
+    if ((detected.searchPaths ?? []).length) {
+      // 搜索路径默认折叠。它是排查"为什么没找到"时才需要的信息，展开时
+      // 占掉五行会把下面的"可安装"推到屏幕外——用户来这一页首先想装的。
+      const details = el("details", "tc-searched");
+      const summary = el("summary", "", s.tcSearched.replace("{n}", String(detected.searchPaths.length)));
+      details.appendChild(summary);
+      const paths = el("div", "tc-search-paths");
+      for (const path of detected.searchPaths) paths.appendChild(el("code", "", path));
+      details.appendChild(paths);
+      detectedBox.appendChild(details);
+    }
+  };
+
   const render = () => {
+    renderDetected(state.packState?.detected ?? null);
     const packs = state.packState;
     list.innerHTML = "";
 
@@ -1297,7 +1405,7 @@ function buildToolsPage() {  const s = S();
     // 可安装的条目。已经装过的那个不再列出来 —— 同一份东西出现在
     // "已安装"和"可安装"两处，用户只会读成"还能再装一次"。
     const installedIds = new Set((packs.packs ?? []).map((pack) => pack.manifest.id));
-    const available = (state.packCatalog ?? []).filter((entry) => !installedIds.has(entry.id));
+    const available = (state.packCatalog ?? []).filter((entry) => !installedIds.has(entry.id) && entry.installable);
     if (available.length) {
       const group = el("section", "setting-group");
       group.appendChild(el("h3", "setting-group-title", s.packAvailable));
@@ -1316,6 +1424,13 @@ function buildToolsPage() {  const s = S();
         group.appendChild(row);
       }
       list.appendChild(group);
+    } else {
+      // 没有可安装项时不安静地留白：用户会以为页面坏了。真实原因有两种,
+      // 都要说清楚 —— 已经装完了，或者目录里还没有通过校验的条目。
+      const pending = (state.packCatalog ?? []).filter((entry) => !entry.installable && !installedIds.has(entry.id));
+      const note = el("p", "setting-note pack-none");
+      note.textContent = pending.length ? s.packNonePending : s.packNoneInstalled;
+      list.appendChild(note);
     }
 
     // 离线安装：内网机器连不上下载站时，用户手上只有别人拷过来的
@@ -1751,6 +1866,11 @@ function basename(path) {
         break;
       case "packs":
         state.packState = message;
+        // The toolchain table arrives with the same message so a language
+        // switch rebuilds from one source instead of racing two.
+        state.toolchainInfo = {};
+        for (const entry of message.toolchains ?? []) state.toolchainInfo[entry.kind] = entry;
+        state.toolchainKinds = (message.toolchains ?? []).map((entry) => entry.kind);
         state.renderPackPage?.();
         break;
       case "pack_catalog":
