@@ -96,7 +96,9 @@ Desktop app:
 - **Diff-first review** — per-file changes, inline comments, send feedback to
   the agent.
 - **Checkpoints** — restore individual file writes or the whole session.
-- **Persistent terminal** — a shell that stays open in the workspace.
+- **Persistent terminal** — a shell that stays open in the workspace. It is a
+  command runner, not a PTY: non-interactive commands, builds and `cd` work,
+  while `vim`, a REPL or a password prompt needs a real terminal.
 - **Artifacts and browser panes** — preview generated files; drop page text into
   the composer.
 - **Worktrees** — run sessions on isolated branches, then merge or discard.
