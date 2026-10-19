@@ -19,8 +19,12 @@ test("protected paths cover the machinery, not the source", () => {
   // Ordinary source stays ordinary.
   assert.equal(isProtectedPath(join(cwd, "src", "app.ts"), cwd), false);
   assert.equal(isProtectedPath(join(cwd, "README.md"), cwd), false);
-  // Outside the workspace is the confinement check's job, not this one's.
-  assert.equal(isProtectedPath(join(cwd, "..", ".git", "config"), cwd), false);
+  // A path outside the workspace is still protected when it names machinery:
+  // `~/.ssh/config` and `~/.prometheus/config.json` decide how later commands
+  // and sessions behave, so a write there is the escalation this list exists
+  // to catch. Concurrency against the workspace is a separate check.
+  assert.equal(isProtectedPath(join(cwd, "..", ".git", "config"), cwd), true);
+  assert.equal(isProtectedPath(join(cwd, "..", "notes.txt"), cwd), false);
 });
 
 test("deleting the workspace or home root is refused in every mode", () => {

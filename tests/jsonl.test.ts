@@ -5,12 +5,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SESSIONS_DIR } from "../src/config.ts";
 import {
   appendMessages,
   deleteSessionFile,
+  latestSession,
   listSessions,
   loadMessages,
   loadSession,
@@ -146,5 +147,31 @@ test("sessions in the same folder are one project even when stored with differen
   } finally {
     deleteSessionFile(a);
     deleteSessionFile(b);
+  }
+});
+
+test("--continue picks the most recent session, not a pinned older one", () => {
+  const older = newSessionId();
+  const newer = newSessionId();
+  const folder = `C:/tmp/continue-${Date.now()}`;
+  try {
+    saveSession({ ...baseRecord(older, [{ role: "user", content: "old" }]), cwd: folder });
+    saveSession({ ...baseRecord(newer, [{ role: "user", content: "new" }]), cwd: folder });
+    // Pin the old one: the sidebar floats it to the top on purpose, and that
+    // ordering is exactly what `--continue` must not inherit.
+    updateSessionFlags(older, { pinned: true });
+    // Pinning refreshes `updatedAt`, so the ordering has to be restored by
+    // hand. Two saves in the same millisecond would tie otherwise.
+    const metaPath = join(SESSIONS_DIR, older, "meta.json");
+    const meta = JSON.parse(readFileSync(metaPath, "utf8"));
+    meta.createdAt = "2020-01-01T00:00:00.000Z";
+    meta.updatedAt = "2020-01-01T00:00:00.000Z";
+    writeFileSync(metaPath, JSON.stringify(meta));
+    const listed = listSessions(false).filter((session) => session.cwd === folder);
+    assert.equal(listed[0].id, older, "the sidebar still floats the pinned session");
+    assert.equal(latestSession(folder)?.id, newer, "--continue follows recency instead");
+  } finally {
+    deleteSessionFile(older);
+    deleteSessionFile(newer);
   }
 });

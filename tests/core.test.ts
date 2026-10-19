@@ -141,7 +141,7 @@ test("a failed model summary falls back to the local recap", async () => {
   });
   assert.ok(result);
   assert.equal(result.level, "local-fallback");
-  assert.match(String(result.messages[1].content), /User requests/);
+  assert.match(String(result.messages[1].content), /Original goal/);
 });
 
 test("trim handles small overflows without calling the model", async () => {

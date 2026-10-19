@@ -5,12 +5,18 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { hooksFor, loadHooks, runHooks } from "../src/hooks.ts";
+import { hooksFor, loadHooks, runHooks, trustProjectHooks } from "../src/hooks.ts";
 
+/**
+ * A workspace whose project hooks have been accepted, which is the state a
+ * user reaches by approving the checkout. Untrusted loading is covered in
+ * round3-security.test.ts.
+ */
 function workspace(hooks: object) {
   const dir = mkdtempSync(join(tmpdir(), "prometheus-hooks-"));
   mkdirSync(join(dir, ".prometheus"), { recursive: true });
   writeFileSync(join(dir, ".prometheus", "hooks.json"), JSON.stringify({ hooks }), "utf8");
+  trustProjectHooks(dir);
   return dir;
 }
 

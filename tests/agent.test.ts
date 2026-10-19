@@ -137,3 +137,22 @@ test("path escapes are rejected", async () => {
     process.chdir(previous);
   }
 });
+
+test("replaceToolsByPrefix drops a server's stale tools and keeps the rest", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "prometheus-tools-"));
+  const { agent, fake } = await makeAgent(workspace, () => ({ text: "ok" }));
+  try {
+    const tool = (name: string) => ({ name, description: name, readonly: true, parameters: { type: "object", properties: {} }, execute: async () => ({ content: "" }) });
+    agent.addTools([tool("mcp__a__one"), tool("mcp__a__two"), tool("mcp__b__keep")]);
+    agent.replaceToolsByPrefix("mcp__a__", [tool("mcp__a__three")]);
+    const names = agent.tools.map((entry) => entry.name);
+    // The default tool set is still there; only server `a`'s entries moved.
+    assert.ok(!names.includes("mcp__a__one"), "the stale tool stayed");
+    assert.ok(!names.includes("mcp__a__two"), "the stale tool stayed");
+    assert.ok(names.includes("mcp__a__three"), "the replacement is missing");
+    assert.ok(names.includes("mcp__b__keep"), "another server's tool was removed");
+    assert.ok(names.includes("read_file"), "the built-in tools were removed");
+  } finally {
+    await fake.close();
+  }
+});

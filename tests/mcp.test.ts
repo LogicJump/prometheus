@@ -24,9 +24,15 @@ test("a stdio server initializes and its tools are wrapped as local tools", asyn
     const loaded = await loadMcpTools(dir, 10_000);
     try {
       assert.deepEqual(loaded.errors, []);
-      assert.equal(loaded.tools.length, 1);
-      const tool = loaded.tools[0];
-      assert.equal(tool.name, "mcp__fake__echo");
+      // Three tools across two pages: echo, announce and ask on the first,
+      // shot on the second. `mcp_read_resource` is added because this server
+      // also advertises a resource. Seeing all of them proves the cursor is
+      // followed.
+      assert.deepEqual(
+        loaded.tools.map((tool) => tool.name).sort(),
+        ["mcp__fake__announce", "mcp__fake__ask", "mcp__fake__echo", "mcp__fake__shot", "mcp_read_resource"],
+      );
+      const tool = loaded.tools.find((candidate) => candidate.name === "mcp__fake__echo")!;
       const result = await tool.execute({ text: "hi" }, {});
       assert.equal(result.content, "echo:hi");
       assert.equal(result.isError, false);
@@ -80,6 +86,87 @@ test("an MCP error response rejects the call", async () => {
     await assert.rejects(() => client.request("bogus/method", {}), /no method/);
   } finally {
     client.dispose();
+  }
+});
+
+test("a JSON-RPC error keeps its code and data instead of flattening to a message", async () => {
+  const client = new StdioMcpClient("fake", { command: process.execPath, args: [SERVER] });
+  try {
+    await client.initialize();
+    const error = await client.request("bogus/method", {}).then(
+      () => null,
+      (err: Error & { code?: number; data?: unknown }) => err,
+    );
+    assert.ok(error, "the request resolved instead of rejecting");
+    assert.equal(error.code, -32601);
+    assert.deepEqual(error.data, { method: "bogus/method" });
+  } finally {
+    client.dispose();
+  }
+});
+
+test("prompts/get returns the server's own text, not the prompt's name", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-mcp-prompt-"));
+  mkdirSync(join(dir, ".prometheus"), { recursive: true });
+  writeFileSync(
+    join(dir, ".prometheus", "mcp.json"),
+    JSON.stringify({ servers: { fake: { command: process.execPath, args: [SERVER] } } }),
+    "utf8",
+  );
+  try {
+    const loaded = await loadMcpTools(dir, 10_000);
+    try {
+      const client = loaded.byServer.get("fake")!;
+      assert.ok(client.getPrompt, "the prompt method was not exposed");
+      const result = await client.getPrompt!("review", { path: "src/a.ts" });
+      const text = (result.messages[0] as { content?: { text?: string } })?.content?.text ?? "";
+      assert.match(text, /Review the file at src\/a\.ts/);
+    } finally {
+      for (const each of loaded.clients) each.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a non-text content part is reported rather than dropped", async () => {
+  const client = new StdioMcpClient("fake", { command: process.execPath, args: [SERVER] });
+  try {
+    await client.initialize();
+    const result = await client.callTool("shot", {});
+    // The bytes stay out of the transcript, but a screenshot tool that reads
+    // "(no output)" tells the model nothing happened.
+    assert.match(result.content, /captured/);
+    assert.match(result.content, /\[image image\/png/);
+  } finally {
+    client.dispose();
+  }
+});
+
+test("a list_changed notification reaches the refresh callback", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-mcp-refresh-"));
+  mkdirSync(join(dir, ".prometheus"), { recursive: true });
+  writeFileSync(
+    join(dir, ".prometheus", "mcp.json"),
+    JSON.stringify({ servers: { fake: { command: process.execPath, args: [SERVER] } } }),
+    "utf8",
+  );
+  try {
+    const loaded = await loadMcpTools(dir, 10_000);
+    try {
+      const seen: { server: string; kind: string }[] = [];
+      loaded.onRefresh = (server, kind) => seen.push({ server, kind });
+      const client = loaded.byServer.get("fake")!;
+      await client.callTool("announce", {});
+      // The notification travels on stdout after the call's response, so give
+      // the read loop a tick to deliver it.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.deepEqual(seen, [{ server: "fake", kind: "tools" }]);
+    } finally {
+      for (const each of loaded.clients) each.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -160,3 +247,50 @@ async function loadMcpToolsWithConfig(servers: Record<string, { url?: string; co
   }
   return { clients, tools, errors };
 }
+
+test("elicitation questions flatten the server's schema into answerable fields", async () => {
+  const { elicitationQuestions } = await import("../src/mcp.ts");
+  const questions = elicitationQuestions({
+    message: "Pick",
+    requestedSchema: {
+      type: "object",
+      properties: {
+        profile: { type: "string", title: "Profile", enum: ["debug", "release"] },
+        nested: { type: "object" },
+        count: { type: "integer", description: "How many" },
+      },
+    },
+  });
+  assert.deepEqual(questions.map((entry) => entry.name), ["profile", "count"]);
+  assert.deepEqual(questions[0].options, ["debug", "release"]);
+  assert.equal(questions[1].label, "How many");
+});
+
+test("a server's elicitation request is answered through the handler", async () => {
+  const client = new StdioMcpClient("fake", { command: process.execPath, args: [SERVER] });
+  try {
+    const asked: string[] = [];
+    client.onElicitation!(async (request) => {
+      asked.push(request.message);
+      return { action: "accept", content: { profile: "release" } };
+    });
+    await client.initialize();
+    const result = await client.callTool("ask", {});
+    assert.deepEqual(asked, ["Which profile should the build use?"]);
+    assert.match(result.content, /profile/);
+    assert.match(result.content, /release/);
+  } finally {
+    client.dispose();
+  }
+});
+
+test("with no handler the server is declined rather than left waiting", async () => {
+  const client = new StdioMcpClient("fake", { command: process.execPath, args: [SERVER] });
+  try {
+    await client.initialize();
+    const result = await client.callTool("ask", {});
+    assert.match(result.content, /decline/);
+  } finally {
+    client.dispose();
+  }
+});
