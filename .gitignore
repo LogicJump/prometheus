@@ -15,6 +15,9 @@ release*/
 # Research dumps and scratch artefacts
 .research/
 *.log
+
+# Ad-hoc source archives handed around during review
+*.tar.gz
 .env
 models.json
 argv.log

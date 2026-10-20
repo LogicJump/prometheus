@@ -49,6 +49,11 @@ export interface PipelineDeps {
   sessionId: string;
   /** Called before a mutating file tool runs. */
   onBeforeMutate?: ((toolName: string, input: Record<string, unknown>) => void) | null;
+  /**
+   * Called before every tool and awaited; may be slow (it can run a board
+   * scan). Errors are swallowed: it gathers evidence, it does not gate.
+   */
+  onBeforeTool?: ((toolName: string, input: Record<string, unknown>) => Promise<void> | void) | null;
   /** Run a sub-task; only the top-level agent provides this. */
   runSubagent: (prompt: string, options?: { context?: "none" | "summary" | "full" }) => Promise<string>;
   /** Run several sub-tasks concurrently (optional; falls back to serial). */
@@ -76,6 +81,8 @@ export interface PipelineOutcome {
   /** The text sent back to the model as the tool message. */
   content: string;
   ok: boolean;
+  /** Images the tool produced, delivered to the model beside the text. */
+  images?: string[];
 }
 
 const MUTATING_FILE_TOOLS = new Set(["write_file", "edit_file"]);
@@ -253,6 +260,13 @@ export class ToolPipeline {
     }
 
     // 3. prepare
+    if (this.deps.onBeforeTool) {
+      try {
+        await this.deps.onBeforeTool(name, input);
+      } catch {
+        /* evidence gathering must never block a tool */
+      }
+    }
     if (this.deps.sessionId && MUTATING_FILE_TOOLS.has(name) && typeof input.path === "string") {
       try {
         captureBefore(this.deps.sessionId, name, this.deps.cwd, input.path, this.deps.messageIndex?.());
@@ -285,6 +299,8 @@ export class ToolPipeline {
       ui,
       todo: this.deps.todos,
       sessionId: this.deps.sessionId,
+      // Read at call time: the index of the message this tool call belongs to.
+      ...(this.deps.messageIndex ? { messageIndex: this.deps.messageIndex() } : {}),
       runSubagent: this.deps.runSubagent,
       ...(this.deps.runSubagents ? { runSubagents: this.deps.runSubagents } : {}),
       ...(this.deps.runSubagentInBackground ? { runSubagentInBackground: this.deps.runSubagentInBackground } : {}),
@@ -334,7 +350,7 @@ export class ToolPipeline {
                   deletions: summary.deletions,
                   hunks: summary.hunks,
                 },
-              });
+              }, { id: callId });
             }
           }
         }
@@ -346,7 +362,7 @@ export class ToolPipeline {
     }
     // A structured result goes to a UI that can render it; the transcript text
     // above is still what the model reads, so this is additive and optional.
-    if (result.data !== undefined) ui.toolDetail?.(name, result.data);
+    if (result.data !== undefined) ui.toolDetail?.(name, result.data, { id: callId });
     if (!this.deps.trusted) {
       // A failed call has its own event: a hook that wants to suggest a fix or
       // record the failure could only guess from a successful one before.
@@ -368,7 +384,11 @@ export class ToolPipeline {
         if (extra) this.deps.onContext?.(extra);
       }
     }
-    return { ok: !result.isError, content: result.isError ? `Error: ${content}` : content };
+    return {
+      ok: !result.isError,
+      content: result.isError ? `Error: ${content}` : content,
+      ...(Array.isArray(result.images) && result.images.length > 0 ? { images: result.images } : {}),
+    };
   }
 
   /**

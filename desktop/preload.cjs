@@ -1,6 +1,6 @@
 /** Preload bridge: the only surface the renderer can use to reach the main process. */
 
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("prometheus", {
   send: (payload) => ipcRenderer.send("host-send", payload),
@@ -39,6 +39,15 @@ contextBridge.exposeInMainWorld("prometheus", {
     return () => ipcRenderer.removeListener("browser-state", listener);
   },
   revealFile: (path) => ipcRenderer.invoke("reveal-file", path),
+  // Electron 32 removed `File.path`; this is the replacement for a dropped or
+  // pasted file. Without it every non-image drop was rejected.
+  getPathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch {
+      return "";
+    }
+  },
   openExternal: (url) => ipcRenderer.invoke("open-external", url),
   notify: (title, body) => ipcRenderer.invoke("notify", { title, body }),
   platform: process.platform,

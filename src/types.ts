@@ -1,5 +1,7 @@
 /** Shared types for the Prometheus agent runtime. */
 
+import type { EffectiveBoard } from "./embedded/board.ts";
+
 /**
  * How a tool call is approved.
  *
@@ -105,6 +107,16 @@ export interface Config {
   fallbackModels?: string[];
   /** Board selected in the UI; tools use it as a default when an argument is omitted. */
   board?: BoardSelection;
+  /**
+   * The board as it stands at this moment, including a target derived from the
+   * attached chip.
+   *
+   * `board` above is the saved preference and may name a part that is no longer
+   * on the desk. This is what tools act on. It is set by the desktop host at
+   * the end of each scan and cleared when the board state is forgotten; the
+   * CLI never sets it and falls back to `board`.
+   */
+  effectiveBoard?: EffectiveBoard;
   /** Saved boards the user can switch between. */
   boardProfiles?: BoardProfile[];
   /**
@@ -225,6 +237,14 @@ export interface ToolResult {
    * to send over the event stream; the CLI and sub-agents ignore it.
    */
   data?: unknown;
+  /**
+   * Images the tool produced, as data URLs.
+   *
+   * A tool message carries text only, so these are delivered to the model as a
+   * user message right after the result. `browser_screenshot` used to return a
+   * file path and the model was told about a picture it could not see.
+   */
+  images?: string[];
 }
 
 export interface ToolContext {
@@ -236,6 +256,14 @@ export interface ToolContext {
   todo: TodoList;
   /** Session id, so a long tool result can be written next to the transcript. */
   sessionId?: string;
+  /**
+   * Where the conversation stood when this call ran.
+   *
+   * A bash command that edits files is checkpointed like a `write_file`; without
+   * this the checkpoint had no turn to belong to and a rewind left the files
+   * behind. Recorded so "undo everything after this message" reaches them.
+   */
+  messageIndex?: number;
   runSubagent: (prompt: string, options?: { context?: "none" | "summary" | "full" }) => Promise<string>;
   /** Run several independent sub-tasks concurrently; results are in input order. */
   runSubagents?: (prompts: string[], options?: { context?: "none" | "summary" | "full" }) => Promise<{ ok: boolean; report: string }[]>;
@@ -321,7 +349,7 @@ export interface Ui {
   /** Full, possibly long tool output for inspection. */
   toolOutput?(name: string, content: string): void;
   /** Structured result from a tool, for UIs that render it rather than print it. */
-  toolDetail?(name: string, data: unknown): void;
+  toolDetail?(name: string, data: unknown, meta?: { id: string }): void;
   thinking(delta: string): void;
   thinkingEnd(): void;
   todos(items: TodoItem[]): void;
@@ -348,8 +376,8 @@ export interface Ui {
   echoUser?(text: string): void;
   /** A sub-agent's lifecycle, shown as a nested group in the transcript. */
   subagentStart?(prompt: string, meta?: { id: string }): void;
-  subagentActivity?(kind: "tool" | "text", text: string): void;
-  subagentEnd?(ok: boolean, summary: string): void;
+  subagentActivity?(kind: "tool" | "text", text: string, meta?: { id: string }): void;
+  subagentEnd?(ok: boolean, summary: string, meta?: { id: string }): void;
   /** True if the last streamed text ended mid-line. */
   takeLineDirty?(): boolean;
   /** Inline question with extra answers; falls back to `confirm` when absent. */

@@ -4,6 +4,11 @@ import { detectLocale, getDict } from "./i18n.js";
 import { escapeHtml, renderMarkdown, IncrementalRenderer } from "./markdown.js";
 import { createSettings } from "./settings.js";
 import { icon, setIcon } from "./icons.js";
+import { shouldRestoreSession, droppedFilePath } from "./startup.js";
+import { buildTargetView, sourceLabel } from "./boardView.js";
+import { serialPortChoices, startBlockedReason, encodeSend, writtenNotice, selectedLinesAsQuote } from "./serialView.js";
+import { SubagentCards } from "./subagentCards.js";
+import { changeSignature } from "./changeSignature.js";
 
 /** Saved preferences are restored here; the host gets them on init. */
 const savedLocale = localStorage.getItem("prometheus.locale");
@@ -13,6 +18,9 @@ const savedWorkbench = localStorage.getItem("prometheus.workbench");
 const savedPane = localStorage.getItem("prometheus.pane");
 
 const api = window.prometheus;
+
+/** Sub-agent cards by id; the transcript keeps them in the DOM, this routes events. */
+const subagentCards = new SubagentCards();
 
 const $ = (id) => document.getElementById(id);
 const transcript = $("transcript");
@@ -122,6 +130,17 @@ const state = {
   boardState: null,
   /** Whether the target table has been loaded, and the status that follows. */
   boardTargetStatus: { kind: "unloaded", candidates: [], total: 0 },
+  /** The `board_targets` payload: null until a table has been read. */
+  boardTargets: null,
+  /** The table's filter box; the host filters before sending. */
+  boardTargetQuery: "",
+  /**
+   * Names the attached chip answers to, computed from the hardware rather than
+   * from a substring match on what the user typed.
+   */
+  boardSuggested: [],
+  /** Ports read on direct entry, before any board scan has run. */
+  serialPorts: [],
   /** The serial monitor is renderer-local except for the stream itself. */
   serial: {
     open: false,
@@ -190,11 +209,10 @@ function applyLocale(locale, { announce = false } = {}) {
   search.placeholder = t.searchSessions;
   search.title = t.searchSessions;
   $("find-input").placeholder = t.findPlaceholder;
-  // The update button lives in the About page and is built on demand, so there
-  // is nothing to relabel here; touching a missing node used to abort the rest
-  // of this function with a TypeError.
+  // The topbar badge is hidden until a check says there is a newer version;
+  // the update word itself is its title, and the About page owns the label.
   const updateButton = $("check-update");
-  if (updateButton) updateButton.textContent = t.checkUpdate;
+  if (updateButton && !updateButton.dataset.version) updateButton.title = t.checkUpdate;
   modelPicker.title = t.refreshModels;
   // applyLocale also runs during startup, before the voice state is declared.
   $("voice-button").title = $("voice-button").classList.contains("recording") ? t.voiceStop : t.voiceStart;
@@ -344,6 +362,11 @@ function renderProgress() {
   // The streamed character count is the pre-usage stand-in because it is the
   // one figure that is measured rather than estimated.
   const parts = [elapsed];
+  if (progress.retry > 0) {
+    // A retried request is the difference between "slow" and "the gateway is
+    // failing"; the heartbeat already knows the count, so say it.
+    parts.push(t.retryCount.replace("{n}", String(progress.retry)));
+  }
   if (progress.outputTokens > 0) {
     parts.push(`${formatTokens(progress.outputTokens)} ${t.tokens}`);
   } else if (progress.chars > 0) {
@@ -406,6 +429,31 @@ function addUserTurn(text, imageCount = 0) {
       `</div>`,
   );
   node.dataset.queued = queued ? "1" : "";
+  // A message is the thing a user most often wants to act on again: copy it,
+  // run it once more, or fix a typo and resend. All three lived in the input
+  // history, which only walked the text back into the composer.
+  const actions = document.createElement("div");
+  actions.className = "turn-actions";
+  actions.innerHTML =
+    `<button type="button" class="turn-action" data-act="copy" title="${escapeHtml(t.messageCopy)}">${escapeHtml(t.messageCopy)}</button>` +
+    `<button type="button" class="turn-action" data-act="retry" title="${escapeHtml(t.messageRetry)}">${escapeHtml(t.messageRetry)}</button>` +
+    `<button type="button" class="turn-action" data-act="edit" title="${escapeHtml(t.messageEdit)}">${escapeHtml(t.messageEdit)}</button>`;
+  actions.querySelector('[data-act="copy"]').addEventListener("click", () => {
+    void navigator.clipboard.writeText(text);
+  });
+  actions.querySelector('[data-act="retry"]').addEventListener("click", () => {
+    // The same message again. When the host is idle it runs now; when it is
+    // busy it queues, which is what the host already decides for a prompt.
+    api.send({ cmd: "prompt", text });
+  });
+  actions.querySelector('[data-act="edit"]').addEventListener("click", () => {
+    // Editing ends at the composer: the user changes the text and presses
+    // enter, which makes it a new turn they chose to send.
+    input.value = text;
+    input.focus();
+    autoSize();
+  });
+  node.appendChild(actions);
   return node;
 }
 
@@ -561,9 +609,12 @@ function toolGlyph(name) {
   return "file";
 }
 
-function addToolRow(name, summary) {
+function addToolRow(name, summary, callId = "") {
   const row = document.createElement("div");
   row.className = "tool-row running";
+  // The call id pairs a row with its result. Two writes in one batch used to
+  // receive their diff cards by DOM adjacency, which put both on one row.
+  if (callId) row.dataset.callId = callId;
   row.innerHTML =
     `<span class="tool-glyph">${icon(toolGlyph(name))}</span>` +
     `<span class="tool-name">${escapeHtml(toolLabel(name))}</span>` +
@@ -618,6 +669,9 @@ function attachInlineDiff(row, change) {
 
   const box = document.createElement("div");
   box.className = "inline-diff";
+  // Pairs the card with the row it belongs to even when the row is later
+  // re-rendered or moved; a second diff for the same call replaces the first.
+  if (row.dataset.callId) box.dataset.forCall = row.dataset.callId;
   const toggle = document.createElement("button");
   toggle.className = "inline-diff-toggle";
   toggle.innerHTML =
@@ -973,6 +1027,41 @@ function confirmAction(message, options = {}) {
 
 /* ---------- in-conversation search ---------- */
 
+/**
+ * Keep Tab inside an element.
+ *
+ * A dialog that only listens for Escape leaves every control behind it in the
+ * tab order, so a keyboard user tabs out of a modal into the page underneath.
+ * Returns a function that removes the handler.
+ */
+function trapFocus(container, { onEscape } = {}) {
+  const selector =
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  const onKey = (event) => {
+    if (event.key === "Escape" && onEscape) {
+      event.preventDefault();
+      event.stopPropagation();
+      onEscape();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = [...container.querySelectorAll(selector)].filter((el) => el.offsetParent !== null || el === document.activeElement);
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  document.addEventListener("keydown", onKey, true);
+  return () => document.removeEventListener("keydown", onKey, true);
+}
+
+
 const findBar = $("find-bar");
 const findInput = $("find-input");
 let findHits = [];
@@ -1327,7 +1416,13 @@ function renderUsage() {
   // Headline: used / window (percent) — the three facts the chip reduces to
   // one, spelled out where there is room for all three.
   $("usage-context-value").textContent =
-    `${formatTokens(info.used)} / ${formatTokens(info.window)} (${info.percent}%)`;
+    `${formatTokens(info.used)} / ${formatTokens(info.window)} (${info.percent}%)` +
+    // A percentage of an assumed window is a percentage of a guess. Saying so
+    // costs one marker and stops the meter from reading as an endpoint fact.
+    (info.windowAssumed ? ` ${t.usageWindowAssumed}` : "");
+  $("usage-context-value").title = info.windowAssumed
+    ? t.usageWindowAssumedHint
+    : `${formatTokens(info.window)} ${t.tokens}`;
 
   // A colour per category, in a fixed order so the same slice is the same
   // colour between sessions. The palette is the app's own four accents plus
@@ -1610,6 +1705,11 @@ function closeModelMenu() {
   modelPicker.setAttribute("aria-expanded", "false");
 }
 
+/** The verb a checklist row's action shows. */
+function setupActionLabel(action) {
+  return action === "setApiKey" ? t.setupActionApiKey : action === "installGh" ? t.setupActionGh : t.setupActionGeneric;
+}
+
 /* ---------- host events ---------- */
 
 function handleEvent(message) {
@@ -1622,12 +1722,15 @@ function handleEvent(message) {
       setBusy(false);
       if (state.statusKey !== "statusError") setStatus("statusReady");
       // Reopen the conversation the window was in last time. The host starts
-      // a fresh session on every launch, so without this every restart lost
-      // the context of what the user was doing.
-      const remembered = localStorage.getItem("prometheus.lastSession");
-      if (remembered && remembered !== state.sessionId && localStorage.getItem("prometheus.restartSession") !== "0") {
-        api.send({ cmd: "loadSession", id: remembered });
-      }
+      // a fresh session on every launch and announces it with a `state` event
+      // before this one; recording that id here would make the comparison
+      // below always equal, which is why this never fired.
+      const remembered = shouldRestoreSession({
+        remembered: localStorage.getItem("prometheus.lastSession"),
+        current: state.sessionId,
+        enabled: localStorage.getItem("prometheus.restartSession") !== "0",
+      });
+      if (remembered) api.send({ cmd: "loadSession", id: remembered });
       if (state.needsSetup) {
         state.needsSetup = false;
         $("setup-button").hidden = true;
@@ -1650,6 +1753,13 @@ function handleEvent(message) {
             `<div class="setup-row"><div class="setup-label">${escapeHtml(check.label)}</div>` +
             `<div class="setup-detail">${escapeHtml(check.detail)}</div>` +
             (check.hint ? `<pre class="setup-hint">${escapeHtml(check.hint)}</pre>` : "") +
+            // The host says what to do about a missing item (`setApiKey`,
+            // `installGh`); a row that names a problem and offers no way to fix
+            // it is a dead end.
+            (check.action
+              ? `<button class="link-button setup-action" data-setup-action="${escapeHtml(check.action)}">` +
+                `${escapeHtml(setupActionLabel(check.action))}</button>`
+              : "") +
             `</div>`,
         )
         .join("");
@@ -1657,6 +1767,13 @@ function handleEvent(message) {
         `<div class="notice setup"><div class="setup-head">${escapeHtml(t.setupChecklistTitle)}</div>${rows}` +
           `<button class="link-button" id="setup-dismiss">${escapeHtml(t.setupChecklistDismiss)}</button></div>`,
       );
+      document.querySelectorAll(".setup-action").forEach((button) => {
+        button.addEventListener("click", () => {
+          const action = button.dataset.setupAction;
+          if (action === "setApiKey") openSettings("connection");
+          else if (action === "installGh") api.openExternal("https://cli.github.com/");
+        });
+      });
       $("setup-dismiss")?.addEventListener("click", () => {
         localStorage.setItem("prometheus.setupDismissed", "1");
         document.querySelector(".notice.setup")?.remove();
@@ -1666,11 +1783,9 @@ function handleEvent(message) {
 
     case "state":
       state.sessionId = message.sessionId;
-      // Remember the conversation the user is in, so a restart comes back to
-      // it instead of opening a blank window. The setting can be turned off.
-      if (message.sessionId && localStorage.getItem("prometheus.restartSession") !== "0") {
-        localStorage.setItem("prometheus.lastSession", message.sessionId);
-      }
+      // Deliberately not written to `prometheus.lastSession`: this event also
+      // fires for the blank session the host creates at startup. The id is
+      // recorded when a conversation is actually loaded or saved.
       if (message.cwd) state.cwd = message.cwd;
       state.locale = message.locale || state.locale;
       applyLocale(state.locale);
@@ -1705,20 +1820,17 @@ function handleEvent(message) {
       break;
 
     case "board_targets": {
-      const button = $("board-load-targets");
-      button.disabled = false;
-      button.textContent = t.boardLoadTargets;
       state.boardTargets = {
         total: message.total ?? 0,
         notes: message.notes ?? [],
         targets: message.targets ?? [],
         error: message.error ?? "",
       };
-      if (message.error) {
-        addNotice("error", message.error);
-      } else {
-        addNotice("dim", `${message.total} ${t.boardTargetsLoaded}`);
-      }
+      // Names the attached chip answers to. Kept apart from the table's own
+      // candidates because they were computed from the hardware, not from a
+      // substring match on whatever the user typed.
+      state.boardSuggested = Array.isArray(message.suggested) ? message.suggested : [];
+      if (message.error) addNotice("error", message.error);
       // The host follows with a fresh board_state carrying the new verdict.
       renderBoard();
       break;
@@ -1736,6 +1848,20 @@ function handleEvent(message) {
       state.serial.lines = message.lines ?? [];
       fillSerialControls();
       rerenderSerialLines();
+      break;
+
+    case "serial_ports":
+      state.serialPorts = Array.isArray(message.ports) ? message.ports : [];
+      if (message.error) addNotice("warn", message.error);
+      fillSerialControls();
+      break;
+
+    case "serial_written":
+      // A write that went out is worth confirming where the port is described:
+      // it is the only feedback that the bytes left the app.
+      state.serial.lastError = "";
+      state.serial.written = writtenNotice(message, t.serialSent);
+      renderSerialStatus();
       break;
 
     case "serial_state":
@@ -1838,6 +1964,9 @@ function handleEvent(message) {
         api.send({ cmd: "stopSubagent", id: message.id });
       });
       state.currentSubagent = { node, count: 0, id: message.id ?? "" };
+      // Cards are kept by id as well as by the legacy "current" slot: two
+      // sub-agents run at once, and only one of them can be `current`.
+      subagentCards.start(message.id, message.prompt ?? "", node);
       break;
     }
 
@@ -1850,10 +1979,9 @@ function handleEvent(message) {
     }
 
     case "subagent_activity": {
-      const sub = state.currentSubagent;
-      if (!sub) break;
-      sub.count += 1;
-      const list = sub.node.querySelector(".subagent-activities");
+      const card = subagentCards.activity(message.id ?? "", message.kind, message.text);
+      if (!card?.node) break;
+      const list = card.node.querySelector(".subagent-activities");
       const line = document.createElement("div");
       line.className = "subagent-line";
       line.innerHTML = `${icon(message.kind === "tool" ? "chevron-right" : "dot", "inline")}<span>${escapeHtml(message.text)}</span>`;
@@ -1861,18 +1989,19 @@ function handleEvent(message) {
       // A long sub-task used to keep only its last 40 lines, which is exactly
       // the point where you cannot see how it got stuck. Everything is kept in
       // the DOM; the collapsed card clips it and "expand" reveals the rest.
-      sub.node.querySelector(".subagent-count").textContent = String(sub.count);
+      card.node.querySelector(".subagent-count").textContent = String(card.count);
       break;
     }
 
     case "subagent_end": {
-      const sub = state.currentSubagent;
-      if (!sub) break;
-      sub.node.classList.remove("running");
-      if (!message.ok) sub.node.classList.add("failed");
-      sub.node.querySelector(".subagent-count").textContent = message.ok ? t.subagentDone : t.subagentFailed;
-      sub.node.querySelector(".subagent-stop")?.remove();
-      state.currentSubagent = null;
+      const card = subagentCards.end(message.id ?? "", message.ok !== false);
+      const node = card?.node ?? state.currentSubagent?.node;
+      if (!node) break;
+      node.classList.remove("running");
+      if (!message.ok) node.classList.add("failed");
+      node.querySelector(".subagent-count").textContent = message.ok ? t.subagentDone : t.subagentFailed;
+      node.querySelector(".subagent-stop")?.remove();
+      if (state.currentSubagent?.node === node) state.currentSubagent = null;
       break;
     }
 
@@ -1956,6 +2085,16 @@ function handleEvent(message) {
 
     case "queued":
       setQueuedBadge(message.count ?? 0);
+      break;
+
+    case "prompt_accepted":
+      // The host says where the message landed; the bubble added on submit
+      // gets its rewind now. Without this the button existed only on turns
+      // restored from a saved session.
+      if (pendingRewindNode && Number.isFinite(message.index)) {
+        attachRewind(pendingRewindNode, message.index);
+      }
+      pendingRewindNode = null;
       break;
 
     case "user_queued_delivered":
@@ -2112,7 +2251,12 @@ function handleEvent(message) {
         let result = { ok: false, error: "unsupported browser request" };
         try {
           if (request.kind === "open") {
+            // The agent opened the page, so show it: a view nobody navigated
+            // to is the same as no view at all. The bounds follow once the
+            // pane has laid out, or the view sits wherever it was last.
+            openWorkbench("browser");
             await api.browserOpen(request.url);
+            scheduleBrowserBounds();
             result = { ok: true, url: request.url };
           } else if (request.kind === "read") {
             const snapshot = await api.browserSnapshot({ selector: request.selector });
@@ -2121,7 +2265,11 @@ function handleEvent(message) {
               : { ok: false, error: "the browser pane is not open" };
           } else if (request.kind === "screenshot") {
             const shot = await api.browserScreenshot?.();
-            result = shot ? { ok: shot.ok, url: shot.url, text: shot.path, error: shot.error } : { ok: false, error: "screenshots are unavailable" };
+            // `dataUrl` is the image itself; the path is for the user. Sending
+            // only the path told the model about a picture it could not see.
+            result = shot
+              ? { ok: shot.ok, url: shot.url, text: shot.path, dataUrl: shot.dataUrl, error: shot.error }
+              : { ok: false, error: "screenshots are unavailable" };
           }
         } catch (error) {
           result = { ok: false, error: String(error?.message ?? error) };
@@ -2140,7 +2288,7 @@ function handleEvent(message) {
         setStatus("statusWorking");
       }
       if (state.currentAssistant) flushAssistant();
-      addToolRow(message.name, message.summary);
+      addToolRow(message.name, message.summary, message.id ?? "");
       break;
 
     case "tool_detail":
@@ -2150,7 +2298,11 @@ function handleEvent(message) {
       // A file write's diff, attached to its row: seeing what changed in place
       // is faster than opening the Changes pane and finding the file.
       if (message.data && message.data.change) {
-        const row = state.lastToolNode;
+        // By call id: two writes in one batch both used to land on whichever
+        // row `lastToolNode` pointed at, so one card doubled and one was lost.
+        const row = message.id
+          ? transcript.querySelector(`.tool-row[data-call-id="${CSS.escape(message.id)}"]`)
+          : state.lastToolNode;
         if (row) attachInlineDiff(row, message.data.change);
       }
       break;
@@ -2490,6 +2642,12 @@ function handleEvent(message) {
         api.send({ cmd: "getTree", path: "." });
         api.send({ cmd: "listSessions", includeArchived: state.showArchived });
       }
+      // The conversation on screen is the one to reopen next launch. This is
+      // the event that distinguishes it from the blank session `state`
+      // announces at startup.
+      if (state.sessionId && localStorage.getItem("prometheus.restartSession") !== "0") {
+        localStorage.setItem("prometheus.lastSession", state.sessionId);
+      }
       scrollToBottom(true);
       break;
     }
@@ -2557,6 +2715,10 @@ function handleEvent(message) {
       break;
 
     case "session_saved":
+      // A turn landed, so this is the conversation to reopen on next launch.
+      if (message.sessionId && localStorage.getItem("prometheus.restartSession") !== "0") {
+        localStorage.setItem("prometheus.lastSession", message.sessionId);
+      }
       api.send({ cmd: "listSessions", includeArchived: state.showArchived });
       break;
 
@@ -2842,7 +3004,7 @@ function renderDiff() {
   // pane on every push reset its scroll position, so a person reading a diff
   // was thrown back to the top twice a second. Identical content now renders
   // nothing, and a real change keeps the reader where they were.
-  const signature = files.map((file) => `${file.path}:${file.additions}:${file.deletions}:${file.diff?.length ?? 0}`).join("|") + `#${state.selectedChange}#${scope}`;
+  const signature = changeSignature({ files, selected: state.selectedChange, scope });
   if (signature === diffSignature && diffRoot.childElementCount > 0) return;
   const previousScroll = diffRoot.scrollTop;
   diffSignature = signature;
@@ -2911,6 +3073,19 @@ function renderDiff() {
  * because that is what the agent falls back to — and that selection is saved by
  * the host, not held here.
  */
+/**
+ * The Board pane.
+ *
+ * One question, one block: what will the flasher be told to flash. Everything
+ * else on this pane exists only to answer that or to explain why it cannot be
+ * answered. The chip reading is the *evidence* for the target, never a second
+ * target — when both were rows, a stale saved name and a live reading sat side
+ * by side and the user was asked to adjudicate a conflict the pane invented.
+ *
+ * The machine inventory (every toolchain, every port, the whole target table)
+ * lives in Settings and in `embed_targets`. It used to fill this pane, which
+ * buried a one-second answer under a page of things that were not wrong.
+ */
 function renderBoard() {
   const body = $("board-body");
   const board = state.boardState;
@@ -2928,111 +3103,177 @@ function renderBoard() {
     );
   };
 
-  const scanned = Boolean(board.scannedAt);
+  const view = buildTargetView({
+    board,
+    selection: state.board.selection ?? {},
+    status: state.boardTargetStatus,
+    targets: state.boardTargets,
+    query: state.boardTargetQuery,
+    t,
+  });
+  const scanned = view.scanned;
   const project = board.project ?? { kind: "unknown", evidence: [] };
+  const effective = board.effective ?? {};
+  const source = view.source;
+  const identity = view.identity;
+  const hasProbes = (board.probes ?? []).length > 0;
 
-  // Project. An unknown kind is not an error: it only means this folder is not
-  // firmware, and the probes and ports below are still true.
+  // ---- Target: the one thing this pane is for -----------------------------
+  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardTarget)}</div>`);
+
+  // The evidence line, under the target: family, size, and what the name rest
+  // on. Never a row of its own — it is the explanation of the value above it.
+  // A family with several flash sizes yields several names; the one shown was
+  // selected, so the line says that rather than crediting the chip with it.
+  const evidence = [];
+  if (identity?.family) {
+    evidence.push(identity.family);
+    if (identity.flashKib !== undefined) evidence.push(`${identity.flashKib} KiB`);
+  }
+  const statusNote = view.targetNote;
+
+  if (source === "chip" || source === "picked") {
+    if (identity) evidence.push(sourceLabel(view, t));
+    row("", effective.target ?? "", "ok", [...evidence, statusNote].filter(Boolean).join(" · "));
+  } else if (source === "unlisted") {
+    row("", t.boardNoTargetName, "warn", t.boardTargetUnlisted(identity?.family ?? ""));
+  } else if (source === "manual") {
+    row("", effective.target ?? "", "", [t.boardTargetManual, statusNote].filter(Boolean).join(" · "));
+    if (evidence.length) parts.push(`<div class="board-note">${escapeHtml(evidence.join(" · "))}</div>`);
+  } else if (!scanned) {
+    parts.push(`<div class="board-empty">${escapeHtml(t.boardScanning)}</div>`);
+  } else if (hasProbes) {
+    row("", t.boardUnknownPart, "warn", board.identityNote || t.boardNoChipRead);
+  } else {
+    row("", t.boardNoProbeShort, "warn", t.boardPlugInHint);
+  }
+
+  // What carries the name. A target name has no meaning without the flasher
+  // whose namespace it belongs to, so these live in the same block.
+  if (source !== "none" || effective.flasher) {
+    row(t.boardFlasher, effective.flasher || t.boardFlasherDefault, effective.flasher ? "" : "muted");
+  }
+  const portText = effective.port
+    ? `${effective.port}${selectionHasBaud(board) ? ` · ${effective.baud}` : ""}`
+    : t.boardUnset;
+  row(t.boardSerial, portText, effective.port ? "" : "warn", effective.port && !selectionHasBaud(board) ? t.boardBaudDefault : "");
+  parts.push(`</div>`);
+
+  // ---- Alternatives ------------------------------------------------------
+  // Only when the chip read leaves a real choice: 1 MiB vs 2 MiB, two probes,
+  // or another port. These are overrides on top of the chip's answer, not a
+  // second answer to compare against.
+  const options = view.alternatives;
+  const portChoices = (board.ports ?? []).filter((port) => port.path !== effective.port);
+  const probeChoices = view.probes;
+  if (options.length > 1 || portChoices.length > 0 || probeChoices.length > 0) {
+    parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardAlternatives)}</div>`);
+    if (options.length > 1) {
+      parts.push(`<div class="board-targets">`);
+      for (const name of options) {
+        const active = name === effective.target ? " active" : "";
+        parts.push(`<button type="button" class="board-target${active}" data-target="${escapeHtml(name)}">${escapeHtml(name)}</button>`);
+      }
+      parts.push(`</div>`);
+    }
+    // One row per attached probe, with the serial that tells two of the same
+    // model apart. A probe without one is listed but not offered: selecting it
+    // would write an empty id.
+    for (const probe of probeChoices) {
+      const detail = [probe.kind, probe.serial, probe.targetText].filter(Boolean).join(" · ");
+      if (probe.selectable) {
+        parts.push(
+          `<button type="button" class="board-row board-probe${probe.active ? " active" : ""}" data-probe="${escapeHtml(probe.serial)}">` +
+            `<span class="board-label">${escapeHtml(probe.name)}</span>` +
+            `<span class="board-value">${escapeHtml(detail)}</span></button>`,
+        );
+      } else {
+        row(probe.name, detail || t.boardNoReportedTarget);
+      }
+    }
+    if (portChoices.length > 0) {
+      parts.push(`<div class="board-targets">`);
+      for (const port of portChoices) {
+        parts.push(`<button type="button" class="board-port" data-port="${escapeHtml(port.path)}">${escapeHtml(port.path)}</button>`);
+      }
+      parts.push(`</div>`);
+    }
+    parts.push(`</div>`);
+  }
+
+  // ---- The target table --------------------------------------------------
+  // The table is what turns "this is an STM32F42x" into the name a flasher
+  // accepts; it loads with the scan and is listed here rather than behind a
+  // button. 206 rows stay out of the pane until they are asked for, so the
+  // list appears once a scan has answered.
+  if (scanned && (view.targetsTotal > 0 || state.boardTargetQuery)) {
+    parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardTargetTable)}</div>`);
+    parts.push(
+      `<input class="board-filter" id="board-target-filter" type="search" ` +
+        `placeholder="${escapeHtml(t.boardTargetFilter)}" value="${escapeHtml(state.boardTargetQuery ?? "")}" ` +
+        `aria-label="${escapeHtml(t.boardTargetFilter)}" />`,
+    );
+    if (view.targets.length === 0) {
+      parts.push(`<div class="board-empty">${escapeHtml(t.boardTargetsNone)}</div>`);
+    } else {
+      parts.push(`<div class="board-targets board-target-list">`);
+      for (const entry of view.targets) {
+        const active = entry.name === effective.target ? " active" : "";
+        const label = entry.vendor ? `${entry.name} · ${entry.vendor}` : entry.name;
+        parts.push(
+          `<button type="button" class="board-target${active}" data-target="${escapeHtml(entry.name)}" ` +
+            `title="${escapeHtml(label)}">${escapeHtml(entry.name)}</button>`,
+        );
+      }
+      parts.push(`</div>`);
+    }
+    parts.push(`<div class="board-note dim">${escapeHtml(t.boardTargetsShown(view.targets.length, view.targetsTotal))}</div>`);
+    parts.push(`</div>`);
+  }
+
+  // ---- Project and the last build ----------------------------------------
   parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardProject)}</div>`);
   if (project.kind === "unknown") {
     parts.push(`<div class="board-empty"><strong>${escapeHtml(t.boardNoProject)}</strong>${escapeHtml(t.boardNoProjectHint)}</div>`);
   } else {
     row(t.boardKind, project.kind, "ok");
-    if (project.evidence?.length) row(t.boardEvidence, project.evidence.join(", "));
     if (project.root) row(t.boardRoot, project.root);
   }
-  parts.push(`</div>`);
-
-  // Toolchains.
-  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardToolchains)}</div>`);
-  if (!scanned) {
-    parts.push(`<div class="board-empty">${escapeHtml(t.boardScanning)}</div>`);
-  } else if ((board.tools ?? []).length === 0) {
-    row(t.boardToolchains, t.boardNone, "bad");
-  } else {
-    for (const tool of board.tools) {
-      // A tool that ran but reported a problem is amber: it exists, and it may
-      // still be the reason a build or flash fails.
-      row(tool.kind, tool.version || tool.path || t.boardInstalled, tool.problem ? "warn" : "ok", tool.problem ?? "");
-    }
-  }
-  if ((board.missing ?? []).length > 0) {
-    row(t.boardMissing, board.missing.join(", "), "warn");
-  }
-  parts.push(`</div>`);
-
-  // Probes.
-  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardProbes)}</div>`);
-  if (!scanned) {
-    parts.push(`<div class="board-empty">${escapeHtml(t.boardScanning)}</div>`);
-  } else if ((board.probes ?? []).length === 0) {
-    row(t.boardProbe, t.boardNoProbe, "warn");
-    for (const note of board.probeNotes ?? []) parts.push(`<div class="board-note">${escapeHtml(note)}</div>`);
-  } else {
-    for (const probe of board.probes) {
-      const id = probe.serial ? ` · ${probe.serial}` : "";
-      // `target: n/a` used to be shown verbatim; it means the tool did not
-      // report one, which is different from a target named "n/a".
-      const target = probe.target ? `${t.boardReported} ${probe.target}` : t.boardNoReportedTarget;
-      row(probe.name || probe.kind, `${probe.kind}${id}`, "", target);
-    }
-  }
-  parts.push(`</div>`);
-
-  // Serial ports.
-  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardPorts)}</div>`);
-  if (!scanned) {
-    parts.push(`<div class="board-empty">${escapeHtml(t.boardScanning)}</div>`);
-  } else if ((board.ports ?? []).length === 0) {
-    row(t.boardPort, t.boardNoPort, "warn");
-  } else {
-    for (const port of board.ports) {
-      const detail = port.board || port.description || (port.vid ? `${port.vid}:${port.pid ?? "?"}` : "");
-      row(port.path, detail || t.boardPort, "", "");
-    }
-  }
-  parts.push(`</div>`);
-
-  // Selection and what it means.
-  parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardSelection)}</div>`);
-  const effective = board.effective ?? {};
-  row(t.boardTarget, effective.target || t.boardUnset, effective.target ? "" : "warn", targetStatusNote());
-  row(t.boardSerial, effective.port ? `${effective.port} · ${effective.baud ?? 115200}` : t.boardUnset, effective.port ? "" : "warn");
-  if (effective.flasher) row(t.boardFlasher, effective.flasher);
-  const candidates = state.boardTargetStatus?.candidates ?? [];
-  if (candidates.length > 0 && state.boardTargetStatus.kind !== "exact") {
-    parts.push(`<div class="board-targets">`);
-    for (const candidate of candidates) {
-      const active = candidate.name === effective.target ? " active" : "";
-      parts.push(
-        `<button type="button" class="board-target${active}" data-target="${escapeHtml(candidate.name)}">${escapeHtml(candidate.name)}</button>`,
-      );
-    }
-    parts.push(`</div>`);
-  }
-  const portChoices = (board.ports ?? []).filter((port) => port.path !== effective.port);
-  if (portChoices.length > 0) {
-    parts.push(`<div class="board-targets">`);
-    for (const port of portChoices) {
-      parts.push(
-        `<button type="button" class="board-port" data-port="${escapeHtml(port.path)}">${escapeHtml(port.path)}</button>`,
-      );
-    }
-    parts.push(`</div>`);
-  }
-  parts.push(`</div>`);
-
-  // The last build. Absent until the agent builds in this session — an empty
-  // section would suggest the numbers exist and are zero.
   if (board.build) {
-    parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardLastBuild)}</div>`);
     if (board.build.usage) {
-      row(t.boardFlash, formatBytes(board.build.usage.flash));
+      // Flash usage is a share of a capacity only when the part reported one.
+      // Without it the bytes are still true; the percentage would not be.
+      const flash = board.build.usage.flash;
+      const total = identity?.flashKib !== undefined ? identity.flashKib * 1024 : undefined;
+      const share = total ? ` (${((flash / total) * 100).toFixed(1)}%)` : "";
+      row(t.boardFlash, `${formatBytes(flash)}${share}`, "", total ? "" : t.boardRamUnknown);
       row(t.boardRam, formatBytes(board.build.usage.ram));
     } else {
       row(t.boardBuild, board.build.ok ? t.boardBuildOk : t.boardBuildFailed, board.build.ok ? "ok" : "bad");
     }
     parts.push(`<div class="board-note">${escapeHtml(t.boardFromBuild)}</div>`);
+  }
+  parts.push(`</div>`);
+
+  // ---- Machine, as one line ----------------------------------------------
+  // The full inventory is in Settings. What belongs here is only what the user
+  // can act on: is there a probe, is there a port, and what does this project
+  // need that is missing. A list of every installed toolchain answered no
+  // question anyone asked this pane.
+  if (scanned) {
+    const probes = (board.probes ?? []).length;
+    const ports = (board.ports ?? []).length;
+    const summary = [
+      t.boardProbeCount(probes),
+      t.boardPortCount(ports),
+      (board.tools ?? []).length ? t.boardToolCount((board.tools ?? []).length) : t.boardNoTools,
+    ].join(" · ");
+    parts.push(`<div class="board-section"><div class="board-section-title">${escapeHtml(t.boardMachine)}</div>`);
+    parts.push(`<div class="board-note">${escapeHtml(summary)}</div>`);
+    for (const note of board.probeNotes ?? []) parts.push(`<div class="board-note dim">${escapeHtml(note)}</div>`);
+    // Only the tools this project's own kind needs, and only when missing.
+    const needed = requiredMissing(board);
+    if (needed.length > 0) row(t.boardMissing, needed.join(", "), "warn");
     parts.push(`</div>`);
   }
 
@@ -3043,18 +3284,63 @@ function renderBoard() {
   body.querySelectorAll("[data-port]").forEach((button) => {
     button.addEventListener("click", () => saveBoardSelection({ port: button.dataset.port }));
   });
+  body.querySelectorAll("[data-probe]").forEach((button) => {
+    button.addEventListener("click", () => saveBoardSelection({ probe: button.dataset.probe }));
+  });
+  const filter = $("board-target-filter");
+  if (filter) {
+    filter.addEventListener("input", () => {
+      state.boardTargetQuery = filter.value;
+      // The host holds the full table and filters before sending; redrawing
+      // from the local copy keeps typing responsive while that answer lands.
+      clearTimeout(boardFilterTimer);
+      boardFilterTimer = setTimeout(() => {
+        api.send({ cmd: "getBoardTargets", filter: state.boardTargetQuery });
+      }, 150);
+    });
+  }
 }
 
-/** The one-line verdict under the Target row; this is the pane's whole point. */
-function targetStatusNote() {
-  const status = state.boardTargetStatus;
-  if (!status || status.kind === "unloaded") return t.boardTargetsUnloaded;
-  if (status.kind === "exact") return t.boardTargetExact;
-  if (status.kind === "candidates") return t.boardTargetCandidates;
-  return t.boardTargetAbsent;
+let boardFilterTimer = null;
+
+/**
+ * Whether the baud rate shown was chosen or defaulted.
+ *
+ * A baud rate cannot be observed: nothing reads it back from the port. When
+ * the user has not set one, the number on screen is this app's default, and
+ * showing `COM7 · 115200` as though it were a property of the port is the same
+ * mistake as showing a default context window as the model's.
+ */
+function selectionHasBaud(board) {
+  const chosen = board?.selection?.baud;
+  return typeof chosen === "number" && chosen > 0;
 }
-function formatBytes(bytes) {
-  const value = Number(bytes) || 0;
+
+/**
+ * Toolchains this project's kind needs and the machine does not have.
+ *
+ * The full missing list is every toolchain the detector knows about — telling
+ * an STM32 project it lacks RISC-V GCC, `west` and `idf.py` is noise that
+ * reads like an error. Only the tools this project would actually invoke are
+ * listed, and only when they are absent.
+ */
+function requiredMissing(board) {
+  const kind = board?.project?.kind ?? "unknown";
+  const needs = {
+    zephyr: ["cmake", "ninja", "gcc-arm", "west"],
+    espIdf: ["idf", "cmake"],
+    platformio: ["pio"],
+    arduino: ["arduino-cli"],
+    cmake: ["cmake", "gcc-arm"],
+    // A bare Makefile or a bare-metal project still needs a compiler and make.
+    make: ["make", "gcc-arm"],
+  }[kind];
+  if (!needs) return [];
+  const missing = new Set(board?.missing ?? []);
+  return needs.filter((tool) => missing.has(tool));
+}
+
+function formatBytes(bytes) {  const value = Number(bytes) || 0;
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / (1024 * 1024)).toFixed(2)} MB`;
@@ -3072,6 +3358,11 @@ function setBoardState(message) {
   state.boardState = message.state;
   state.board = state.boardState;
   if (message.targetStatus) state.boardTargetStatus = message.targetStatus;
+  // The inventory carries the target table the host read during the scan.
+  // Pulling it here is what makes the table a part of the pane instead of
+  // something behind a button: the scan that found the chip also found the
+  // names it could be.
+  if (message.state?.scannedAt && !state.boardTargets) api.send({ cmd: "getBoardTargets", filter: state.boardTargetQuery });
   renderBoard();
   renderBoardChip();
 }
@@ -3082,15 +3373,20 @@ function setBoardState(message) {
 function renderBoardChip() {
   const control = $("board-control");
   const selection = state.board.selection ?? {};
+  // The chip shows what the tools will use, not what was saved: a saved target
+  // with a swapped board is exactly the stale value the pane stopped trusting,
+  // and the chip would otherwise put it back in front of the user.
+  const effective = state.boardState?.effective ?? selection;
+  const target = effective.target;
   const projectKind = state.board.projectKind ?? "unknown";
   const hasPorts = (state.boardState?.ports ?? []).length > 0;
-  const relevant = Boolean(selection.port || selection.target) || projectKind !== "unknown" || hasPorts;
+  const relevant = Boolean(effective.port || target) || projectKind !== "unknown" || hasPorts;
   control.hidden = !relevant;
   if (!relevant) return;
 
   const parts = [];
-  if (selection.port) parts.push(`${selection.port}${selection.baud ? ` · ${selection.baud}` : ""}`);
-  if (selection.target) parts.push(selection.target);
+  if (target) parts.push(target);
+  if (effective.port) parts.push(effective.port);
   // This node carries no data-i18n on purpose: the locale sweep would overwrite
   // it with placeholder text. Same reason as the model id label.
   $("board-chip-value").textContent = parts.join(" · ") || t.boardChipNone;
@@ -3150,14 +3446,29 @@ $("board-picker").addEventListener("click", (event) => {
   else closeBoardMenu();
 });
 
+// Escape and an outside click close the board menu, the same way they close the
+// model picker. Without them the only way out was clicking the chip again.
+document.addEventListener(
+  "mousedown",
+  (event) => {
+    if ($("board-menu").hidden) return;
+    if (event.target.closest?.("#board-menu") || event.target.closest?.("#board-picker")) return;
+    closeBoardMenu();
+  },
+  true,
+);
+document.addEventListener(
+  "keydown",
+  (event) => {
+    if (event.key !== "Escape" || $("board-menu").hidden) return;
+    event.preventDefault();
+    closeBoardMenu();
+    $("board-picker").focus();
+  },
+  true,
+);
+
 $("board-refresh").addEventListener("click", () => api.send({ cmd: "getBoardState", refresh: "all" }));
-$("board-load-targets").addEventListener("click", () => {
-  // Loading the table is the one expensive call in this pane; it happens here
-  // and nowhere else.
-  $("board-load-targets").disabled = true;
-  $("board-load-targets").textContent = t.boardLoadingTargets;
-  api.send({ cmd: "getBoardTargets" });
-});
 
 /* ---------- serial pane ---------- */
 
@@ -3169,37 +3480,50 @@ function openSerialPane() {
   // Never open the port automatically: asserting DTR resets most boards, and
   // the agent may be using it. A status read only fetches the ring.
   api.send({ cmd: "serialStatus" });
+  // The port list is its own request: the board inventory carries one only
+  // after the Board pane has scanned, and a user who came straight here had an
+  // empty dropdown. Asking again when we already have ports is harmless.
+  api.send({ cmd: "serialPorts" });
 }
 
 function fillSerialControls() {
   const portSelect = $("serial-port");
   const baudSelect = $("serial-baud");
-  const ports = state.boardState?.ports ?? [];
+  // Ports arrive from `serial_ports` (direct entry) or from the board
+  // inventory (when the scan has run); either is current enough to list.
+  const ports = state.serialPorts.length > 0 ? state.serialPorts : state.boardState?.ports ?? [];
   const selection = state.board.selection ?? {};
-  const wantedPort = state.serial.port || selection.port || (ports.length === 1 ? ports[0].path : "");
+  const choices = serialPortChoices({
+    ports,
+    current: state.serial.port || "",
+    saved: selection.port || "",
+  });
 
   portSelect.innerHTML = "";
-  if (ports.length === 0) {
+  if (choices.length === 0) {
     const option = document.createElement("option");
     option.value = "";
     option.textContent = t.boardNoPort;
     portSelect.appendChild(option);
   }
-  for (const port of ports) {
+  for (const choice of choices) {
     const option = document.createElement("option");
-    option.value = port.path;
-    option.textContent = port.path;
+    option.value = choice.path;
+    option.textContent = choice.path;
+    option.title = choice.label;
+    option.selected = choice.selected;
     portSelect.appendChild(option);
   }
   // A selection may name a port that is not currently attached; keeping it on
   // the list lets the user see what they picked instead of silently dropping it.
-  if (wantedPort && !ports.some((port) => port.path === wantedPort)) {
+  const picked = state.serial.port || selection.port || "";
+  if (picked && !choices.some((choice) => choice.path === picked)) {
     const option = document.createElement("option");
-    option.value = wantedPort;
-    option.textContent = wantedPort;
+    option.value = picked;
+    option.textContent = picked;
     portSelect.appendChild(option);
   }
-  if (wantedPort) portSelect.value = wantedPort;
+  if (picked) portSelect.value = picked;
 
   if (baudSelect.options.length === 0) {
     for (const baud of SERIAL_BAUDS) {
@@ -3229,6 +3553,7 @@ function renderSerialStatus() {
     status.className = serial.lastError ? "serial-status bad" : "serial-status";
   }
   if (serial.lastError) parts.push(serial.lastError);
+  else if (serial.written) parts.push(serial.written);
   if (serial.paused) {
     parts.push(`${t.serialPausedState}${serial.pausedBacklog ? ` · ${serial.pausedBacklog} ${t.serialNewLines}` : ""}`);
   } else if (serial.dropped) {
@@ -3266,6 +3591,9 @@ function serialLineNode(line) {
 
   row.append(timeEl, levelEl, tagEl, textEl);
   if (line.level) row.dataset.level = line.level;
+  // The index into `state.serial.lines` is what a selection resolves to; a
+  // selection read from the DOM alone loses the lines scrolled out of it.
+  if (line.index !== undefined) row.dataset.lineIndex = String(line.index);
   return row;
 }
 
@@ -3291,13 +3619,16 @@ function appendSerialLines(lines) {
   }
 
   serial.filtered = 0;
-  for (const line of lines) {
+  // The batch was just pushed, so its first index follows from the ring length;
+  // scanning the ring per line would be quadratic on a talkative port.
+  const base = serial.lines.length - lines.length;
+  lines.forEach((line, offset) => {
     if (!serialVisible(line)) {
       serial.filtered += 1;
-      continue;
+      return;
     }
-    output.appendChild(serialLineNode(line));
-  }
+    output.appendChild(serialLineNode({ ...line, index: base + offset }));
+  });
   while (output.childElementCount > SERIAL_MAX_LINES) output.firstElementChild?.remove();
   if (serial.follow && pinned) output.scrollTop = output.scrollHeight;
   renderSerialStatus();
@@ -3309,13 +3640,15 @@ function rerenderSerialLines() {
   output.innerHTML = "";
   state.serial.filtered = 0;
   const fragment = document.createDocumentFragment();
-  for (const line of state.serial.lines) {
+  state.serial.lines.forEach((line, index) => {
     if (!serialVisible(line)) {
       state.serial.filtered += 1;
-      continue;
+      return;
     }
-    fragment.appendChild(serialLineNode(line));
-  }
+    // Stamp the ring position so a selection can be resolved back to the lines
+    // even after rows have been trimmed from the top of the display.
+    fragment.appendChild(serialLineNode({ ...line, index }));
+  });
   output.appendChild(fragment);
   if (state.serial.follow) output.scrollTop = output.scrollHeight;
   renderSerialStatus();
@@ -3350,7 +3683,16 @@ $("serial-toggle").addEventListener("click", () => {
     return;
   }
   const port = $("serial-port").value;
-  if (!port) return;
+  const ports = state.serialPorts.length > 0 ? state.serialPorts : state.boardState?.ports ?? [];
+  const blocked = startBlockedReason({ open: false, port, ports });
+  if (blocked) {
+    // Silence here was the bug: the button looked broken. The reason lands in
+    // the status line, where the port state is already reported.
+    state.serial.lastError = blocked === "noPort" ? t.serialNoPorts : t.serialChoosePort;
+    renderSerialStatus();
+    return;
+  }
+  state.serial.lastError = "";
   const baud = Number($("serial-baud").value) || 115200;
   state.serial.port = port;
   state.serial.baud = baud;
@@ -3358,6 +3700,62 @@ $("serial-toggle").addEventListener("click", () => {
   // the same decision, and making the user repeat it is how they diverge.
   if ((state.board.selection ?? {}).port !== port) saveBoardSelection({ port, baud });
   api.send({ cmd: "serialOpen", port, baud });
+});
+
+/**
+ * Send one line to the open port.
+ *
+ * The host has had `serialWrite` since the pane was built; nothing called it,
+ * so the pane could watch a console and not answer it. The ending is not
+ * appended blindly — a bootloader prompt usually wants none.
+ */
+function sendSerialInput() {
+  const field = $("serial-send-input");
+  const text = encodeSend(field.value, $("serial-send-ending").value);
+  if (!state.serial.open) {
+    state.serial.lastError = t.serialOpenFirst;
+    renderSerialStatus();
+    return;
+  }
+  api.send({ cmd: "serialWrite", text });
+  field.value = "";
+  field.focus();
+}
+
+$("serial-send").addEventListener("click", sendSerialInput);
+$("serial-send-input").addEventListener("keydown", (event) => {
+  // Enter sends; Shift+Enter is the escape hatch for a multi-line payload.
+  if (event.key !== "Enter" || event.shiftKey) return;
+  event.preventDefault();
+  sendSerialInput();
+});
+$("serial-send-ending").addEventListener("change", (event) => {
+  state.serial.ending = event.target.value;
+});
+
+/**
+ * Hand the selected console lines to the agent.
+ *
+ * They land in the composer as a quoted block instead of being submitted: a
+ * selection is the user's evidence for the next question, and sending it on
+ * their behalf would spend a turn they did not ask for.
+ */
+$("serial-to-agent").addEventListener("click", () => {
+  const selected = [...$("serial-output").querySelectorAll(".serial-line.selected")]
+    .map((row) => Number(row.dataset.lineIndex))
+    .filter((index) => Number.isInteger(index) && index >= 0)
+    .sort((a, b) => a - b)
+    .map((index) => state.serial.lines[index])
+    .filter(Boolean);
+  const quote = selectedLinesAsQuote({ port: state.serial.port, lines: selected });
+  if (!quote) {
+    state.serial.lastError = t.serialNothingSelected;
+    renderSerialStatus();
+    return;
+  }
+  input.value = input.value.trim() ? `${input.value.replace(/\s+$/, "")}\n\n${quote}` : quote;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.focus();
 });
 
 $("serial-pause").addEventListener("click", () => {
@@ -3400,6 +3798,62 @@ $("serial-follow").addEventListener("click", () => {
   renderSerialStatus();
 });
 
+/**
+ * Select console rows.
+ *
+ * Click sets the anchor, Shift-click extends, and a drag over the output
+ * extends as it goes. The rows are the unit rather than the text: a selection
+ * has to survive being quoted into the composer, and text ranges do not.
+ */
+let serialAnchor = -1;
+function selectSerialRows(upTo, { extend = false } = {}) {
+  const output = $("serial-output");
+  const rows = [...output.querySelectorAll(".serial-line[data-line-index]")];
+  if (rows.length === 0) return;
+  if (!extend || serialAnchor < 0) {
+    rows.forEach((row) => row.classList.remove("selected"));
+    serialAnchor = rows.findIndex((row) => Number(row.dataset.lineIndex) === upTo);
+    rows[serialAnchor]?.classList.add("selected");
+    return;
+  }
+  const end = rows.findIndex((row) => Number(row.dataset.lineIndex) === upTo);
+  if (end < 0) return;
+  const [from, to] = serialAnchor <= end ? [serialAnchor, end] : [end, serialAnchor];
+  rows.forEach((row, index) => row.classList.toggle("selected", index >= from && index <= to));
+}
+
+$("serial-output").addEventListener("click", (event) => {
+  const row = event.target.closest(".serial-line[data-line-index]");
+  if (!row) return;
+  selectSerialRows(Number(row.dataset.lineIndex), { extend: event.shiftKey });
+});
+
+$("serial-output").addEventListener("mousedown", (event) => {
+  const row = event.target.closest(".serial-line[data-line-index]");
+  if (!row || event.shiftKey) return;
+  // A drag that leaves the row still selects what it passes over; without this
+  // the browser's own text selection fights the row selection.
+  const move = (moved) => {
+    const over = document.elementFromPoint(moved.clientX, moved.clientY)?.closest?.(".serial-line[data-line-index]");
+    if (over) selectSerialRows(Number(over.dataset.lineIndex), { extend: true });
+  };
+  const stop = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", stop);
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", stop);
+});
+
+$("serial-output").addEventListener("keydown", (event) => {
+  // Ctrl+A in the output means the whole console, which is what someone
+  // copying a boot log wants.
+  if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "a") return;
+  event.preventDefault();
+  const rows = $("serial-output").querySelectorAll(".serial-line[data-line-index]");
+  rows.forEach((row) => row.classList.add("selected"));
+});
+
 $("serial-output").addEventListener("scroll", () => {
   const output = $("serial-output");
   const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 24;
@@ -3423,6 +3877,16 @@ $("serial-filter").addEventListener("click", (event) => {
 
 $("serial-port").addEventListener("change", () => {
   saveBoardSelection({ port: $("serial-port").value, baud: Number($("serial-baud").value) || 115200 });
+});
+
+// The baud rate was the one control with no listener: changing it looked
+// applied until the pane reopened, and the agent kept the old value.
+$("serial-baud").addEventListener("change", () => {
+  const baud = Number($("serial-baud").value) || 115200;
+  const port = $("serial-port").value || state.board.selection?.port || "";
+  // Only name a port when there is one; an empty string here would erase a
+  // saved port the scan has not brought back yet.
+  saveBoardSelection(port ? { port, baud } : { baud });
 });
 
 /* ---------- inline review comments ---------- */
@@ -3538,16 +4002,36 @@ $("comments-clear").addEventListener("click", () => {
 function renderDiffFileList(files = state.changes.files) {
   diffFilelist.innerHTML = "";
   for (const file of files) {
-    const row = document.createElement("button");
+    // The row is a div holding two buttons: selecting the file and undoing it
+    // are different actions, and nesting a button in a button is invalid.
+    const row = document.createElement("div");
     row.className = `change-row${file.path === state.selectedChange ? " active" : ""}`;
-    row.innerHTML =
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "change-select";
+    select.innerHTML =
       `<span class="change-path">${escapeHtml(file.path)}</span>` +
       `<span class="change-stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`;
-    row.addEventListener("click", () => {
+    select.addEventListener("click", () => {
       state.selectedChange = file.path;
       openWorkbench("diff");
       renderDiff();
     });
+    const undo = document.createElement("button");
+    undo.type = "button";
+    undo.className = "change-undo";
+    undo.dataset.undo = file.path;
+    undo.textContent = t.changeUndo;
+    undo.title = t.changeUndoHint(file.path);
+    undo.addEventListener("click", (event) => {
+      event.stopPropagation();
+      // Undo restores one file. Restoring the whole turn would be the rewind
+      // card's job, and doing it from a per-file button is a surprise.
+      void confirmAction(t.changeUndoConfirm(file.path), { danger: true }).then((yes) => {
+        if (yes) api.send({ cmd: "restoreFile", path: file.path });
+      });
+    });
+    row.append(select, undo);
     diffFilelist.appendChild(row);
   }
 }
@@ -3663,6 +4147,22 @@ function renderCheckpoints() {
       const header = document.createElement("div");
       header.className = "checkpoint-turn";
       header.textContent = t.checkpointTurn(entry.messageIndex);
+      // Rewinding to turn 1 means removing the conversation itself, which the
+      // "restore to the start" button already does; offering it here as well
+      // would put a second door to the same room next to it.
+      if (entry.messageIndex > 1) {
+        const rewind = document.createElement("button");
+        rewind.type = "button";
+        rewind.className = "link-button checkpoint-rewind";
+        rewind.textContent = t.rewindToTurn;
+        rewind.title = t.rewindToTurnHint(entry.messageIndex);
+        rewind.addEventListener("click", () => {
+          void confirmAction(t.rewindConfirm, { danger: true }).then((yes) => {
+            if (yes) api.send({ cmd: "rewindTo", index: entry.messageIndex });
+          });
+        });
+        header.appendChild(rewind);
+      }
       checkpointList.appendChild(header);
     }
     const row = document.createElement("button");
@@ -3685,16 +4185,6 @@ function renderCheckpoints() {
     });
     checkpointList.appendChild(row);
   }
-}
-
-function renderTree() {
-  fileTree.innerHTML = "";
-  const nodes = state.tree ?? [];
-  if (nodes.length === 0) {
-    fileTree.innerHTML = `<div class="sidebar-empty">…</div>`;
-    return;
-  }
-  for (const node of nodes) fileTree.appendChild(treeRow(node));
 }
 
 function treeRow(node) {
@@ -3837,17 +4327,6 @@ function syncBrowserBounds() {
 function scheduleBrowserBounds() {
   clearTimeout(browserBoundsTimer);
   browserBoundsTimer = setTimeout(syncBrowserBounds, 60);
-}
-
-function openBrowserPane(url) {
-  openWorkbench("browser");
-  if (url) {
-    $("browser-url").value = url;
-    void api.browserOpen(url);
-  } else {
-    void api.browserOpen("about:blank");
-  }
-  scheduleBrowserBounds();
 }
 
 function renderBrowserState(message) {
@@ -4292,17 +4771,12 @@ function openSplitPicker(exclude) {
 
   const close = () => {
     overlay.remove();
-    document.removeEventListener("keydown", onKey, true);
+    release?.();
     if (previous && typeof previous.focus === "function") previous.focus();
   };
-  function onKey(event) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      close();
-    }
-  }
-  document.addEventListener("keydown", onKey, true);
+  // The list is a modal too: Escape closes it, and Tab stays on its rows and
+  // the cancel button instead of walking into the window behind it.
+  const release = trapFocus(overlay, { onEscape: close });
   overlay.querySelector(".confirm-cancel").addEventListener("click", close);
   overlay.addEventListener("click", (event) => {
     if (event.target === overlay) close();
@@ -4335,9 +4809,9 @@ function setDensity(density) {
 
 const systemTheme = matchMedia("(prefers-color-scheme: light)");
 systemTheme.addEventListener("change", () => {
-  // High contrast follows the same light/dark choice as "system"; both
-  // resolve again when the OS preference flips.
-  if (state.theme === "system" || state.theme === "high-contrast") {
+  // High contrast and the colour-vision variant follow the same light/dark
+  // choice as "system"; both resolve again when the OS preference flips.
+  if (state.theme === "system" || state.theme === "high-contrast" || state.theme === "daltonized") {
     document.documentElement.dataset.theme = resolvedTheme(state.theme);
   }
 });
@@ -4348,6 +4822,11 @@ function resolvedTheme(theme) {
     // base, then raises every text and border token; it is a variant, not a
     // third palette.
     return systemTheme.matches ? "light-contrast" : "contrast";
+  }
+  if (theme === "daltonized") {
+    // Same idea: the light/dark base with the semantic triad replaced by one
+    // that survives red/green confusion.
+    return systemTheme.matches ? "light-daltonized" : "daltonized";
   }
   if (theme !== "system") return theme;
   return systemTheme.matches ? "light" : "dark";
@@ -4399,13 +4878,20 @@ function submit() {
   input.value = "";
   autoSize();
   rememberInHistory(text);
-  addUserTurn(text || t.imageOnlyPrompt, images.length);
+  const userTurn = addUserTurn(text || t.imageOnlyPrompt, images.length);
+  // Indexed by the host's `prompt_accepted`, which carries the position this
+  // message will occupy; a turn sent in this window gets its rewind when the
+  // two arrive, in whichever order.
+  pendingRewindNode = userTurn;
   state.attachments = [];
   state.mentionFiles = [];
   renderAttachments();
   api.send({ cmd: "prompt", text, images, ...(files.length ? { files } : {}) });
   input.focus();
 }
+
+/** The turn whose message index has not arrived yet. */
+let pendingRewindNode = null;
 
 input.addEventListener("input", () => {
   autoSize();
@@ -4631,9 +5117,10 @@ function handleImageFiles(files) {
       reader.readAsDataURL(file);
       continue;
     }
-    // Electron exposes the real path on dropped files; plain browser File
-    // objects do not, and there is nothing useful to send without one.
-    const path = file.path;
+    // Electron 32 removed `File.path`. `webUtils.getPathForFile` is the
+    // replacement, exposed through the preload; without it every dropped log
+    // or markdown file looked pathless and was rejected as unsupported.
+    const path = droppedFilePath(file, (target) => api.getPathForFile(target));
     if (!path) {
       addNotice("warn", t.attachmentUnsupported);
       continue;
@@ -4899,12 +5386,19 @@ function openPalette() {
   field.placeholder = t.palettePlaceholder;
   renderPalette();
   field.focus();
+  // The palette is a modal: Tab must not walk into the composer behind it.
+  paletteRelease = trapFocus($("command-palette"), { onEscape: () => closePalette() });
 }
+
+/** Removes the palette's Tab trap; set by openPalette. */
+let paletteRelease = null;
 
 function closePalette() {
   paletteState = null;
   $("palette-scrim").hidden = true;
   $("command-palette").hidden = true;
+  paletteRelease?.();
+  paletteRelease = null;
   input.focus();
 }
 
@@ -4976,7 +5470,7 @@ $("scroll-bottom").addEventListener("click", () => scrollToBottom(true));
  * the edit will run, and this renders the changed lines with a little context,
  * capped so the question and its buttons stay visible.
  */
-function renderPendingDiff(detail) {
+function renderPendingDiff(detail, expanded = false) {
   const box = $("pending-diff");
   box.innerHTML = "";
   if (!detail || typeof detail !== "object") {
@@ -4988,6 +5482,9 @@ function renderPendingDiff(detail) {
   const olderSet = new Set(older);
   const newerSet = new Set(newer);
   const rows = [];
+  // The preview was cut at 40 rows with no way to see the rest, which for a
+  // generated file is the half that matters. The cap is a default, not a wall.
+  const cap = expanded ? Infinity : 40;
   let i = 0;
   let j = 0;
   // Leading context: the last unchanged lines before the first change, so the
@@ -4999,7 +5496,7 @@ function renderPendingDiff(detail) {
     j++;
   }
   for (const line of contextBefore.slice(-3)) rows.push({ kind: "context", text: line });
-  while ((i < older.length || j < newer.length) && rows.length < 40) {
+  while ((i < older.length || j < newer.length) && rows.length < cap) {
     if (i < older.length && j < newer.length && older[i] === newer[j]) {
       rows.push({ kind: "context", text: older[i] });
       i++;
@@ -5026,9 +5523,11 @@ function renderPendingDiff(detail) {
     box.appendChild(node);
   }
   if (i < older.length || j < newer.length) {
-    const more = document.createElement("div");
-    more.className = "pending-diff-more";
-    more.textContent = `+${detail.additions} −${detail.deletions} · ${detail.path}`;
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "link-button pending-diff-more";
+    more.textContent = `${t.pendingDiffShowAll} · +${detail.additions} −${detail.deletions} · ${detail.path}`;
+    more.addEventListener("click", () => renderPendingDiff(detail, true));
     box.appendChild(more);
   }
   box.hidden = rows.length === 0;
@@ -5095,6 +5594,33 @@ plusPicker.addEventListener("click", (event) => {
 document.addEventListener("click", (event) => {
   if (!event.target.closest("#plus-control")) setPlusMenu(false);
 });
+
+// One Escape path for the composer's menus. Each of them closed on an outside
+// click but not on Escape, so a keyboard user had to tab back to the trigger.
+document.addEventListener(
+  "keydown",
+  (event) => {
+    if (event.key !== "Escape") return;
+    let closed = false;
+    if (!plusMenu.hidden) {
+      setPlusMenu(false);
+      plusPicker.focus();
+      closed = true;
+    }
+    if (!modeMenu.hidden) {
+      setModeMenu(false);
+      $("mode-picker").focus();
+      closed = true;
+    }
+    if (!modelMenu.hidden) {
+      closeModelMenu();
+      $("model-picker").focus();
+      closed = true;
+    }
+    if (closed) event.preventDefault();
+  },
+  true,
+);
 
 // Files and photos: the OS dialog, then the same path the drop handler takes,
 // so an image becomes an attachment and anything else becomes a mention chip.
@@ -5588,6 +6114,9 @@ const settings = createSettings({
   closeModal,
   applyCodeFont,
   getT: () => t,
+  // Removing a server, a skill, a memory entry or a rule asks the same way the
+  // rest of the window does.
+  confirm: (message, options) => confirmAction(message, options),
 });
 
 // Kept as free functions so the rest of this file can call them by name.
@@ -5646,9 +6175,22 @@ async function checkUpdateQuietly() {
   if (!result || result.status !== "available") return;
   state.updateAvailable = result;
   addNotice("dim", t.updateAvailableBanner(result.latest));
+  // A top-bar badge, hidden until there is a version to report. The About page
+  // button was the only place this surfaced, which meant nobody saw it without
+  // going looking.
   const button = $("check-update");
-  if (button) button.textContent = `${t.checkUpdate} · ${result.latest}`;
+  if (button) {
+    button.hidden = false;
+    button.dataset.version = result.latest;
+    button.title = t.checkUpdateVersion?.(result.latest) ?? `${t.checkUpdate} · ${result.latest}`;
+    // A quiet dot rather than a version string: the button is 30px wide and
+    // the version is in the tooltip and on the About page.
+    button.classList.add("has-update");
+  }
 }
+
+// The badge is a shortcut to the page that says what to do about it.
+$("check-update").addEventListener("click", () => openSettings("about"));
 
 /* ---------- top bar overflow menu ---------- */
 

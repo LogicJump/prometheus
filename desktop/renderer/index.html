@@ -94,6 +94,9 @@
             <span class="status-text" id="status-text" data-i18n="statusStarting">starting</span>
           </div>
           <div class="topbar-actions">
+            <button class="icon-button update-badge" id="check-update" data-i18n-title="checkUpdate" hidden>
+              <svg class="icon" aria-hidden="true"><use href="#i-download"></use></svg>
+            </button>
             <button class="icon-button" id="changes-button" data-i18n-title="changesTitle">
               <svg class="icon" aria-hidden="true"><use href="#i-file-diff"></use></svg>
               <span class="icon-badge" id="changes-badge" hidden>0</span>
@@ -133,6 +136,7 @@
                 <button data-theme-choice="light" data-i18n="themeLight">Light</button>
                 <button data-theme-choice="dark" data-i18n="themeDark">Dark</button>
                 <button data-theme-choice="high-contrast" data-i18n="themeHighContrast">High contrast</button>
+                <button data-theme-choice="daltonized" data-i18n="themeDaltonized">Colour-friendly</button>
               </div>
             </div>
             <div class="menu-setting" role="group" aria-label="Language">
@@ -427,7 +431,6 @@
               <div class="board-root" id="board-root" hidden>
                 <div class="board-toolbar">
                   <button class="btn btn-quiet small" id="board-refresh" data-i18n="boardRefresh">Refresh</button>
-                  <button class="btn btn-quiet small" id="board-load-targets" data-i18n="boardLoadTargets">Load targets</button>
                 </div>
                 <div class="board-body" id="board-body"></div>
               </div>
@@ -469,6 +472,16 @@
                   <span class="serial-status" id="serial-status"></span>
                 </div>
                 <div class="serial-output" id="serial-output" tabindex="0"></div>
+                <div class="serial-send-row">
+                  <input class="serial-input" id="serial-send-input" type="text" data-i18n-placeholder="serialSendHint" autocomplete="off" />
+                  <select class="serial-select serial-ending" id="serial-send-ending" data-i18n-title="serialSendEnding">
+                    <option value="lf">LF</option>
+                    <option value="crlf">CRLF</option>
+                    <option value="none">—</option>
+                  </select>
+                  <button class="btn btn-quiet small" id="serial-send" data-i18n="serialSend">Send</button>
+                  <button class="btn btn-quiet small" id="serial-to-agent" data-i18n="serialToAgent">Send selection to agent</button>
+                </div>
               </div>
               <div class="artifact-root" id="artifact-root" hidden></div>
               <div class="browser-root" id="browser-root" hidden>
@@ -513,11 +526,11 @@
           </div>
           <nav class="settings-nav" id="settings-nav" role="tablist" aria-orientation="vertical"></nav>
           <div class="settings-rail-foot">
-            <button type="button" class="settings-profile" id="settings-profile">
+            <button type="button" class="settings-profile" id="settings-profile" title="Change the working folder">
               <span class="settings-avatar" aria-hidden="true">P</span>
               <span class="settings-profile-copy">
                 <span class="settings-profile-name" id="settings-profile-name">Local workspace</span>
-                <span class="settings-profile-sub" id="settings-profile-sub">Not signed in</span>
+                <span class="settings-profile-sub" id="settings-profile-sub">Local workspace</span>
               </span>
             </button>
           </div>

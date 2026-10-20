@@ -22,6 +22,7 @@ import { Agent } from "../src/agent.ts";
 import { Permissions } from "../src/permissions.ts";
 import { ALL_TOOLS } from "../src/tools/index.ts";
 import { listSessions, loadSession, newSessionId, saveSession, updateSessionFlags, deleteSessionFile, sessionMeta, searchSessions } from "../src/sessions.ts";
+import { EMPTY_SESSION_VIEW, resolveSessionView, filterSessions } from "./sessionView.js";
 import { acquireSessionLock, releaseSessionLock, lockConflictMessage, sessionLockHolder, removeSessionLockFile } from "../src/sessionLock.ts";
 import { compactForce } from "../src/context.ts";
 import { discoverModels, FALLBACK_MODELS } from "../src/models.ts";
@@ -30,7 +31,8 @@ import { buildChange } from "../src/diff.ts";
 import { loadCheckpoints, restoreTo, restoreAfterMessage, restoreFile, clearCheckpoints, captureBefore, lastRedo, applyRedo } from "../src/checkpoints.ts";
 import { loadFilePreview, readWorkspaceTree, searchWorkspaceFiles } from "../src/workspace.ts";
 import { maskKey, readUiSettings, writeBoardConfig, writeConfigFile, writeUiSettings } from "../src/settings.ts";
-import { loadRules, removeRule } from "../src/rules.ts";
+import { loadRules, removeRule, addRule } from "../src/rules.ts";
+import { rulesFromAutoApprove } from "../src/autoApproveMigration.ts";
 import { publicProviders, providerFor } from "../src/providers.ts";
 import { recordUsage, usageSummary } from "../src/usage.ts";
 import {
@@ -55,9 +57,13 @@ import { MCP_PRESETS, findPreset } from "../src/embedded/mcpPresets.ts";
 import { detectProject } from "../src/embedded/project.ts";
 import { hooksStatus, trustProjectHooks, revokeProjectHooks } from "../src/hooks.ts";
 import { listProbes, listTargets } from "../src/embedded/probe.ts";
-import { listSerialPorts, openPort, rememberLine, recentPortLines, isPortOpen, registerPortWriter, clearPortWriter } from "../src/embedded/serial.ts";
+import { listSerialPorts, openPort, rememberLine, recentPortLines, clearRecentLines, isPortOpen, registerPortWriter, clearPortWriter } from "../src/embedded/serial.ts";
 import { SerialLineBuffer } from "../src/embedded/serialStream.ts";
-import { assembleBoardState, boardTargetStatus } from "../src/embedded/board.ts";
+import { assembleBoardState, boardTargetStatus, effectiveBoard } from "../src/embedded/board.ts";
+import { IdentificationNeed } from "../src/embedded/identifyGate.ts";
+import { autoTitleAllowed, ruleFirstTitle } from "../src/titlePolicy.ts";
+import { withMentionedFiles as withMentionedFilesBlocks } from "./mentions.js";
+import { identifyChip, suggestTargets, flashCodeFor } from "../src/embedded/identity.ts";
 import { TerminalSession } from "./terminal.js";
 import { gitCommit, gitStatus, prStatus, createPullRequest, ghAvailable, rerunFailedChecks, failedCheckLog } from "./git.js";
 import { expandSlash, listCommands } from "../src/commands.ts";
@@ -82,6 +88,8 @@ let sessionCreatedAt = new Date().toISOString();
 let sessionTitle = "";
 /** Task state of this conversation, mirrored into the sidebar. */
 let sessionStatus = "ready";
+/** The sidebar's current filter; every pushed list keeps it. */
+let sessionView = { ...EMPTY_SESSION_VIEW };
 /** Prompts advertised by MCP servers, exposed as slash commands. */
 let mcpPrompts = [];
 /** Canonical workspace spelling: one project must not appear twice. */
@@ -380,11 +388,11 @@ class HostUi {
     this.thinkingEnd();
     send({ type: "subagent_start", prompt: String(prompt).slice(0, 300), ...(meta ? { id: meta.id } : {}) });
   }
-  subagentActivity(kind, text) {
-    send({ type: "subagent_activity", kind, text: String(text).slice(0, 300) });
+  subagentActivity(kind, text, meta) {
+    send({ type: "subagent_activity", kind, text: String(text).slice(0, 300), ...(meta ? { id: meta.id } : {}) });
   }
-  subagentEnd(ok, summary) {
-    send({ type: "subagent_end", ok, summary: String(summary ?? "") });
+  subagentEnd(ok, summary, meta) {
+    send({ type: "subagent_end", ok, summary: String(summary ?? ""), ...(meta ? { id: meta.id } : {}) });
   }
   thinking(delta = "") {
     if (this.assistantActive) this.assistantEnd();
@@ -427,7 +435,10 @@ class HostUi {
       elapsedMs: Date.now() - runStartedAt,
       tool: this.lastTool || "",
       retry: this.retryCount,
-      turns: agent?.lastRunTurns ?? 0,
+      // `turns` was sent here and dropped by the renderer: the loop count is a
+      // tool-loop detail, and the progress line never showed it. Removed rather
+      // than rendered because "turn 4" beside an elapsed clock reads as a
+      // different clock.
       // Output tokens only. The input side is the prompt — often six figures
       // on the first heartbeat once a long document is in context — and a live
       // readout of it reads as a runaway bill rather than as progress.
@@ -444,7 +455,7 @@ class HostUi {
    * flash/RAM numbers come from the last build, not from a fresh one — so this
    * both records it and forwards it. The renderer ignores names it does not know.
    */
-  toolDetail(name, data) {
+  toolDetail(name, data, meta) {
     if (name === "embed_build" && data && typeof data === "object") {
       const usage = data.usage && typeof data.usage === "object" ? data.usage : null;
       lastBuild = {
@@ -453,7 +464,7 @@ class HostUi {
         at: new Date().toISOString(),
       };
     }
-    send({ type: "tool_detail", name, data });
+    send({ type: "tool_detail", name, data, ...(meta ? { id: meta.id } : {}) });
   }
   todos(items) {
     send({ type: "todos", items });
@@ -787,19 +798,20 @@ function sendSessions(options = {}) {
   // The sidebar filters by state and workspace; doing it here means the page
   // size limits the rows shown, not the rows searchable. "Only errors" used to
   // be a client-side filter that hid failures beyond the first page.
-  const state = String(options.status ?? "all");
-  const cwdFilter = options.cwd ? canonicalCwd(String(options.cwd)) : "";
-  const visible = all.filter((session) => {
-    if (state !== "all" && (session.status ?? "ready") !== state) return false;
-    if (cwdFilter && canonicalCwd(session.cwd) !== cwdFilter) return false;
-    return true;
-  });
+  //
+  // The view is remembered for the same reason: three other paths push a fresh
+  // list (a save, a status change, archiving), and a push with no options used
+  // to reset the filter to "all" — a "only errors" list repopulated itself
+  // with everything the moment any session changed state.
+  sessionView = resolveSessionView(sessionView, options);
+  const visible = filterSessions(all, sessionView);
   send({
     type: "sessions",
     sessions: visible.slice(0, limit),
     total: visible.length,
     all: all.length,
     limit,
+    filter: { status: sessionView.status, cwd: sessionView.cwd },
   });
 }
 
@@ -960,6 +972,13 @@ function createAgent(messages = []) {
   agent.sessionId = sessionId;
   agent.outputStyle = uiPrefs.outputStyle ?? "default";
   agent.onBeforeMutate = (name, input) => recordChange(name, input);
+  // Board tools take a stored target when nothing identified the attached
+  // part. Identify once per selection before they run, so a flash names the
+  // chip on the desk rather than the one that was there last time.
+  agent.onBeforeTool = async (name) => {
+    if (!BOARD_AWARE_TOOLS.has(name)) return;
+    await ensureIdentified();
+  };
   // A background sub-task reports when it is done. The notice is not a user
   // turn: it lands in the transcript as a result, and the conversation only
   // sees it if the user asks a follow-up.
@@ -1057,9 +1076,110 @@ let lastBuild = null;
 const BOARD_TTL_MS = 30_000;
 
 /** Invalidate everything a folder switch or a toolchain change makes stale. */
+/**
+ * Identify the attached part before a tool uses a stored target.
+ *
+ * Identification used to happen only when the Board pane scanned. A user who
+ * opened the app and told the agent to flash got `config.board.target` — a
+ * name saved from the last board — which is a preference, not evidence. This
+ * runs the scan once per selection, and only when a stored target would
+ * otherwise be used. A machine with no probe is not retried on every call.
+ */
+const identificationNeed = new IdentificationNeed();
+identificationNeed.noteSelection(config?.board);
+
+/** Tools whose arguments can come from the saved board selection. */
+const BOARD_AWARE_TOOLS = new Set(["embed_flash", "embed_debug", "embed_reset"]);
+
+async function ensureIdentified() {
+  if (!config?.board?.target) return;
+  identificationNeed.noteSelection(config.board);
+  if (boardCache) {
+    identificationNeed.markIdentified();
+    return;
+  }
+  // Cheap hint first: with nothing plugged in there is nothing to ask, and a
+  // scan would spawn four tool probes to learn that.
+  let probes = 0;
+  try {
+    const report = await detectToolchains();
+    const byKind = new Map(report.tools.map((entry) => [entry.kind, entry.path]));
+    probes = (await listProbes({ pyocd: byKind.get("pyocd"), "probe-rs": byKind.get("probe-rs"), jlink: byKind.get("jlink") })).probes.length;
+  } catch {
+    return;
+  }
+  if (!identificationNeed.shouldIdentify({ board: config.board, identity: boardCache?.identity ?? null, probes })) return;
+  send({ type: "notice", level: "dim", text: "identifying the attached board before using the saved target" });
+  try {
+    await emitBoardState("auto");
+  } finally {
+    identificationNeed.markIdentified();
+  }
+}
+
 function forgetBoard() {
   boardCache = null;
   targetCache = null;
+  // The effective board described the previous one; keeping it would let a
+  // tool flash a part that is no longer on the desk.
+  if (config) config.effectiveBoard = undefined;
+  if (agent) agent.config.effectiveBoard = undefined;
+}
+
+/**
+ * Read the attached part's identity, or say why it could not be read.
+ *
+ * The probe list is the cheap hint that something is plugged in. Identification
+ * is only attempted when at least one probe is known to the tools, so a desk
+ * with nothing attached costs no subprocess at all.
+ */
+async function identifyAttached(pyocdPath, openocdPath, probes, jlinkPath) {
+  if (!pyocdPath && !openocdPath && !jlinkPath) return { identity: null, note: "no probe tool installed (pyocd, openocd or jlink)" };
+  if (!Array.isArray(probes) || probes.length === 0) {
+    return { identity: null, note: "no probe detected, so the chip could not be asked what it is" };
+  }
+  try {
+    // OpenOCD cannot read a chip without a target config; without one every
+    // OpenOCD attempt failed with "no target", so identification could only
+    // ever succeed through pyOCD.
+    const openocdTarget = config?.board?.targetConfig ? String(config.board.targetConfig) : "";
+    const openocdInterface = config?.board?.interfaceConfig ? String(config.board.interfaceConfig) : "";
+    const result = await identifyChip({
+      ...(pyocdPath ? { pyocd: pyocdPath } : {}),
+      ...(openocdPath ? { openocd: openocdPath } : {}),
+      ...(openocdTarget ? { openocdTarget } : {}),
+      ...(openocdInterface ? { openocdInterface } : {}),
+      ...(jlinkPath ? { jlink: jlinkPath } : {}),
+    });
+    if (result.ok) return { identity: result.identity, note: undefined };
+    const said = result.failure.attempts.map((attempt) => `${attempt.probe}: ${attempt.reason}`).join("; ");
+    return { identity: null, note: `identification failed — ${said}` };
+  } catch (err) {
+    return { identity: null, note: `identification failed — ${err?.message ?? err}` };
+  }
+}
+
+/**
+ * The target tool name for the attached part.
+ *
+ * This is the answer to "which target is this", and it comes from the chip.
+ * The stored selection is consulted only to break a tie between two target
+ * names a tool offers for the same silicon — it never overrides the part that
+ * answered the probe, because a stored name is a memory of the last board and
+ * the chip is the board that is plugged in now.
+ */
+function targetForIdentity(identity, selection) {
+  if (!identity) return { target: undefined, options: [], source: "none" };
+  const options = targetCache ? suggestTargets(identity, targetCache.targets) : [];
+  if (options.length === 0) {
+    // The chip was read, but no tool's table has a name for it. That is a
+    // different fact from "no target", and the pane says so rather than
+    // printing the stored name as though it still applied.
+    return { target: undefined, options: [], source: "unlisted" };
+  }
+  const stored = selection?.target ? String(selection.target).toLowerCase() : "";
+  const chosen = options.find((name) => name.toLowerCase() === stored) ?? options[0];
+  return { target: chosen, options, source: "chip" };
 }
 
 async function boardInventory(force = false) {
@@ -1073,6 +1193,25 @@ async function boardInventory(force = false) {
       listProbes({ pyocd: byKind.get("pyocd"), "probe-rs": byKind.get("probe-rs"), jlink: byKind.get("jlink") }),
       listSerialPorts(),
     ]);
+    // Ask the attached part what it is. This is the only fact in the pane that
+    // comes from the hardware rather than from a file, so it is attempted
+    // whenever a probe is present — and its failure is reported, not hidden.
+    const identity = await identifyAttached(byKind.get("pyocd"), byKind.get("openocd"), probes.probes, byKind.get("jlink"));
+    // The target table is what turns an identification into a name a flasher
+    // accepts. It takes one second, so it loads here with the rest of the
+    // inventory instead of waiting behind a button: without it the pane could
+    // say which chip is attached but not which target to use, which is the
+    // half-answer that made the old pane confusing.
+    if (!targetCache) {
+      try {
+        const listed = await listTargets({ pyocd: byKind.get("pyocd") }, { limit: 0 });
+        targetCache = { targets: listed.targets, notes: listed.notes, total: listed.total };
+      } catch {
+        // A missing table is not a failed scan: identification still stands,
+        // and the pane says the table could not be read.
+        targetCache = { targets: [], notes: ["target table could not be read"], total: 0 };
+      }
+    }
     boardCache = {
       at: Date.now(),
       tools: report.tools,
@@ -1080,11 +1219,15 @@ async function boardInventory(force = false) {
       probes: probes.probes,
       probeNotes: probes.notes,
       ports,
+      identity: identity.identity ?? null,
+      identityNote: identity.note,
       paths: {
         pyocd: byKind.get("pyocd"),
         "probe-rs": byKind.get("probe-rs"),
       },
     };
+    // The tools must use the same target the pane is about to show.
+    syncEffectiveBoard();
     return boardCache;
   })().finally(() => {
     boardInflight = null;
@@ -1101,12 +1244,58 @@ async function boardInventory(force = false) {
  */
 function boardStateProject() {
   const project = detectProject(cwd);
+  const selection = config?.board ?? {};
   return assembleBoardState({
     project,
-    selection: config?.board ?? {},
+    selection,
     scannedAt: null,
     build: lastBuild,
+    ...(boardCache ? { identity: boardCache.identity ?? null, ...(boardCache.identityNote ? { identityNote: boardCache.identityNote } : {}) } : {}),
+    // The target the tools will use. When the chip was read it decides; when it
+    // was not, the stored selection is the only thing left and is labelled as
+    // what it is — a remembered choice, not a reading.
+    ...targetSelectionFor(selection),
   });
+}
+
+/**
+ * Work out which target name applies, and say where it came from.
+ *
+ * `source` is what lets the pane be honest without being confusing: `chip`
+ * means the part answered and the name was derived from it, `manual` means the
+ * user typed one and nothing is attached to check it against, and `none` means
+ * there is nothing to flash yet.
+ */
+/** The target name the flashers will use, and where it came from. */
+function targetSelectionFor(selection) {
+  const resolved = targetForIdentity(boardCache?.identity ?? null, selection);
+  if (resolved.target) {
+    return { target: resolved.target, targetOptions: resolved.options, targetSource: "chip" };
+  }
+  if (resolved.source === "unlisted") {
+    return { target: undefined, targetOptions: [], targetSource: "unlisted" };
+  }
+  // No identification: the stored name is all there is.
+  if (selection?.target) return { target: String(selection.target), targetOptions: [], targetSource: "manual" };
+  return { target: undefined, targetOptions: [], targetSource: "none" };
+}
+
+/**
+ * Push the board the pane is showing into the agent, so the tools use it.
+ *
+ * The pane could say "this is what gets flashed" all it liked; until this ran,
+ * `embed_flash` read `config.board` and used the saved target instead. The
+ * whole point of deriving a target from the chip is that it is what the tools
+ * act on, so the two are set together everywhere the board state changes.
+ */
+function syncEffectiveBoard() {
+  const selection = config?.board ?? {};
+  const resolved = targetSelectionFor(selection);
+  const ports = boardCache?.ports ?? [];
+  const live = effectiveBoard(selection, boardCache?.identity ?? null, resolved.target, resolved.targetSource, ports);
+  config.effectiveBoard = live;
+  if (agent) agent.config.effectiveBoard = live;
+  return live;
 }
 
 /**
@@ -1116,7 +1305,7 @@ function boardStateProject() {
  * enough to be worth testing, and `boardTargetStatus` is already tested.
  */
 function targetStatusFor(selection) {
-  return boardTargetStatus(selection?.target, targetCache ? targetCache.targets : null);
+  return boardTargetStatus(selection?.target, targetCache ? targetCache.targets : null, boardCache?.identity ?? null);
 }
 
 /**
@@ -1159,6 +1348,8 @@ async function emitBoardState(refresh = "auto") {
       probeNotes: inventory.probeNotes,
       ports: inventory.ports,
       scannedAt: new Date(inventory.at).toISOString(),
+      identity: inventory.identity ?? null,
+      ...(inventory.identityNote ? { identityNote: inventory.identityNote } : {}),
     });
   } catch (err) {
     send({ type: "notice", level: "warn", text: `board scan failed: ${err.message}` });
@@ -1182,6 +1373,10 @@ async function emitBoardTargets(filter) {
             entry.part?.toLowerCase().includes(needle),
         )
       : targetCache.targets;
+    // When the chip has been read, the table can answer "which of these is the
+    // part that is actually attached" instead of only "does this name exist".
+    const attached = boardCache?.identity ?? null;
+    const suggested = attached ? suggestTargets(attached, targetCache.targets) : [];
     send({
       type: "board_targets",
       total: targetCache.total,
@@ -1189,6 +1384,15 @@ async function emitBoardTargets(filter) {
       // A filtered list is what the picker shows; it is capped because the
       // unfiltered table is 206 entries and the picker is not a table.
       targets: targets.slice(0, 200),
+      suggested,
+      attached: attached
+        ? {
+            family: attached.family ?? null,
+            deviceId: attached.deviceId,
+            flashKib: attached.flashKib ?? null,
+            flashCode: attached.flashKib === undefined ? null : flashCodeFor(attached.flashKib) ?? null,
+          }
+        : null,
       filter: filter ?? "",
     });
     // Loading the table turns "unloaded" into a real verdict about the selected
@@ -1204,6 +1408,9 @@ function applyBoardSelection(selection) {
   const clean = selection && typeof selection === "object" ? selection : null;
   const path = writeBoardConfig(clean, cwd);
   config.board = clean ?? undefined;
+  // What was saved is a preference; what the tools act on is the effective
+  // board, recomputed from it. They differ whenever the chip decided the name.
+  const live = syncEffectiveBoard();
   if (agent) {
     agent.config.board = config.board;
     agent.refreshSystemPrompt(
@@ -1212,7 +1419,9 @@ function applyBoardSelection(selection) {
         : "The user cleared the board selection in the Board pane.",
     );
   }
-  send({ type: "board_selection", selection: config.board ?? {}, path });
+  // The pane needs to hear the effective target too, or it would re-derive it
+  // and possibly disagree with the tools between the two messages.
+  send({ type: "board_selection", selection: config.board ?? {}, path, effective: live });
   sendBoardState("project", boardStateCached());
   void emitBoardState("auto");
 }
@@ -1498,7 +1707,7 @@ function scheduleMidTurnPersist() {
  */
 function withMentionedFiles(text, files) {
   if (!Array.isArray(files) || files.length === 0) return text;
-  const blocks = [];
+  const collected = [];
   for (const relative of files.slice(0, 8)) {
     try {
       const abs = isAbsolute(relative) ? relative : resolve(cwd, relative);
@@ -1507,21 +1716,20 @@ function withMentionedFiles(text, files) {
       const info = statSync(abs);
       if (!info.isFile()) continue;
       if (info.size > 200 * 1024) {
-        blocks.push(`<file path="${relative}" bytes="${info.size}">too large to inline; read it with read_file</file>`);
+        collected.push({ path: relative, content: "", bytes: info.size, tooLarge: true });
         continue;
       }
       const buf = readFileSync(abs);
       if (buf.subarray(0, 8000).includes(0)) {
-        blocks.push(`<file path="${relative}">binary file; not inlined</file>`);
+        collected.push({ path: relative, content: "", binary: true });
         continue;
       }
-      blocks.push("<file path=" + JSON.stringify(relative) + ">" + buf.toString("utf8") + "</file>");
+      collected.push({ path: relative, content: buf.toString("utf8") });
     } catch {
       /* a path that vanished is not worth failing the message for */
     }
   }
-  if (blocks.length === 0) return text;
-  return blocks.join("\\n\\n") + "\\n\\n" + text;
+  return withMentionedFilesBlocks(text, collected);
 }
 
 async function runPrompt(text, images, options = {}) {
@@ -1538,6 +1746,10 @@ async function runPrompt(text, images, options = {}) {
   running = true;
   setSessionStatus("working");
   startProgress();
+  // Where the user's message is about to land in the transcript. The renderer
+  // needs it to offer "rewind to here" on the turn it just sent; without it the
+  // button only existed on turns restored from disk.
+  send({ type: "prompt_accepted", index: agent.messages.length });
   turnBaseline = new Map();
   if (ephemeral) {
     // Record where the transcript stood; everything past it belongs to this
@@ -1708,12 +1920,17 @@ let titleAttempted = false;
  * existing first-message fallback.
  */
 async function autoTitle() {
+  // Off means off: the switch exists, and a title costs a request.
+  if (!autoTitleAllowed({ suggestions: uiPrefs.suggestions })) return;
   try {
     const firstUser = agent.messages.find((message) => message.role === "user");
     const firstReply = agent.messages.find((message) => message.role === "assistant" && typeof message.content === "string");
     if (!firstUser || !firstReply) return;
     const text = typeof firstUser.content === "string" ? firstUser.content : "";
-    const title = await agent.proposeTitle(text, String(firstReply.content ?? ""));
+    // The message already says what it is about. Try the free rule first; the
+    // model is only asked when the message is too thin to name.
+    const rule = ruleFirstTitle(text);
+    const title = rule || (await agent.proposeTitle(text, String(firstReply.content ?? "")));
     if (!title || sessionTitle) return;
     sessionTitle = title;
     updateSessionFlags(sessionId, { title });
@@ -1871,6 +2088,37 @@ function lastAssistantText() {
   return "";
 }
 
+/**
+ * Turn an old `autoApprove` list into rules, once.
+ *
+ * The settings page no longer has that box; the rule list is the only place an
+ * approval is written. Runs at startup so a config saved before the change
+ * keeps its behaviour, and clears the field so nothing reads it again.
+ */
+function migrateApprovalsOnce() {
+  const stored = Array.isArray(config?.autoApprove) ? config.autoApprove : [];
+  if (stored.length === 0) return;
+  const rules = rulesFromAutoApprove({ autoApprove: stored, existing: loadRules(), scope: "user" });
+  for (const rule of rules) {
+    try {
+      addRule(rule);
+    } catch {
+      /* a rule file that cannot be written must not stop the app */
+    }
+  }
+  try {
+    writeConfigFile({ autoApprove: [] });
+  } catch {
+    /* leaving the field behind is harmless: nothing reads it now */
+  }
+  config.autoApprove = [];
+  send({
+    type: "notice",
+    level: "dim",
+    text: `moved ${rules.length} auto-approved tool(s) into the rules list`,
+  });
+}
+
 async function handle(cmd) {
   switch (cmd.cmd) {
     case "init": {
@@ -1885,6 +2133,7 @@ async function handle(cmd) {
         send({ type: "fatal", message: err.message });
         return;
       }
+      migrateApprovalsOnce();
       client = makeClient();
       // The browser tools live in the agent process but run in the window;
       // this bridge turns a tool call into the same request the pane handles.
@@ -1905,6 +2154,11 @@ async function handle(cmd) {
         },
       });
       createAgent([]);
+      // "Isolate by default" applied to every new session except the one that
+      // exists at launch: the flag was read on `startNewSession` and inside the
+      // worktree switch, never on the path that runs when the window opens. A
+      // user who turned it on still worked in the real tree on every restart.
+      if (uiPrefs.isolateByDefault) void enterDefaultWorktree();
       send({ type: "ready" });
       void emitGitStatus();
       void startMcp();
@@ -2176,6 +2430,7 @@ async function handle(cmd) {
           theme: uiPrefs.theme ?? "dark",
           density: uiPrefs.density ?? "balanced",
           fontScale: uiPrefs.fontScale ?? 1,
+          uiScale: uiPrefs.uiScale ?? 1,
           transcriptWidth: uiPrefs.transcriptWidth ?? "standard",
           transcriptView: uiPrefs.transcriptView ?? "normal",
           reduceMotion: Boolean(uiPrefs.reduceMotion),
@@ -2214,10 +2469,14 @@ async function handle(cmd) {
         "restartSession",
         "suggestions",
         "updateCheck",
+        "uiScale",
       ]);
       if (!allowed.has(key)) return;
-      writeUiSettings({ [key]: value });
-      uiPrefs = { ...uiPrefs, [key]: value };
+      // The zoom level arrives as a number; clamp it where the value is stored
+      // rather than in the page, so a bad value cannot be saved at all.
+      const stored = key === "uiScale" ? Math.max(0.75, Math.min(1.5, Number(value) || 1)) : value;
+      writeUiSettings({ [key]: stored });
+      uiPrefs = { ...uiPrefs, [key]: stored };
       if (key === "outputStyle" && agent) {
         agent.outputStyle = ["concise", "explanatory"].includes(value) ? value : "default";
         agent.refreshSystemPrompt(`The response style is now "${agent.outputStyle}".`);
@@ -2365,7 +2624,7 @@ async function handle(cmd) {
         writeConfigFile(filePatch);
         const uiPatch = {};
         if (isLocale(patch.locale)) uiPatch.locale = patch.locale;
-        if (["dark", "light", "system", "high-contrast"].includes(patch.theme)) uiPatch.theme = patch.theme;
+        if (["dark", "light", "system", "high-contrast", "daltonized"].includes(patch.theme)) uiPatch.theme = patch.theme;
         if (["compact", "balanced", "detailed"].includes(patch.density)) uiPatch.density = patch.density;
         if (Number.isFinite(Number(patch.fontScale))) uiPatch.fontScale = Math.max(0.85, Math.min(1.3, Number(patch.fontScale)));
         if (["narrow", "standard", "wide"].includes(patch.transcriptWidth)) uiPatch.transcriptWidth = patch.transcriptWidth;
@@ -2596,7 +2855,7 @@ async function handle(cmd) {
       return;
     }
     case "listSessions":
-      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit });
+      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit, status: cmd.status, cwd: cmd.cwd });
       return;
     case "sessionFlags": {
       const updated = updateSessionFlags(String(cmd.id), {
@@ -2605,7 +2864,7 @@ async function handle(cmd) {
         archived: cmd.archived,
       });
       if (!updated) return send({ type: "notice", level: "error", text: `session not found: ${cmd.id}` });
-      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit });
+      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit, status: cmd.status, cwd: cmd.cwd });
       if (updated.id === sessionId) {
         sessionTitle = updated.title ?? "";
         send({ type: "session_title", title: sessionTitle });
@@ -2625,7 +2884,7 @@ async function handle(cmd) {
       }
       removeSessionLockFile(String(cmd.id));
       const deleted = deleteSessionFile(String(cmd.id));
-      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit });
+      sendSessions({ includeArchived: Boolean(cmd.includeArchived), limit: cmd.limit, status: cmd.status, cwd: cmd.cwd });
       if (!deleted) send({ type: "notice", level: "error", text: `session not found: ${cmd.id}` });
       return;
     }
@@ -2760,11 +3019,28 @@ async function handle(cmd) {
     }
     case "serialClear": {
       serial?.buffer.clear();
+      // The pane is not the only reader: `embed_serial` reads a process-wide
+      // ring, and clearing only the display left the agent quoting lines the
+      // user had just thrown away.
+      if (serial?.port) clearRecentLines(serial.port);
       send({ type: "serial_cleared", port: serial?.port ?? null });
       return;
     }
     case "serialStatus": {
       send({ type: "serial_snapshot", ...serialStatus(), lines: serial ? serial.buffer.peek() : [] });
+      return;
+    }
+    case "serialPorts": {
+      // The Serial pane can be opened without ever opening the Board pane, and
+      // the port list used to live only in the board inventory. This answers
+      // with the list alone: no toolchain detection, no chip identification,
+      // no flashing-tool probe — a dropdown does not need any of that.
+      try {
+        const ports = await listSerialPorts();
+        send({ type: "serial_ports", ports });
+      } catch (err) {
+        send({ type: "serial_ports", ports: [], error: err?.message ?? String(err) });
+      }
       return;
     }
     case "browserResult": {

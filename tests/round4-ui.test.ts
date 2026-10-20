@@ -3,10 +3,14 @@
  * without a window.
  *
  * The renderer runs in Electron; what is testable here is the logic behind it
- * — the incremental markdown renderer, the word-level diff decoration, the
- * schedule and recovery bookkeeping, and the CLI verbs. Anything that needs a
- * real DOM is left to manual verification; inventing a fake DOM would test the
- * fake.
+ * — the incremental markdown renderer, the schedule and recovery bookkeeping,
+ * and the CLI verbs. Anything that needs a real DOM is left to manual
+ * verification; inventing a fake DOM would test the fake.
+ *
+ * Word-level diff decoration is not covered here: it lives in `app.js`, which
+ * reads `document` at module load. The structural side of it (which hunks exist
+ * and what `highlights` contains) is asserted in `round9-batch8.test.ts` via
+ * the signature helper instead.
  */
 
 import { test } from "node:test";

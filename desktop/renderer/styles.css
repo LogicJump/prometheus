@@ -182,6 +182,38 @@
   --shadow-popover: 0 12px 34px rgba(20, 26, 36, 0.14);
 }
 
+/*
+ * Colour-vision variants.
+ *
+ * Red/green is the pair most commonly confused, and it is also the pair this
+ * product uses for "added" and "removed". The variants keep every surface,
+ * border and text token of dark/light and replace only the semantic triad:
+ * green becomes blue, red becomes orange-red. Nothing new is introduced, so a
+ * diff stays readable in the same way it was.
+ */
+:root[data-theme="daltonized"] {
+  --success: #58a8f0;
+  --warn: #e0b45c;
+  --danger: #f08a4b;
+  --danger-soft: rgba(240, 138, 75, 0.14);
+  --success-soft: rgba(88, 168, 240, 0.16);
+  --add-bg: rgba(88, 168, 240, 0.16);
+  --del-bg: rgba(240, 138, 75, 0.14);
+  --mark-bg: rgba(224, 180, 92, 0.3);
+}
+
+:root[data-theme="light-daltonized"] {
+  color-scheme: light;
+  --success: #1f6feb;
+  --warn: #8a6415;
+  --danger: #b4501f;
+  --danger-soft: rgba(180, 80, 31, 0.1);
+  --success-soft: rgba(31, 111, 235, 0.1);
+  --add-bg: rgba(31, 111, 235, 0.1);
+  --del-bg: rgba(180, 80, 31, 0.1);
+  --mark-bg: rgba(160, 110, 0, 0.26);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -502,6 +534,38 @@ body.resizing-sidebar .sidebar {
   text-align: left;
 }
 
+/* Selecting a file and undoing it are two actions on one row. The selector
+   takes the width; the undo button appears on hover so it does not read as
+   part of the filename. */
+.change-select {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+
+.change-undo {
+  flex: 0 0 auto;
+  opacity: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  padding: 0 2px;
+}
+
+.change-row:hover .change-undo,
+.change-row.active .change-undo,
+.change-undo:focus-visible {
+  opacity: 1;
+}
+
+.change-undo:hover {
+  color: var(--danger);
+}
+
 .change-row:hover,
 .change-row.active {
   background: var(--surface);
@@ -621,11 +685,20 @@ body.resizing-sidebar .sidebar {
 }
 
 .checkpoint-turn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 10px 0 2px;
   padding: 0 6px;
   font-family: var(--mono);
   font-size: var(--text-xs);
   color: var(--text-faint);
+}
+
+.checkpoint-rewind {
+  margin-left: auto;
+  font-family: inherit;
+  font-size: inherit;
 }
 
 .checkpoint-row {
@@ -1036,7 +1109,10 @@ body.resizing-sidebar .sidebar {
   padding-left: 8px;
   white-space: pre;
   overflow-wrap: normal;
-  min-width: 0;
+  /* A diff line is as wide as it is. `min-width: 0` let the flex item shrink
+     and the long line wrap out of its own gutter; content sizing keeps one row
+     per line and lets the pane scroll sideways. */
+  min-width: max-content;
 }
 
 .diff-line.add {
@@ -1900,6 +1976,18 @@ body.resizing-sidebar .sidebar {
   color: var(--text);
 }
 
+/* An update is worth one dot, not a version string in a 30px button. */
+.update-badge.has-update::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
 .icon-button.small {
   width: 24px;
   height: 24px;
@@ -2105,6 +2193,35 @@ mark.find-hit.current {
 .turn.user:hover .rewind-button,
 .rewind-button:focus-visible {
   opacity: 1;
+}
+
+/* Copy / retry / edit sit in the same empty space as the rewind button, on the
+   side the bubble does not occupy. They appear on hover so a transcript of
+   twenty messages is not a column of buttons. */
+.turn-actions {
+  order: -2;
+  display: flex;
+  gap: 2px;
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity 120ms var(--ease);
+}
+
+.turn.user:hover .turn-actions,
+.turn-actions:focus-within {
+  opacity: 1;
+}
+
+.turn-action {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+}
+
+.turn-action:hover {
+  color: var(--text);
+  background: var(--surface);
 }
 
 /* The clearfix that used to live here existed for the floated bubble. The
@@ -3175,6 +3292,18 @@ mark.find-hit.current {
 
 .send-button:not(:disabled):active {
   transform: scale(0.94);
+}
+
+/* Mid-turn the same button queues instead of sending. The change has to be
+   visible: the arrow means "send now", and a queue is a different promise. */
+.send-button.queues {
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+.send-button.queues svg {
+  transform: rotate(90deg);
 }
 
 .stop-button {
@@ -5301,6 +5430,43 @@ mark.find-hit.current {
   gap: 8px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* A selected row is the unit the "send to agent" action quotes, so the mark
+   has to be unmistakable while reading a dense boot log. */
+.serial-line.selected {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.serial-send-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.serial-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  padding: 4px 8px;
+  outline: none;
+}
+
+.serial-input:focus {
+  border-color: var(--border-strong);
+}
+
+.serial-ending {
+  max-width: 76px;
 }
 
 .serial-time {

@@ -114,9 +114,19 @@ export const browserScreenshotTool: Tool = {
     if (!bridge) return { isError: true, content: UNAVAILABLE };
     const result = await bridge.request({ kind: "screenshot" });
     if (!result.ok) return { isError: true, content: result.error ?? "could not capture the page" };
+    // The description promises "the image you receive"; a path is not an
+    // image, and the model cannot open one. Without the data the call failed
+    // at the thing it exists for, so it says so rather than reporting success.
+    if (!result.dataUrl) {
+      return {
+        isError: true,
+        content: `the screenshot was saved to ${result.text ?? "an unknown path"}, but no image data came back, so it cannot be shown to you`,
+      };
+    }
     return {
-      content: `Screenshot of ${result.url ?? "the page"} saved to ${result.text ?? "(no path)"}.`,
+      content: `Screenshot of ${result.url ?? "the page"} (also saved to ${result.text ?? "(no path)"}).`,
       display: result.url ?? "screenshot",
+      images: [String(result.dataUrl)],
     };
   },
 };

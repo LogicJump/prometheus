@@ -223,6 +223,37 @@ const ESP_LEVELS: Record<string, LogLevel> = {
 const SYSLOG_LEVELS: LogLevel[] = ["error", "error", "error", "error", "warn", "info", "info", "debug"];
 
 /**
+ * A level in the text of an otherwise unstructured line.
+ *
+ * The structured formats above miss plain `printf` debugging, which is what
+ * most bare-metal firmware does: `WARN: heap low`, `[ERROR] i2c timeout`,
+ * `ERROR: ...`. Those lines were classified as info, so the pane's Warnings
+ * and Errors filters showed nothing on exactly the firmware where they matter.
+ *
+ * Only a prefix counts. `error` in the middle of a sentence is prose, and
+ * promoting it would make the filter useless in the other direction.
+ */
+const TEXT_LEVELS: [RegExp, LogLevel][] = [
+  [/^\s*\[?ERROR\]?[\s:\-]/i, "error"],
+  [/^\s*\[?ERR\]?[\s:\-]/i, "error"],
+  [/^\s*\[?FAIL(?:ED|URE)?\]?[\s:\-]/i, "error"],
+  [/^\s*\[?FATAL\]?[\s:\-]/i, "error"],
+  [/^\s*\[?ASSERT\]?[\s:\-]/i, "error"],
+  [/^\s*\[?WARN(?:ING)?\]?[\s:\-]/i, "warn"],
+  [/^\s*\[?DEBUG\]?[\s:\-]/i, "debug"],
+  [/^\s*\[?TRACE\]?[\s:\-]/i, "trace"],
+  [/^\s*\[?INFO\]?[\s:\-]/i, "info"],
+];
+
+/** The level carried by an unstructured line, or null. */
+export function logLevelOf(line: string): LogLevel | null {
+  for (const [pattern, level] of TEXT_LEVELS) {
+    if (pattern.test(line)) return level;
+  }
+  return null;
+}
+
+/**
  * Parse one line. Formats are tried in order of specificity; a line that
  * matches nothing is returned as plain text, which is the common case for
  * `printf` debugging.
@@ -272,6 +303,9 @@ export function parseLine(raw: string): LogLine {
     const severity = Number(syslog[1]);
     return { level: SYSLOG_LEVELS[severity] ?? "info", text: syslog[2], raw: line };
   }
+
+  const level = logLevelOf(line);
+  if (level) return { level, text: line, raw: line };
 
   return { text: line, raw: line };
 }
@@ -558,6 +592,17 @@ export function rememberLine(path: string, line: string): void {
 /** The last `limit` lines seen on a port this process has open. */
 export function recentPortLines(path: string, limit = 200): string[] {
   return (recentLines.get(portKey(path)) ?? []).slice(-Math.max(1, Math.min(RECENT_CAP, limit)));
+}
+
+/**
+ * Forget what was seen on a port.
+ *
+ * The pane's Clear button emptied its own display; `embed_serial` still read
+ * the process-wide ring, so the agent kept quoting lines the user had just
+ * cleared. Both buffers have to go for the button to mean what it says.
+ */
+export function clearRecentLines(path: string): void {
+  recentLines.delete(portKey(path));
 }
 
 /** True when this process currently holds the port open. */

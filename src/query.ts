@@ -27,6 +27,7 @@ import type { Config, Usage } from "./types.ts";
 import { BUDGET_RATIO, compactWithModel, estimateTokens, type CompactionLevel } from "./context.ts";
 import { classifyError, type ClassifiedError } from "./errors.ts";
 import type { ToolPipeline } from "./tools/pipeline.ts";
+import { imagePartsOf } from "./tools/imageResults.ts";
 
 export type QueryEvent =
   | { type: "assistant_start" }
@@ -322,6 +323,27 @@ export async function* query(options: QueryOptions): AsyncGenerator<QueryEvent, 
 }
 
 /**
+ * Deliver a tool's images to the model.
+ *
+ * The chat protocol has no image slot on a `tool` message, so a compatible
+ * endpoint accepts images only on a user turn. They follow the tool result as
+ * one user message naming the call, which is also how a person reading the
+ * transcript sees it: "screenshot from browser_screenshot", then the picture.
+ */
+function pushToolImages(
+  messages: ChatMessage[],
+  toolName: string,
+  outcome: unknown,
+): void {
+  const parts = imagePartsOf(outcome);
+  if (parts.length === 0) return;
+  messages.push({
+    role: "user",
+    content: [{ type: "text", text: `Image returned by ${toolName}.` }, ...parts],
+  });
+}
+
+/**
  * Run every call in one assistant turn, returning the index the batch was
  * cancelled at (or null when all of them ran).
  *
@@ -357,6 +379,7 @@ async function* runToolBatch(
     if (!batchable) {
       const outcome = await pipeline.run(call.function.name, call.function.arguments, signal);
       messages.push({ role: "tool", tool_call_id: call.id, content: outcome.content });
+      pushToolImages(messages, call.function.name, outcome);
       index++;
       continue;
     }
@@ -383,6 +406,7 @@ async function* runToolBatch(
     // next request both depend on the assistant/tool pairing being stable.
     for (let offset = 0; offset < batch.length; offset++) {
       messages.push({ role: "tool", tool_call_id: batch[offset].id, content: results[offset].content });
+      pushToolImages(messages, batch[offset].function.name, results[offset]);
     }
     if (signal.aborted) {
       for (let skipped = end; skipped < calls.length; skipped++) {

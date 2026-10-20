@@ -113,7 +113,20 @@ export async function gitCommit(cwd, message, paths = []) {
 
 /* ---------- GitHub: PR and CI status via the gh CLI ---------- */
 
+let ghRunner = null;
+
+/**
+ * Replace the `gh` invoker. The host passes nothing; tests use it to answer
+ * without a network and to see the arguments a call actually builds — the two
+ * broken commands here were wrong in their arguments, which no assertion on
+ * the returned object would have caught.
+ */
+export function setGhRunner(next) {
+  ghRunner = next;
+}
+
 function gh(cwd, args, timeout = 25_000) {
+  if (ghRunner) return ghRunner(cwd, args, timeout);
   return new Promise((resolve) => {
     execFile(
       "gh",
@@ -195,42 +208,72 @@ export async function createPullRequest(cwd, { title, body, base, draft }) {
 }
 
 /**
+ * The Actions run id in a check's link.
+ *
+ * `gh pr checks` reports each check's own URL; an Actions job lives at
+ * `.../actions/runs/<run-id>/job/<job-id>`. `gh run rerun` and `gh run view`
+ * both take the run id — the bare `gh run rerun --failed` that was here
+ * failed with exit 1 because it has no run to act on.
+ *
+ * A third-party check links to its own dashboard and has no run id; returning
+ * "" there is the honest answer, and the caller reports it instead of guessing.
+ */
+export function runIdFromCheckUrl(url) {
+  const match = /\/actions\/runs\/(\d+)/.exec(String(url ?? ""));
+  return match ? match[1] : "";
+}
+
+async function failingChecks(cwd, number) {
+  const result = await gh(cwd, ["pr", "checks", String(number), "--json", "name,state,link"], 30_000);
+  if (!result.ok) return { ok: false, error: result.stderr || "could not read checks" };
+  try {
+    const checks = JSON.parse(result.stdout);
+    return { ok: true, checks: Array.isArray(checks) ? checks : [] };
+  } catch {
+    return { ok: false, error: "could not parse gh output" };
+  }
+}
+
+/**
  * Re-run the failed checks on a pull request.
  *
  * `gh pr checks --watch` is the human loop; a script wants the rerun itself.
  * Only failed runs are re-triggered: re-running passing work spends minutes of
- * CI for nothing.
+ * CI for nothing. A run holds several jobs, so the same run is rerun once even
+ * when two of its jobs failed.
  */
 export async function rerunFailedChecks(cwd, number) {
   if (!Number.isFinite(Number(number))) return { ok: false, error: "no pull request number" };
-  const result = await gh(cwd, ["pr", "checks", String(number), "--json", "name,state,link"], 30_000);
-  if (!result.ok) return { ok: false, error: result.stderr || "could not read checks" };
-  let checks;
-  try {
-    checks = JSON.parse(result.stdout);
-  } catch {
-    return { ok: false, error: "could not parse gh output" };
-  }
-  const failed = checks.filter((check) => /FAILURE|ERROR|CANCELLED|TIMED_OUT/i.test(String(check.state ?? "")));
+  const listed = await failingChecks(cwd, number);
+  if (!listed.ok) return { ok: false, error: listed.error };
+  const failed = listed.checks.filter((check) => /FAILURE|ERROR|CANCELLED|TIMED_OUT/i.test(String(check.state ?? "")));
   if (failed.length === 0) return { ok: true, rerun: 0 };
-  const rerun = await gh(cwd, ["run", "rerun", "--failed"], 30_000);
-  if (!rerun.ok) return { ok: false, error: rerun.stderr || "gh run rerun failed", rerun: 0 };
-  return { ok: true, rerun: failed.length, failed: failed.map((check) => check.name) };
+  const runs = [...new Set(failed.map((check) => runIdFromCheckUrl(check.link)).filter(Boolean))];
+  if (runs.length === 0) {
+    return {
+      ok: false,
+      rerun: 0,
+      error: "the failing checks are not GitHub Actions runs, so there is no run id to rerun",
+      failed: failed.map((check) => check.name),
+    };
+  }
+  for (const id of runs) {
+    const rerun = await gh(cwd, ["run", "rerun", id, "--failed"], 30_000);
+    if (!rerun.ok) return { ok: false, error: rerun.stderr || `gh run rerun ${id} failed`, rerun: 0 };
+  }
+  return { ok: true, rerun: failed.length, runs: runs.length, failed: failed.map((check) => check.name) };
 }
 
 /** The failure log of the first failing check, for handing to the agent. */
 export async function failedCheckLog(cwd, number, limit = 12_000) {
-  const list = await gh(cwd, ["pr", "checks", String(number), "--json", "name,state,link"], 30_000);
-  if (!list.ok) return { ok: false, error: list.stderr || "could not read checks" };
-  let checks;
-  try {
-    checks = JSON.parse(list.stdout);
-  } catch {
-    return { ok: false, error: "could not parse gh output" };
-  }
-  const failed = checks.find((check) => /FAILURE|ERROR|TIMED_OUT/i.test(String(check.state ?? "")));
+  const listed = await failingChecks(cwd, number);
+  if (!listed.ok) return { ok: false, error: listed.error };
+  const failed = listed.checks.find((check) => /FAILURE|ERROR|TIMED_OUT/i.test(String(check.state ?? "")));
   if (!failed) return { ok: false, error: "no failing check to read" };
-  const log = await gh(cwd, ["run", "view", "--log-failed", "--limit", "500"], 60_000);
+  const runId = runIdFromCheckUrl(failed.link);
+  if (!runId) return { ok: false, error: "the failing check is not a GitHub Actions run, so its log is elsewhere", name: failed.name };
+  // `gh run view` has no --limit; the body is cut here instead.
+  const log = await gh(cwd, ["run", "view", runId, "--log-failed"], 60_000);
   if (!log.ok) return { ok: false, error: log.stderr || "could not read the failed log", name: failed.name };
   const text = String(log.stdout ?? "");
   return { ok: true, name: failed.name, log: text.length > limit ? `${text.slice(0, limit)}

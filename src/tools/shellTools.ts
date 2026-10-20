@@ -232,7 +232,7 @@ export const bashTool: Tool = {
           return path ? `${content}\n\n[full output: ${path}]` : content;
         };
         if (snapshotBefore && ctx.sessionId) {
-          void captureBashChanges(ctx.sessionId, cwd, snapshotBefore).catch(() => {});
+          void captureBashChanges(ctx.sessionId, cwd, snapshotBefore, ctx.messageIndex).catch(() => {});
         }
         void started;
         if (result.timedOut) {
@@ -326,7 +326,7 @@ export const bashTool: Tool = {
         if (snapshotBefore && ctx.sessionId) {
           // Fire-and-forget: the command's result is what the model needs;
           // the snapshot is for a later undo and must not slow it down.
-          void captureBashChanges(ctx.sessionId, cwd, snapshotBefore).catch(() => {});
+          void captureBashChanges(ctx.sessionId, cwd, snapshotBefore, ctx.messageIndex).catch(() => {});
         }
         clearTimeout(timer);
         ctx.signal.removeEventListener("abort", onAbort);

@@ -93,9 +93,28 @@ function flasherHint(paths: Partial<Record<FlasherKind, string>>): string {
     : "None installed. pyOCD (pip install pyocd) or probe-rs (cargo install probe-rs-tools) are the easiest starting points.";
 }
 
-/** The board the user selected in the Board pane, or an empty object. */
+/**
+ * The board a tool should act on.
+ *
+ * `effectiveBoard` wins over the saved selection: it carries a target derived
+ * from the part that answered the probe, while `config.board` is a memory of
+ * the last board someone picked. A tool that used the saved value would flash
+ * the wrong chip on a desk where the board was swapped and the pane reopened —
+ * which is exactly the case the pane was rebuilt to prevent.
+ *
+ * The CLI never sets `effectiveBoard`, so it keeps using the selection there.
+ */
 function selectedBoard(ctx: ToolContext): BoardSelection {
-  return ctx.config.board ?? {};
+  const live = ctx.config.effectiveBoard;
+  if (!live) return ctx.config.board ?? {};
+  const saved = ctx.config.board ?? {};
+  return {
+    ...saved,
+    ...(live.target ? { target: live.target } : {}),
+    ...(live.port ? { port: live.port } : {}),
+    ...(live.baud ? { baud: live.baud } : {}),
+    ...(live.flasher ? { flasher: live.flasher as BoardSelection["flasher"] } : {}),
+  };
 }
 
 /**

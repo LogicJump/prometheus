@@ -1,10 +1,11 @@
 /** Electron main process: one window, one agent host child process per window. */
 
-import { app, BrowserWindow, dialog, globalShortcut, ipcMain, Notification, shell } from "electron";
+import { app, BrowserWindow, dialog, globalShortcut, ipcMain, Notification, screen as screenApi, shell } from "electron";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { splitClamp } from "./windowBounds.js";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import { browserNavigate, browserSnapshot, browserScreenshot, closeBrowser, openBrowser, setBrowserBounds } from "./browser.js";
@@ -377,19 +378,24 @@ app.whenReady().then(() => {
     const parent = BrowserWindow.fromWebContents(event.sender);
     const bounds = parent && !parent.isDestroyed() ? parent.getBounds() : null;
     const screen = parent && !parent.isDestroyed() ? parent.getContentBounds() : null;
+    // Place the child beside the parent, then clamp it into the work area of
+    // the display it lands on. A fixed half-width overran the screen on a
+    // second, smaller display and sat under the taskbar.
+    let placement = null;
+    if (screen) {
+      const wanted = {
+        x: screen.x + Math.floor(screen.width / 2),
+        y: screen.y,
+        width: Math.max(640, Math.floor(screen.width / 2)),
+        height: Math.max(600, screen.height),
+      };
+      const display = screenApi.getDisplayMatching(wanted);
+      placement = splitClamp(wanted, display.workArea);
+    }
     const child = startWindow({
       ...(request.cwd ? { cwd: String(request.cwd) } : {}),
       ...(request.sessionId ? { loadSession: String(request.sessionId) } : {}),
-      ...(screen
-        ? {
-            bounds: {
-              x: screen.x + Math.floor(screen.width / 2),
-              y: screen.y,
-              width: Math.max(640, Math.floor(screen.width / 2)),
-              height: Math.max(600, screen.height),
-            },
-          }
-        : {}),
+      ...(placement ? { bounds: placement } : {}),
     });
     void bounds;
     void child;
@@ -514,7 +520,9 @@ app.whenReady().then(() => {
     const file = join(dir, `shot-${Date.now()}.png`);
     const base64 = String(result.dataUrl).replace(/^data:image\/png;base64,/, "");
     await wf(file, Buffer.from(base64, "base64"));
-    return { ok: true, url: result.url, path: file };
+    // Both: the path is what the user can open, the data URL is what the model
+    // can actually look at.
+    return { ok: true, url: result.url, path: file, dataUrl: String(result.dataUrl) };
   });
 
   ipcMain.handle("browser-close", async (event) => {

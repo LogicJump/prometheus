@@ -9,9 +9,14 @@
 
 import { settingsStrings } from "./settings-i18n.js";
 import { iconEl } from "./icons.js";
+import { filledPreferences } from "./settingsState.js";
 
 export function createSettings(deps) {
   const { state, $, api, formatTokens, setTheme, setDensity, setMode, applyLocale, openModal, closeModal, getT, applyCodeFont } = deps;
+  // Removing a server, a skill, a memory entry or a rule is not undoable from
+  // this page, so each asks first. The fallback keeps the page usable when it
+  // is constructed without one (tests, or a future embedder).
+  const confirm = deps.confirm ?? (async () => true);
   // `t` is rebound on every locale change, so every read goes through getT().
   const t = new Proxy({}, { get: (_, key) => getT()[key] });
   const settingsDialog = $("settings-dialog");
@@ -422,6 +427,7 @@ function buildAppearancePage() {
             { value: "light", label: s.themeLight, preview: "light" },
             { value: "dark", label: s.themeDark, preview: "dark" },
             { value: "high-contrast", label: s.themeHighContrast, preview: "dark" },
+            { value: "daltonized", label: s.themeDaltonized, preview: "dark" },
           ],
           onChange: (value) => applyPref("theme", value),
         }),
@@ -842,7 +848,11 @@ function buildBehaviorPage() {
           min: 8000,
           max: 4000000,
           step: 1000,
-          value: settings.contextWindow ?? 1000000,
+          // The configured value, and nothing pre-filled into it. A number sat
+          // in this field before anyone chose one, and the usage meter then
+          // reported progress against it as though the endpoint had said so.
+          value: settings.contextWindow ?? "",
+          placeholder: "128000",
           onChange: (value) => applyConfig({ contextWindow: Number(value) }),
         }),
       }),
@@ -911,21 +921,6 @@ function buildBehaviorPage() {
             { value: "open", label: s.networkOpen },
           ],
           onChange: (value) => applyConfig({ networkPolicy: value }),
-        }),
-      }),
-      sRow({
-        id: "setting-auto-approve",
-        label: s.autoApprove,
-        desc: s.autoApproveRulesHint,
-        control: sText({
-          id: "setting-auto-approve",
-          value: (settings.autoApprove ?? []).join(", "),
-          mono: true,
-          // The same `Tool(specifier)` grammar saved rules use, so a CI grant
-          // and a standing approval are one language rather than two lists
-          // that disagree about what "bash" means.
-          placeholder: "read_file, Bash(git status), mcp__github__*",
-          onChange: (value) => applyConfig({ autoApprove: value }),
         }),
       }),
       sRow({
@@ -1042,7 +1037,9 @@ function buildMcpPage() {
       );
       actions.appendChild(sButton(s.edit, () => openMcpForm(server), { quiet: true }));
       actions.appendChild(
-        sButton(s.remove, () => api.send({ cmd: "removeMcpServer", scope: server.scope, name: server.name }), {
+        sButton(s.remove, () => void confirm(s.removeServerConfirm(server.name), { danger: true }).then((yes) => {
+          if (yes) api.send({ cmd: "removeMcpServer", scope: server.scope, name: server.name });
+        }), {
           quiet: true,
           danger: true,
         }),
@@ -1198,7 +1195,9 @@ function buildSkillsPage() {
         const actions = el("div", "mcp-actions");
         actions.appendChild(sButton(s.edit, () => openForm(skill), { quiet: true }));
         actions.appendChild(
-          sButton(s.remove, () => api.send({ cmd: "removeSkill", scope: skill.scope, name: skill.name }), {
+          sButton(s.remove, () => void confirm(s.removeSkillConfirm(skill.name), { danger: true }).then((yes) => {
+            if (yes) api.send({ cmd: "removeSkill", scope: skill.scope, name: skill.name });
+          }), {
             quiet: true,
             danger: true,
           }),
@@ -1296,7 +1295,9 @@ function buildMemoryPage() {
         card.appendChild(el("p", "memory-body-text", entry.body));
         const actions = el("div", "memory-actions");
         actions.appendChild(
-          sButton(s.remove, () => api.send({ cmd: "deleteMemory", scope: section.key, name: entry.name }), {
+          sButton(s.remove, () => void confirm(s.removeMemoryConfirm(entry.name), { danger: true }).then((yes) => {
+            if (yes) api.send({ cmd: "deleteMemory", scope: section.key, name: entry.name });
+          }), {
             quiet: true,
             danger: true,
           }),
@@ -1928,6 +1929,16 @@ $("settings-nav").addEventListener("click", (event) => {
 
 $("settings-back").addEventListener("click", () => closeModal(settingsDialog));
 
+/**
+ * The rail foot names the open folder and opens the General page.
+ *
+ * It used to be a button that said "Not signed in" and did nothing at all —
+ * there is no account in this product, so the label described a state that
+ * cannot exist and the click was never wired. It is now what its position
+ * implies: the workspace, and a way to get to the control that changes it.
+ */
+$("settings-profile").addEventListener("click", () => selectSettingsTab("general"));
+
 $("settings-search").addEventListener("input", (event) => {
   state.settingsQuery = event.target.value.trim().toLowerCase();
   applySettingsSearch();
@@ -2017,7 +2028,11 @@ function renderRules(rules) {
     label.title = `${rule.scope}${rule.cwd ? ` · ${rule.cwd}` : ""}`;
     const remove = el("button", "link-button", t.rulesRemove);
     remove.type = "button";
-    remove.addEventListener("click", () => api.send({ cmd: "removeRule", id: rule.id }));
+    remove.addEventListener("click", () => {
+      void confirm(s.removeRuleConfirm(rule.tool), { danger: true }).then((yes) => {
+        if (yes) api.send({ cmd: "removeRule", id: rule.id });
+      });
+    });
     row.append(label, remove);
     list.appendChild(row);
   }
@@ -2044,6 +2059,10 @@ function fillSettings(settings) {
   state.outputStyle = settings.outputStyle ?? "default";
   state.archiveAfterDays = settings.archiveAfterDays ?? 0;
   state.sandbox = settings.sandbox === "off" ? "off" : "enforce";
+  // The five switches below were read from `state` but never assigned from the
+  // host's answer, so every one of them rendered as its default on every open.
+  Object.assign(state, filledPreferences(settings));
+  applyUiPreference("uiScale", state.uiScale);
   // The WSL answer arrives with the settings payload so the row can state the
   // truth ("Ubuntu is available") instead of offering a switch with no visible
   // effect.

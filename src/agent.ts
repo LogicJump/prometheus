@@ -74,6 +74,13 @@ export interface ContextBreakdown {
   compactAt: number;
   /** Unsorted except that the caller may rely on the order being stable. */
   parts: Array<{ key: string; label: string; tokens: number }>;
+  /**
+   * True when `window` is this build's default rather than something the
+   * endpoint or the user stated. The meter still has to draw against some
+   * number, but a percentage of a guess is a guess: the UI says so instead of
+   * presenting 175k/1M as a fact about the model.
+   */
+  windowAssumed?: boolean;
 }
 
 export class Agent {
@@ -134,6 +141,15 @@ export class Agent {
   private reportedUsage: Usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
   /** Called before a mutating tool runs; used to snapshot file state for diffs. */
   onBeforeMutate: ((toolName: string, input: Record<string, unknown>) => void) | null = null;
+  /**
+   * Called before every tool, and awaited.
+   *
+   * The board tools take their target from a saved preference when nothing has
+   * identified the attached part, so a flash can name a chip that is not on
+   * the desk. The host uses this to identify first; a failure here must not
+   * block the tool, which is why it returns nothing.
+   */
+  onBeforeTool: ((toolName: string, input: Record<string, unknown>) => Promise<void> | void) | null = null;
   /** Set by the host so a turn can stream to the renderer instead of a terminal. */
   onQueryEvent: ((event: QueryEvent) => void) | null = null;
   /** Called when a background sub-task finishes, with its report. */
@@ -323,17 +339,30 @@ export class Agent {
           ? "- Explain the reasoning behind non-obvious changes in a short paragraph, naming the tradeoff you chose."
           : "";
 
-    // The board the user picked, described in whatever terms they set. Nothing
-    // here assumes a vendor or a part: a selection may name only a port, only a
-    // target, or both, and the sentence is built from whatever is present.
-    const board = this.config.board ?? {};
+    // The board the tools will act on, described in whatever terms are known.
+    // `effectiveBoard` is preferred because it carries a target derived from
+    // the attached chip; `board` is the saved preference and may name a part
+    // that is no longer on the desk.
+    const live = this.config.effectiveBoard;
+    const board = live ?? this.config.board ?? {};
     const boardParts = [
       board.target ? `target ${board.target}` : "",
       board.port ? `port ${board.port}${board.baud ? ` at ${board.baud} baud` : ""}` : "",
       board.flasher ? `flasher ${board.flasher}` : "",
     ].filter(Boolean);
+    // Where the target came from changes how much the model should trust it,
+    // and whether it should re-read before acting. `chip` means the part
+    // answered the probe; `manual` means nobody checked.
+    const provenance =
+      live?.source === "chip"
+        ? " The target was derived from the attached chip, which answered a probe."
+        : live?.source === "manual"
+          ? " The target was entered by hand; no chip reading confirms it — read the chip before flashing if that matters."
+          : live?.source === "unlisted"
+            ? " The attached chip was read, but no installed tool has a target name for it."
+            : "";
     const boardNote = boardParts.length
-      ? `\n- Board selected in the Board pane: ${boardParts.join(", ")}. embed_flash, embed_serial and embed_debug use it when you omit the matching argument; an explicit argument still wins.`
+      ? `\n- Board selected in the Board pane: ${boardParts.join(", ")}.${provenance} embed_flash, embed_serial and embed_debug use it when you omit the matching argument; an explicit argument still wins.`
       : "";
 
     return `You are Prometheus, a general-purpose software engineering agent running in a terminal.
@@ -594,6 +623,7 @@ ${instructions ? `\n# Project instructions (follow these)\n${instructions}` : ""
         onContext: (text) => this.injectContext(text),
         sessionId: this.sessionId,
         onBeforeMutate: this.onBeforeMutate,
+        onBeforeTool: this.onBeforeTool,
         runSubagent: (prompt, options) =>
           this.runSubagent(prompt, this.abortController?.signal ?? new AbortController().signal, options ?? {}),
         runSubagents: (prompts, options) =>
@@ -1202,6 +1232,7 @@ ${digest}` }];
     label: string,
     context: "none" | "summary" | "full" = "none",
     prompt = "",
+    subagentId = "",
   ): Agent {
     const seedMessages = this.seedForSubagent(context, prompt);
     const child = new Agent(
@@ -1229,7 +1260,12 @@ ${digest}` }];
     child.ui = new Proxy(parentUi, {
       get(target, property, receiver) {
         if (property === "toolStart") {
-          return (name: string, summary: string) => parentUi.subagentActivity?.("tool", `${label}: ${name} ${summary}`);
+          return (name: string, summary: string) =>
+            (parentUi.subagentActivity as ((kind: "tool" | "text", text: string, meta?: { id: string }) => void) | undefined)?.(
+              "tool",
+              `${label}: ${name} ${summary}`,
+              subagentId ? { id: subagentId } : undefined,
+            );
         }
         return Reflect.get(target, property, receiver);
       },
@@ -1251,13 +1287,16 @@ ${digest}` }];
     options: { context: "none" | "summary" | "full"; label: string; background?: boolean },
   ): { id: string; child: Agent } {
     const label = options.label;
-    const child = this.spawnSubagent(label, options.context, prompt);
     const record = this.subagents.create({
       label,
       prompt,
       context: options.context,
       background: options.background ?? false,
     });
+    // The id is created first and handed to the child, so its tool activity
+    // can be routed to this card rather than to whichever one the renderer saw
+    // last.
+    const child = this.spawnSubagent(label, options.context, prompt, record.id);
     // The id travels with the start event so the card can be stopped, expanded,
     // or paired with the report it eventually produces.
     this.ui.subagentStart?.(prompt, { id: record.id });
@@ -1296,7 +1335,7 @@ ${digest}` }];
     if (record.status === "running") throw new Error(`sub-agent ${id} is still running; wait for its report first`);
     if (child.busy) throw new Error(`sub-agent ${id} is busy`);
     record.status = "running";
-    this.ui.subagentStart?.(`${record.label}: ${text.slice(0, 120)}`);
+    this.ui.subagentStart?.(`${record.label}: ${text.slice(0, 120)}`, { id });
     try {
       await child.run(text);
       record.turns = child.turnCount;
@@ -1304,11 +1343,11 @@ ${digest}` }];
       this.subagents.settle(id, "idle", report);
       const final = child.lastRunPartial ? `[partial: hit the turn limit]
 ${report}` : report;
-      this.ui.subagentEnd?.(true, report.slice(0, 160));
+      this.ui.subagentEnd?.(true, report.slice(0, 160), { id });
       return wrapReport(id, record.label, final);
     } catch (err) {
       this.subagents.settle(id, "failed", (err as Error).message);
-      this.ui.subagentEnd?.(false, (err as Error).message);
+      this.ui.subagentEnd?.(false, (err as Error).message, { id });
       throw err;
     }
   }
@@ -1344,14 +1383,14 @@ ${report}` : report;
       this.ui.info("  ↳ sub-agent finished");
       const status = child.lastRunPartial ? "idle" : "done";
       this.subagents.settle(id, status, report);
-      this.ui.subagentEnd?.(true, report.slice(0, 160));
+      this.ui.subagentEnd?.(true, report.slice(0, 160), { id });
       await this.fireSubagentHooks("SubagentStop", prompt, report);
       const text = child.lastRunPartial ? `[partial: hit the turn limit]
 ${report}` : report;
       return wrapReport(id, "sub-agent", text);
     } catch (err) {
       this.subagents.settle(id, "failed", (err as Error).message);
-      this.ui.subagentEnd?.(false, (err as Error).message);
+      this.ui.subagentEnd?.(false, (err as Error).message, { id });
       await this.fireSubagentHooks("SubagentStop", prompt, (err as Error).message);
       throw err;
     } finally {
@@ -1373,14 +1412,14 @@ ${report}` : report;
     if (this.isSubagent) throw new Error("sub-agents cannot spawn sub-agents");
     this.ui.info(`  ↳ ${prompts.length} sub-agents started in parallel`);
     const children = prompts.map((prompt, index) => {
-      this.ui.subagentStart?.(`[${index + 1}] ${prompt}`);
       const record = this.subagents.create({
         label: `#${index + 1}`,
         prompt,
         context: options.context ?? "none",
         background: false,
       });
-      const child = this.spawnSubagent(`#${index + 1}`, options.context ?? "none", prompt);
+      this.ui.subagentStart?.(`[${index + 1}] ${prompt}`, { id: record.id });
+      const child = this.spawnSubagent(`#${index + 1}`, options.context ?? "none", prompt, record.id);
       this.subagentAgents.set(record.id, child);
       return { prompt, index, child, id: record.id };
     });
@@ -1394,13 +1433,13 @@ ${report}` : report;
           const report = latestReport(child);
           this.addSubagentUsage(child.usage);
           this.subagents.settle(id, child.lastRunPartial ? "idle" : "done", report);
-          this.ui.subagentEnd?.(true, `#${index + 1} ${report.slice(0, 120)}`);
+          this.ui.subagentEnd?.(true, `#${index + 1} ${report.slice(0, 120)}`, { id });
           const text = child.lastRunPartial ? `[partial: hit the turn limit]
 ${report}` : report;
           return { ok: true, report: wrapReport(id, `#${index + 1}`, text) };
         } catch (err) {
           this.subagents.settle(id, "failed", (err as Error).message);
-          this.ui.subagentEnd?.(false, `#${index + 1} ${(err as Error).message}`);
+          this.ui.subagentEnd?.(false, `#${index + 1} ${(err as Error).message}`, { id });
           return { ok: false, report: `sub-agent failed: ${(err as Error).message}` };
         } finally {
           child.abortController = null;
@@ -1421,8 +1460,12 @@ ${report}` : report;
   private startBackgroundSubagent(prompt: string): boolean {
     if (this.isSubagent) return false;
     if (this.background.size >= 4) return false;
-    this.ui.subagentStart?.(`(background) ${prompt}`);
-    const child = this.spawnSubagent("background");
+    // A background task is a sub-agent like any other: it gets a record so the
+    // Tasks pane can list it and its card can be stopped, and the id travels
+    // with its events so its activity lands on its own card.
+    const record = this.subagents.create({ label: "background", prompt, context: "none", background: true });
+    this.ui.subagentStart?.(`(background) ${prompt}`, { id: record.id });
+    const child = this.spawnSubagent("background", "none", "", record.id);
     // `tracked` is assigned after the promise is created, so the finally block
     // can remove exactly this task without capturing a stale binding.
     const tracked = new Set<Promise<void>>();
@@ -1432,13 +1475,15 @@ ${report}` : report;
         const text = [...child.messages].reverse().find((m) => m.role === "assistant" && m.content);
         const report = typeof text?.content === "string" ? text.content : "(background sub-agent produced no text report)";
         this.addSubagentUsage(child.usage, "background");
-        this.ui.subagentEnd?.(true, `background: ${report.slice(0, 120)}`);
+        this.ui.subagentEnd?.(true, `background: ${report.slice(0, 120)}`, { id: record.id });
         this.onBackgroundReport?.(prompt, report, true);
       } catch (err) {
-        this.ui.subagentEnd?.(false, `background: ${(err as Error).message}`);
+        this.ui.subagentEnd?.(false, `background: ${(err as Error).message}`, { id: record.id });
         this.onBackgroundReport?.(prompt, (err as Error).message, false);
       } finally {
         child.abortController = null;
+        // A background task has no id left to stop once it has finished.
+        if (record.status === "running") this.subagents.settle(record.id, "done", record.report);
         for (const entry of tracked) this.background.delete(entry);
         tracked.clear();
       }
@@ -1529,6 +1574,7 @@ ${report}` : report;
       // how much of it is actually usable.
       compactAt: Math.floor(window * BUDGET_RATIO),
       parts: breakdown,
+      ...(this.config.contextWindowAssumed ? { windowAssumed: true } : {}),
     };
   }
 }
