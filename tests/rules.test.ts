@@ -2,7 +2,22 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { addRule, loadRules, matchRule, removeRule, rulesFor } from "../src/rules.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Rules live in the user's config directory. Point it at a fresh temp folder
+// before importing the module, so a rule the user saved while using the app
+// (an "always allow bash" sits above everything and wins the first match) does
+// not change what this suite measures. `PROMETHEUS_HOME` is read at import
+// time, which is why the assignment comes first.
+const home = mkdtempSync(join(tmpdir(), "prometheus-rules-"));
+process.env.PROMETHEUS_HOME = home;
+const { addRule, loadRules, matchRule, removeRule, rulesFor } = await import("../src/rules.ts");
+
+test.after(() => {
+  rmSync(home, { recursive: true, force: true });
+});
 
 const created: string[] = [];
 

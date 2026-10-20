@@ -14,7 +14,7 @@ import type { FallbackChatClient } from "./fallback.ts";
 import type { Config, TodoList, Tool, Usage, UsageBreakdown, UserContentPart } from "./types.ts";
 import type { TerminalUi } from "./ui.ts";
 import { Permissions } from "./permissions.ts";
-import { compactWithModel, estimateTextTokens, estimateTokens, summarizerInput, SUMMARIZE_PROMPT, type CompactionLevel } from "./context.ts";
+import { BUDGET_RATIO, compactWithModel, estimateTextTokens, estimateTokens, summarizerInput, SUMMARIZE_PROMPT, type CompactionLevel } from "./context.ts";
 import { loadMemory } from "./memory.ts";
 import { SUBAGENT_TOOLS, ALL_TOOLS } from "./tools/index.ts";
 import { loadProjectInstructions, loadRules, renderRules } from "./instructions.ts";
@@ -59,6 +59,21 @@ function toolSchemaTokens(tools: Tool[]): number {
     }
   }
   return total;
+}
+
+/**
+ * What is filling a context window, by kind.
+ *
+ * `compactAt` is the token count at which compaction starts; `window` minus it
+ * is the space that is only usable in an emergency.
+ */
+export interface ContextBreakdown {
+  window: number;
+  used: number;
+  percent: number;
+  compactAt: number;
+  /** Unsorted except that the caller may rely on the order being stable. */
+  parts: Array<{ key: string; label: string; tokens: number }>;
 }
 
 export class Agent {
@@ -1452,5 +1467,68 @@ ${report}` : report;
       estimateTextTokens(this.requestSystemPrompt()) +
       toolSchemaTokens(this.tools);
     return { tokens, percent: Math.min(100, Math.round((tokens / this.config.contextWindow) * 100)) };
+  }
+
+  /**
+   * What is filling the context window, by kind.
+   *
+   * A single percentage said "17% used" and left the user with no way to act:
+   * the fix for a full window is either "compact the conversation", "drop an
+   * MCP server" or "the project instructions are enormous", and those are
+   * three different numbers. Every figure here is an estimate from the same
+   * character-counting model `contextUsage` uses, so the parts add up to the
+   * total it reports.
+   */
+  contextBreakdown(): ContextBreakdown {
+    const window = this.config.contextWindow;
+    const count = (text: string) => estimateTextTokens(text);
+
+    // The conversation, split by role: tool results are the part a user can
+    // reclaim by compacting, and they are usually the largest.
+    let messages = 0;
+    let toolResults = 0;
+    for (const message of this.messages) {
+      const cost = estimateTokens([message]);
+      messages += cost;
+      if (message.role === "tool") toolResults += cost;
+    }
+
+    const system = this.requestSystemPrompt();
+    // The prompt is one string; the three categories the user cares about are
+    // separable because each block is rendered from a known source.
+    const memory = loadMemory();
+    const instructions = loadProjectInstructions();
+    const rules = renderRules(loadRules(), [...this.touched]);
+    const breakdown: Array<{ key: string; label: string; tokens: number }> = [
+      { key: "messages", label: "", tokens: Math.max(0, messages - toolResults) },
+      { key: "toolResults", label: "", tokens: toolResults },
+    ];
+
+    // MCP tools are separate from the built-in ones because dropping a server
+    // is the one thing the user can disconnect on the spot.
+    const visible = this.visibleTools();
+    const mcpTools = visible.filter((tool) => tool.name.startsWith("mcp__"));
+    const builtinTools = visible.filter((tool) => !tool.name.startsWith("mcp__"));
+    breakdown.push({ key: "systemTools", label: "", tokens: toolSchemaTokens(builtinTools) });
+    if (mcpTools.length > 0) breakdown.push({ key: "mcpTools", label: "", tokens: toolSchemaTokens(mcpTools) });
+
+    // The system prompt minus the parts counted on their own. Counting the
+    // whole string and then adding memory and instructions would double-count.
+    const dedicated = count(memory) + count(instructions) + count(rules);
+    breakdown.push({ key: "systemPrompt", label: "", tokens: Math.max(0, count(system) - dedicated) });
+    if (memory) breakdown.push({ key: "memory", label: "", tokens: count(memory) });
+    if (instructions) breakdown.push({ key: "instructions", label: "", tokens: count(instructions) });
+    if (rules) breakdown.push({ key: "rules", label: "", tokens: count(rules) });
+
+    const used = breakdown.reduce((sum, part) => sum + part.tokens, 0);
+    return {
+      window,
+      used,
+      percent: window > 0 ? Math.min(100, Math.round((used / window) * 100)) : 0,
+      // The point at which compaction starts, so "free space" is honest about
+      // how much of it is actually usable.
+      compactAt: Math.floor(window * BUDGET_RATIO),
+      parts: breakdown,
+    };
   }
 }

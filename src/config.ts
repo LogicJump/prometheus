@@ -5,7 +5,17 @@ import type { BoardProfile, BoardSelection, Config, PermissionMode, ThinkingEffo
 import { resolveProvider } from "./providers.ts";
 import { applyManaged, loadManagedSettings } from "./managed.ts";
 
-const HOME_DIR = join(homedir(), ".prometheus");
+/**
+ * Where config, sessions, rules and caches live.
+ *
+ * `PROMETHEUS_HOME` overrides it. That exists for tests — a suite that writes
+ * into the real `~/.prometheus` leaves rules behind that change the next run's
+ * results (a "always allow bash" clicked in the app once made an unrelated
+ * rule-ordering assertion fail forever), and a config directory a test can
+ * point at a temp folder makes the suite independent of the developer's own
+ * settings.
+ */
+const HOME_DIR = process.env.PROMETHEUS_HOME?.trim() || join(homedir(), ".prometheus");
 export const CONFIG_HOME = HOME_DIR;
 export const SESSIONS_DIR = join(HOME_DIR, "sessions");
 
@@ -45,7 +55,7 @@ interface FileConfig {
   autoApprove?: string[];
   disallowedTools?: string[];
   sandbox?: "off" | "enforce";
-  networkPolicy?: "off" | "proxy" | "open";
+  networkPolicy?: "off" | "open";
   fallbackModels?: string[];
   board?: unknown;
   boardProfiles?: unknown;
@@ -82,11 +92,36 @@ function readJson(path: string): FileConfig {
   }
 }
 
-const MODES: PermissionMode[] = ["ask", "auto", "plan", "acceptEdits", "dontAsk", "bypassPermissions"];
+/**
+ * Every permission mode the runtime implements.
+ *
+ * Exported because the same list was written out by hand in six places — the
+ * CLI's `--mode` check, the REPL's `/mode`, the host's `setMode`, its settings
+ * save, its "keep the live mode" fallback, and the renderer's menu — and they
+ * drifted. Three of them still accepted only ask/auto/plan, so choosing
+ * `acceptEdits` in the desktop window and then saving an unrelated setting
+ * silently put the session back in `ask`. A mode that exists in exactly one
+ * place cannot disagree with itself.
+ */
+export const PERMISSION_MODES: readonly PermissionMode[] = [
+  "ask",
+  "auto",
+  "plan",
+  "acceptEdits",
+  "dontAsk",
+  "bypassPermissions",
+];
+
+/** True for a string that names a mode, unmatched case. */
+export function isPermissionMode(value: unknown): value is PermissionMode {
+  const text = String(value ?? "").toLowerCase();
+  return PERMISSION_MODES.some((mode) => mode.toLowerCase() === text);
+}
+
 
 /** A mode name from an environment variable, a flag, or a saved session. */
 export function validMode(value: string | undefined): PermissionMode | undefined {
-  return MODES.find((mode) => mode.toLowerCase() === String(value ?? "").toLowerCase());
+  return PERMISSION_MODES.find((mode) => mode.toLowerCase() === String(value ?? "").toLowerCase());
 }
 
 function validSandbox(value: string | undefined): "off" | "enforce" | undefined {
@@ -94,17 +129,31 @@ function validSandbox(value: string | undefined): "off" | "enforce" | undefined 
 }
 
 /**
- * `proxy` is accepted in old configs but has never been implemented; loading it
- * as `off` keeps the choice the user can predict. Returning undefined for it
- * would let a lower-priority config (the project file) quietly win instead.
+ * `proxy` was an option in the settings UI and in old config files, but no
+ * code ever implemented it: the loader silently rewrote it to `off`. A choice
+ * that is accepted and then quietly discarded is worse than one that is not
+ * offered, so the type no longer has it and a file that still says `proxy`
+ * loads as `off` with the same behaviour it always had.
  */
-function validNetwork(value: string | undefined): "off" | "proxy" | "open" | undefined {
+export function validNetwork(value: string | undefined): "off" | "open" | undefined {
   if (value === "proxy") return "off";
   return value === "off" || value === "open" ? value : undefined;
 }
 
-function validEffort(value: string | undefined): ThinkingEffort | undefined {
-  return value === "auto" || value === "low" || value === "medium" || value === "high" ? value : undefined;
+/**
+ * A reasoning level from a config file, a flag, or an environment variable.
+ *
+ * The set is per model and advertised by the gateway, so this cannot be an
+ * allowlist of four names any more. What it can still reject is a value that
+ * is not a level at all: empty, very long, or containing whitespace — each of
+ * those would go on the wire as a malformed parameter. `auto` is kept as the
+ * sentinel meaning "send nothing".
+ */
+export function validEffort(value: string | undefined): ThinkingEffort | undefined {
+  const level = String(value ?? "").trim();
+  if (!level) return undefined;
+  if (level === "auto") return level;
+  return /^[A-Za-z][A-Za-z0-9_-]{0,23}$/.test(level) ? level : undefined;
 }
 
 const FLASHERS = ["pyocd", "probe-rs", "openocd", "esptool", "st-flash", "dfu-util", "avrdude", "jlink"] as const;

@@ -418,17 +418,43 @@ app.whenReady().then(() => {
   });
 
   // 离线安装：内网机器连不上工具链的下载站，用户手上只有一个压缩包。
+  // `multiple` is for the composer's "add files", which may take several at
+  // once; the default stays single so the pack installer's callers are
+  // unchanged.
   ipcMain.handle("pick-file", async (_event, options = {}) => {
     const result = await dialog.showOpenDialog({
-      properties: ["openFile"],
+      properties: options.multiple ? ["openFile", "multiSelections"] : ["openFile"],
       filters: options.filters ?? [],
       ...(options.defaultPath ? { defaultPath: options.defaultPath } : {}),
     });
-    return result.canceled ? null : result.filePaths[0];
+    if (result.canceled) return options.multiple ? [] : null;
+    return options.multiple ? result.filePaths : result.filePaths[0];
   });
 
   ipcMain.handle("reveal-file", async (_event, path) => {
     if (existsSync(path)) shell.showItemInFolder(path);
+  });
+
+  // The composer's "add files" hands back paths; an image has to become a data
+  // URL before it can travel as an image part. Refused above the size the
+  // attachment strip already caps at.
+  ipcMain.handle("read-image", async (_event, path) => {
+    try {
+      const info = statSync(path);
+      if (!info.isFile() || info.size > 4 * 1024 * 1024) return null;
+      const mime = /\.png$/i.test(path)
+        ? "image/png"
+        : /\.gif$/i.test(path)
+          ? "image/gif"
+          : /\.webp$/i.test(path)
+            ? "image/webp"
+            : /\.bmp$/i.test(path)
+              ? "image/bmp"
+              : "image/jpeg";
+      return `data:${mime};base64,${readFileSync(path).toString("base64")}`;
+    } catch {
+      return null;
+    }
   });
 
   ipcMain.handle("save-file", async (_event, { suggestedName, content, filters }) => {

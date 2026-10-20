@@ -31,7 +31,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { SESSIONS_DIR } from "./config.ts";
 import { sessionLockHolder, type SessionHolder } from "./sessionLock.ts";
-import type { BoardSelection, PermissionMode, ChatMessage } from "./types.ts";
+import type { BoardSelection, PermissionMode, ChatMessage, ThinkingEffort } from "./types.ts";
 
 export interface SessionFile {
   id: string;
@@ -62,7 +62,7 @@ export interface SessionFile {
    * exists; the reader validates it before applying.
    */
   mode?: PermissionMode;
-  effort?: "auto" | "low" | "medium" | "high";
+  effort?: ThinkingEffort;
   sandbox?: "off" | "enforce";
   networkPolicy?: "off" | "proxy" | "open";
   /** Board selection in force when the session was last used. */
@@ -114,7 +114,7 @@ export interface SessionMeta {
    * exists; the reader validates it before applying.
    */
   mode?: PermissionMode;
-  effort?: "auto" | "low" | "medium" | "high";
+  effort?: ThinkingEffort;
   sandbox?: "off" | "enforce";
   networkPolicy?: "off" | "proxy" | "open";
   board?: BoardSelection;

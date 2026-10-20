@@ -185,26 +185,17 @@ export class Permissions implements PermissionManager {
     detail?: PermissionDetail,
   ): Promise<{ allowed: boolean; reason?: string }> {
     const summary = tool.summarize(input);
+    // A tool can be read-only in general and a write for one argument
+    // (`embed_serial`'s `write`). Everything below asks "is this call a
+    // mutation", not "is this tool a mutator".
+    const mutation = tool.mutation?.(input) ?? null;
+    const readonlyCall = tool.readonly && !mutation;
+    // A per-call mutation is described as one, so the approval says what is
+    // actually about to happen rather than the tool's usual summary.
+    const effectiveSummary = mutation ? `${summary} (${mutation})` : summary;
 
-    if (this.mode === "plan" && !tool.readonly) {
+    if (this.mode === "plan" && !readonlyCall) {
       return { allowed: false, reason: "plan mode: only read-only tools are allowed" };
-    }
-
-    // `bypassPermissions` is the explicit "I mean it" mode. It still respects
-    // plan mode above (which is a stronger statement about what may run) and
-    // the critical-command breakers below, but it does not ask.
-    if (this.mode === "bypassPermissions") {
-      return this.allow(tool.name, summary);
-    }
-
-    // A credential file is data the model would send to the endpoint. Reading
-    // one is a decision, not a routine read, and a read-only tool would
-    // otherwise never prompt for it.
-    if (typeof input.path === "string" && isSensitiveFile(resolvePath(input.path))) {
-      if (!tool.readonly || this.mode === "ask") {
-        this.audit(tool.name, summary, "sensitive file");
-        return this.prompt(tool.name, `${summary} (credential file - its contents reach the model)`, detail, "credential file");
-      }
     }
 
     // `--disallowed-tools` is a hard refusal, evaluated before every mode and
@@ -216,8 +207,14 @@ export class Permissions implements PermissionManager {
       return { allowed: false, reason: `${tool.name} is on the disallowed list for this run` };
     }
 
-    // The machine-wide circuit breakers run before any mode, rule, or saved
-    // approval: they exist precisely for the case where everything else says yes.
+    // ---- hard refusals: no mode, rule or saved approval can override ----
+    //
+    // These run in one place, before every mode branch. They used to be
+    // scattered: the classifier was consulted only inside `auto`, so `ask`
+    // mode handed `curl … | bash` to the user as an ordinary approval; and the
+    // auto branch returned before the saved-rule lookup, so an explicit
+    // `deny` rule was ignored there. A refusal that only some modes honour is
+    // not a refusal.
     if (tool.name === "bash") {
       const critical = isCriticalCommand(String(input.command ?? ""), process.cwd());
       if (critical) {
@@ -226,30 +223,58 @@ export class Permissions implements PermissionManager {
       }
     }
 
+    const deniedByClassifier = this.classifierRefusal(tool.name, input);
+    if (deniedByClassifier) {
+      this.audit(tool.name, summary, `denied by sandbox: ${deniedByClassifier}`);
+      return { allowed: false, reason: `the command sandbox blocked this: ${deniedByClassifier}` };
+    }
+
+    const rule = matchRuleAgainst(this.rules, tool.name, summary, ruleArgument(tool.name, input));
+    if (rule?.action === "deny") {
+      this.audit(tool.name, summary, "denied by rule");
+      return { allowed: false, reason: `a saved rule denies ${tool.name} for "${summary}"` };
+    }
+
+    // `bypassPermissions` is the explicit "I mean it" mode: it skips the
+    // prompts and the allow-list questions, not the refusals above.
+    if (this.mode === "bypassPermissions") {
+      return this.allow(tool.name, summary);
+    }
+
+    // A credential file is data the model would send to the endpoint. Reading
+    // one is a decision, not a routine read, and a read-only tool would
+    // otherwise never prompt for it.
+    if (typeof input.path === "string" && isSensitiveFile(resolvePath(input.path))) {
+      if (!readonlyCall || this.mode === "ask") {
+        this.audit(tool.name, summary, "sensitive file");
+        return this.prompt(
+          tool.name,
+          `${summary} (credential file - its contents reach the model)`,
+          detail,
+          "credential file",
+          ruleArgument(tool.name, input),
+        );
+      }
+    }
+
     if (typeof input.path === "string" && isProtectedPath(resolvePath(input.path), process.cwd())) {
       // Read-only tools may inspect these paths; only mutation is gated.
-      if (!tool.readonly) {
+      if (!readonlyCall) {
         this.audit(tool.name, summary, "protected path");
-        return this.prompt(tool.name, `${summary} (protected path — this can change how the agent itself runs)`, detail, "protected path");
+        return this.prompt(
+          tool.name,
+          `${summary} (protected path — this can change how the agent itself runs)`,
+          detail,
+          "protected path",
+          ruleArgument(tool.name, input),
+        );
       }
     }
 
     // Read-only tools are always safe to run. `dontAsk` is the one mode that
     // turns a would-be prompt into a refusal, so it is checked before this
     // shortcut only for mutating tools; reads never ask in the first place.
-    if (tool.readonly) return this.allow(tool.name, summary);
-
-    // `acceptEdits` is the common workflow that the three-mode model could not
-    // express: file edits go through, shell commands still ask. The edit tools
-    // are exactly the built-in pair; `bash` and MCP tools are not.
-    if (this.mode === "acceptEdits" && !tool.name.startsWith("mcp__") && FILE_MUTATORS.has(tool.name)) {
-      const rule = matchRuleAgainst(this.rules, tool.name, summary, ruleArgument(tool.name, input));
-      if (rule?.action === "deny") {
-        this.audit(tool.name, summary, "denied by rule");
-        return { allowed: false, reason: `a saved rule denies ${tool.name} for "${summary}"` };
-      }
-      return this.allow(tool.name, summary);
-    }
+    if (readonlyCall) return this.allow(tool.name, summary);
 
     // A standing grant has to be read before the mode branches, not after
     // them. `--mode auto --dont-ask` puts "*" in `autoApprove`, but the auto
@@ -265,17 +290,23 @@ export class Permissions implements PermissionManager {
         (spec) => spec.includes("(") && matchesSpec(spec, tool.name, summary, ruleArgument(tool.name, input)),
       );
 
+    // `acceptEdits` is the common workflow that the three-mode model could not
+    // express: file edits go through, shell commands still ask. The edit tools
+    // are exactly the built-in pair; `bash` and MCP tools are not.
+    if (this.mode === "acceptEdits" && !tool.name.startsWith("mcp__") && FILE_MUTATORS.has(tool.name)) {
+      return this.allow(tool.name, summary);
+    }
+
     if (this.mode === "auto") {
-      if (tool.name === "bash") {
-        const command = String(input.command ?? "");
-        const verdict = classifyCommand(command, process.cwd(), this.sandboxPolicy());
-        if (verdict.class === "deny") {
-          this.audit(tool.name, summary, `denied by sandbox: ${verdict.reason}`);
-          return { allowed: false, reason: `the command sandbox blocked this: ${verdict.reason}` };
-        }
-        if (verdict.class === "confirm" && !preApproved) {
-          return this.prompt(tool.name, `${summary} (${verdict.reason})`, detail, `auto mode asks for this one: ${verdict.reason}`);
-        }
+      const confirmReason = this.confirmReason(tool.name, input);
+      if (confirmReason && !preApproved) {
+        return this.prompt(
+          tool.name,
+          `${summary} (${confirmReason})`,
+          detail,
+          `auto mode asks for this one: ${confirmReason}`,
+          ruleArgument(tool.name, input),
+        );
       }
       return this.allow(tool.name, summary);
     }
@@ -285,12 +316,7 @@ export class Permissions implements PermissionManager {
     // command line for bash, the path for file tools, the tool name for an
     // MCP server prefix — because the summary carries the model's prose
     // description after the real text and a scoped rule would miss its call.
-    const rule = matchRuleAgainst(this.rules, tool.name, summary, ruleArgument(tool.name, input));
     if (rule) {
-      if (rule.action === "deny") {
-        this.audit(tool.name, summary, "denied by rule");
-        return { allowed: false, reason: `a saved rule denies ${tool.name} for "${summary}"` };
-      }
       this.audit(tool.name, summary, "allowed by rule");
       return { allowed: true };
     }
@@ -314,16 +340,39 @@ export class Permissions implements PermissionManager {
         allowed: false,
         reason:
           `${tool.name} has no standing approval in this non-interactive run. ` +
-          `Add it to --allowed-tools (or pass --dont-ask) if it should be permitted, ` +
+          `Re-run with --allowed-tools ${tool.name} if it should be permitted, ` +
           `or use a tool that needs no approval.`,
       };
     }
     return this.prompt(
       tool.name,
-      summary,
+      // A per-call mutation says what is actually about to happen: approving
+      // `embed_serial: COM7` is not the same decision as approving a write to
+      // the board on COM7.
+      mutation ? effectiveSummary : summary,
       detail,
       this.mode === "ask" ? "ask mode: this tool is not in a saved rule" : "not covered by a rule",
+      ruleArgument(tool.name, input),
     );
+  }
+
+  /**
+   * The classifier's verdict for a shell command, when it is a refusal.
+   *
+   * Returns the reason only for `deny`; `confirm` is a prompt the caller
+   * decides about. Non-shell tools have nothing to classify.
+   */
+  private classifierRefusal(toolName: string, input: Record<string, unknown>): string | null {
+    if (toolName !== "bash") return null;
+    const verdict = classifyCommand(String(input.command ?? ""), process.cwd(), this.sandboxPolicy());
+    return verdict.class === "deny" ? (verdict.reason ?? "blocked") : null;
+  }
+
+  /** The classifier's reason for a command that must be confirmed, if any. */
+  private confirmReason(toolName: string, input: Record<string, unknown>): string | null {
+    if (toolName !== "bash") return null;
+    const verdict = classifyCommand(String(input.command ?? ""), process.cwd(), this.sandboxPolicy());
+    return verdict.class === "confirm" ? (verdict.reason ?? "flagged") : null;
   }
   private sandboxPolicy(): SandboxPolicy {
     return {
@@ -344,6 +393,8 @@ export class Permissions implements PermissionManager {
     summary: string,
     detail?: PermissionDetail,
     why?: string,
+    /** The value the rule is written against, so "always" can be narrowed. */
+    argument?: string,
   ): Promise<{ allowed: boolean; reason?: string }> {
     // A run with no person behind it cannot answer a prompt. Refusing is right,
     // but the reason has to say which of the two things happened: a policy
@@ -356,7 +407,7 @@ export class Permissions implements PermissionManager {
         allowed: false,
         reason:
           `no approval was granted for ${tool} in this non-interactive run. ` +
-          `Re-run with --allowed-tools ${tool} (or --dont-ask) if it should be permitted, ` +
+          `Re-run with --allowed-tools ${tool} if it should be permitted, ` +
           `or use a tool that needs no approval.`,
       };
     }
@@ -384,15 +435,21 @@ export class Permissions implements PermissionManager {
       // the answer changes what the user is trusting. A UI that can ask it
       // gets a choice; one that cannot (the terminal, a script) keeps the
       // narrow default.
-      const choice = await this.rememberScope(tool);
+      //
+      // For a shell there is nothing to choose: "every call of bash" cannot be
+      // expressed as a rule that covers every command, because its arguments
+      // *are* the program. Asking the question and then ignoring the answer
+      // would be worse than not asking it.
+      const isCommandTool = tool === "bash";
+      const choice = isCommandTool ? "always-detail" : await this.rememberScope(tool);
       // "Every call of this tool" is the whole-tool grant. "Only this exact
       // call" must not fall back to it: the session-level Set would then wave
       // through every later `rm`, which is precisely what the user declined.
-      // The saved rule covers the exact summary instead.
-      if (choice === "always-tool") this.always.add(tool);
+      const scope = choice;
+      const narrowed = argument ?? summary;
       let persisted = false;
       try {
-        ruleFromChoice(tool, choice === "always-tool" ? "" : summary, "project", process.cwd(), choice);
+        ruleFromChoice(tool, scope === "always-tool" ? "" : narrowed, "project", process.cwd(), scope);
         this.rules.splice(0, this.rules.length, ...rulesFor(process.cwd()));
         persisted = true;
       } catch {
@@ -400,7 +457,8 @@ export class Permissions implements PermissionManager {
            user just gave; a whole-tool grant still applies to this session. */
       }
       const verdict =
-        choice === "always-tool" ? "allowed (always, whole tool)" : "allowed (always, this call)";
+        scope === "always-tool" ? "allowed (always, whole tool)" : "allowed (always, this call)";
+      if (scope === "always-tool" && !isCommandTool) this.always.add(tool);
       this.audit(tool, summary, persisted ? verdict : `${verdict}, rule not saved`);
       return { allowed: true };
     }

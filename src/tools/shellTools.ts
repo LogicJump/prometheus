@@ -28,9 +28,25 @@ const MAX_OUTPUT = 120_000;
  * to undo. Common read-only commands are excluded so the check is not paid on
  * every `cat`.
  */
-const MUTATING_PROGRAMS = new Set([
-  "rm", "del", "erase", "rd", "rmdir", "mv", "move", "ren", "rename", "cp", "copy", "xcopy", "robocopy", "sed", "perl", "python", "python3", "node", "npm", "npx", "pnpm", "yarn", "cargo", "make", "cmake", "ninja", "gradle", "mvn", "dotnet", "go", "rustc", "gcc", "clang", "tsc", "eslint", "prettier", "black", "ruff",
+export const MUTATING_PROGRAMS = new Set([
+  // Filesystem verbs.
+  "rm", "del", "erase", "rd", "rmdir", "mv", "move", "ren", "rename", "cp", "copy", "xcopy", "robocopy",
+  "mkdir", "md", "touch", "tee", "truncate", "dd", "ln", "mklink", "install", "chmod", "chown", "chgrp",
+  "attrib", "icacls", "tar", "zip", "unzip", "7z", "gzip", "gunzip", "bzip2", "xz", "patch",
+  // Programs that run a program in their arguments: an inline script or a
+  // one-liner writes wherever it likes, and the path scan cannot see it.
+  "sed", "perl", "ruby", "php", "awk", "gawk", "python", "python3", "py", "node", "deno", "bun",
+  "powershell", "pwsh", "cmd", "sh", "bash", "zsh",
+  // Build and package tooling: all of it writes a build tree or a lockfile.
+  "npm", "npx", "pnpm", "yarn", "cargo", "rustc", "make", "cmake", "ninja", "gradle", "gradlew", "mvn",
+  "dotnet", "go", "gcc", "g++", "cc", "clang", "clang++", "ld", "javac", "javadoc", "tsc", "eslint",
+  "prettier", "black", "ruff", "pip", "pip3", "uv", "poetry", "conda", "gem", "composer",
+  // Fetchers write files unless every output is discarded.
+  "curl", "wget", "rsync", "scp", "sftp",
+  // Tooling that mutates state outside the build tree.
+  "docker", "podman", "kubectl", "helm", "terraform", "git",
 ]);
+
 
 /**
  * Read-only git subcommands, which change nothing and need no snapshot.
@@ -46,25 +62,40 @@ const READONLY_GIT = new Set([
  * be quoted, prefixed, or chained, and the first word of each segment is
  * what decides. `git` is special because most of its subcommands are reads.
  */
-function canWriteFiles(command: string): boolean {
+export function canWriteFiles(command: string): boolean {
   // Split on shell separators rather than matching one giant pattern: the
   // first word of each segment is the program, and `git status && rm x` has
-  // two segments with different answers.
-  const segments = command.split(/&&|\|\||;|\n/);
+  // two segments with different answers. A pipe is a separator too — the old
+  // split ignored `|`, so `cat x | tee out` looked read-only and the kernel
+  // sandbox mounted the workspace read-only for a command that writes.
+  const segments = command.split(/&&|\|\||\||;|\n/);
   for (const segment of segments) {
     const words = segment.trim().split(/\s+/).map((word) => word.replace(/^["']+|["']+$/g, ""));
     // Skip a leading env assignment or `sudo`-style wrapper.
     let index = 0;
-    while (index < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]) || words[index] === "sudo")) index += 1;
-    const raw = words[index] ?? "";
-    const program = (raw.split(/[\\/]/).pop() ?? "").replace(/\.exe$/i, "").toLowerCase();
-    if (!program) continue;
-    if (program === "git") {
+    while (index < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]) || words[index] === "sudo" || words[index] === "env")) {
+      index += 1;
+    }
+    // `xargs <prog>` and `find … -exec <prog>` run another program; judge that
+    // one. Without this, `find . -name '*.tmp' | xargs rm` read as a `find`.
+    let program = (words[index] ?? "");
+    if (program === "xargs") {
+      index += 1;
+      while (index < words.length && words[index].startsWith("-")) index += 1;
+      program = words[index] ?? "";
+    }
+    if (program === "find") {
+      const execAt = words.indexOf("-exec");
+      if (execAt >= 0) program = words[execAt + 1] ?? "";
+    }
+    const name = (program.split(/[\\/]/).pop() ?? "").replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+    if (!name) continue;
+    if (name === "git") {
       const sub = (words[index + 1] ?? "").toLowerCase();
       if (!READONLY_GIT.has(sub)) return true;
       continue;
     }
-    if (MUTATING_PROGRAMS.has(program)) return true;
+    if (MUTATING_PROGRAMS.has(name)) return true;
   }
   return false;
 }

@@ -24,7 +24,7 @@ export type CommandClass = "allow" | "confirm" | "deny";
 export interface SandboxPolicy {
   /** "off" restores the pre-sandbox behaviour (full env, no classification). */
   mode: "off" | "enforce";
-  network: "off" | "proxy" | "open";
+  network: "off" | "open";
   allowedDirs: string[];
   /** Environment variables injected without entering the model's context. */
   credentials?: Record<string, string>;
@@ -175,18 +175,6 @@ export function classifyCommand(
         violations: ["inline-subprocess"],
       };
     }
-  }
-
-  // `proxy` never reached classification: `loadConfig` rejects it and writes
-  // `off` instead, because the only honest behaviour is the one the user can
-  // predict. The branch stays for callers that build a policy by hand (tests,
-  // a future implementation) and must not silently look implemented.
-  if (policy.network === "proxy" && NETWORK_FETCHERS.test(command)) {
-    return {
-      class: "confirm",
-      reason: "the per-command proxy policy is not implemented; this will use the network directly",
-      violations: ["network"],
-    };
   }
 
   // `cd` out of the workspace and then read with a relative path: the target

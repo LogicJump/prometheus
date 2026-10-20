@@ -15,7 +15,7 @@
 import process from "node:process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, relative as relativePath, resolve } from "node:path";
-import { loadConfig, ALLOWED_MODELS, isModelAllowed } from "../src/config.ts";
+import { loadConfig, ALLOWED_MODELS, isModelAllowed, isPermissionMode, validMode } from "../src/config.ts";
 import { ChatClient } from "../src/llm.ts";
 import { FallbackChatClient, buildFallbackClients } from "../src/fallback.ts";
 import { Agent } from "../src/agent.ts";
@@ -144,6 +144,25 @@ function applyModelContext(id) {
     agent.config.contextWindow = entry.contextLength;
     agent.config.contextWindowAssumed = false;
   }
+}
+
+/**
+ * The reasoning levels the active model accepts, for the effort menu.
+ *
+ * `auto` is always first and is the one level that is never sent on the wire;
+ * the rest are the endpoint's own spellings, in its order. A model that
+ * reasons at a fixed level reports no list, and the menu then shows only
+ * `auto` with that level named, instead of offering a choice the gateway would
+ * ignore.
+ */
+function effortChoices() {
+  const entry = catalog.models.find((model) => model.id === config.model);
+  const levels = entry?.reasoningEfforts ?? [];
+  return {
+    levels,
+    default: entry?.reasoningDefault ?? (levels.length > 0 ? levels[levels.length - 1] : ""),
+    fixed: entry?.reasoningFixed ?? "",
+  };
 }
 
 /**
@@ -402,12 +421,17 @@ class HostUi {
    */
   heartbeat() {
     if (!runStartedAt) return;
+    const usage = agent?.usage ?? { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
     send({
       type: "turn_progress",
       elapsedMs: Date.now() - runStartedAt,
       tool: this.lastTool || "",
       retry: this.retryCount,
       turns: agent?.lastRunTurns ?? 0,
+      // Output tokens only. The input side is the prompt — often six figures
+      // on the first heartbeat once a long document is in context — and a live
+      // readout of it reads as a runaway bill rather than as progress.
+      outputTokens: usage.outputTokens,
     });
   }
   toolOutput(name, content) {
@@ -545,6 +569,147 @@ function availableCommands() {
     });
   }
   return local.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Run a built-in slash command; false when the name is not one.
+ *
+ * These are verbs over the session (clear, compact, change the model), not
+ * prompt templates, so they are handled here rather than expanded into text.
+ * Before this, `/compact` typed into the composer was sent to the model as the
+ * literal string "/compact" — the command existed in the CLI and in the
+ * palette but had no path from the transcript.
+ */
+function runBuiltinSlash(name, args) {
+  switch (name) {
+    case "clear":
+      startNewSession();
+      return true;
+    case "compact":
+      compactConversation(args);
+      return true;
+    case "context":
+      reportContext();
+      return true;
+    case "export":
+      exportCurrentSession();
+      return true;
+    case "model": {
+      const id = args.trim();
+      if (!id) {
+        send({ type: "notice", level: "dim", text: `model: ${config.model}` });
+        return true;
+      }
+      if (!configModelAllowed(id)) {
+        send({ type: "notice", level: "warn", text: `model "${id}" is not available on this endpoint` });
+        return true;
+      }
+      config.model = id;
+      if (client) client.options.model = id;
+      if (agent) agent.refreshSystemPrompt();
+      applyModelContext(id);
+      emitState();
+      return true;
+    }
+    case "models":
+      void refreshCatalog(args.trim() === "refresh");
+      return true;
+    case "mode": {
+      const mode = ["ask", "auto", "plan", "acceptEdits", "dontAsk", "bypassPermissions"].find(
+        (candidate) => candidate.toLowerCase() === args.trim().toLowerCase(),
+      );
+      if (!mode) {
+        send({ type: "notice", level: "dim", text: `mode: ${config.permissionMode}` });
+        return true;
+      }
+      config.permissionMode = mode;
+      if (agent) agent.config.permissionMode = mode;
+      emitState();
+      return true;
+    }
+    case "plan":
+      return runBuiltinSlash("mode", "plan");
+    case "effort": {
+      const level = args.trim();
+      if (!level) {
+        send({ type: "notice", level: "dim", text: `effort: ${config.thinkingEffort}` });
+        return true;
+      }
+      if (!/^(auto|[A-Za-z][A-Za-z0-9_-]{0,23})$/.test(level)) {
+        send({ type: "notice", level: "warn", text: `"${level}" is not a reasoning level` });
+        return true;
+      }
+      config.thinkingEffort = level;
+      if (client) client.options.reasoningEffort = level;
+      emitState();
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+/**
+ * The helpers a built-in slash command shares with its IPC handler.
+ *
+ * Each one was inline in a `case`; the composer's menu needs the same work
+ * without a round trip through the renderer, and duplicating the bodies would
+ * let the two paths drift.
+ */
+function startNewSession() {
+  if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
+  releaseSessionLock(sessionId);
+  sessionId = newSessionId();
+  sessionTitle = "";
+  titleAttempted = false;
+  createAgent([]);
+  // The new session exists on disk only after the first persist; take its
+  // lock now so two windows cannot both create the same id.
+  const claimed = acquireSessionLock(sessionId, "desktop window");
+  if (!claimed.ok) send({ type: "notice", level: "warn", text: lockConflictMessage(sessionId, claimed.holder) });
+  send({ type: "session_loaded", messages: [] });
+  // A user who chose isolated sessions gets one without asking each time;
+  // failures (not a repo) are a dim note, not an error, because a plain
+  // folder is a normal place to work.
+  if (uiPrefs.isolateByDefault && !worktree) void enterDefaultWorktree();
+}
+
+async function compactConversation(focus, keep) {
+  const before = agent.contextUsage().tokens;
+  try {
+    // The model writes the recap; the old call used the keyword summary,
+    // which made the explicit "compact well" command produce the worst
+    // recap of all the paths.
+    const result = await agent.compactNow({
+      ...(focus ? { focus: String(focus) } : {}),
+      ...(Number(keep) > 0 ? { keepRecent: Number(keep) } : {}),
+    });
+    if (!result) {
+      send({ type: "notice", level: "dim", text: "nothing to compact" });
+    } else {
+      send({
+        type: "notice",
+        level: "dim",
+        text: `compacted (${result.level}): ~${before} -> ~${agent.contextUsage().tokens} tokens`,
+      });
+    }
+  } catch (error) {
+    send({ type: "notice", level: "warn", text: error instanceof Error ? error.message : String(error) });
+  }
+  send({ type: "run_end", context: agent.contextUsage(), usage: agent.usage, todos: agent.todos.items, files: changedFiles() });
+}
+
+function reportContext() {
+  const breakdown = agent?.contextBreakdown();
+  send({
+    type: "context_report",
+    ...(breakdown ? breakdown : { window: config.contextWindow, used: 0, percent: 0, compactAt: 0, parts: [] }),
+  });
+}
+
+function exportCurrentSession() {
+  const record = sessionRecord();
+  send({ type: "export_ready", markdown: sessionToMarkdown(record), filename: exportFilename(record) });
 }
 
 /** Expand a slash command typed in the composer, MCP prompts included. */
@@ -711,6 +876,9 @@ function emitState() {
     locale,
     mode: config.permissionMode,
     effort: config.thinkingEffort,
+    // The picker is built from the endpoint's own list, so a model with
+    // `xhigh` or `max` gets those rows and one with a fixed level gets none.
+    effortChoices: effortChoices(),
     sandbox: config.sandbox ?? "enforce",
     networkPolicy: config.networkPolicy ?? "off",
     model: config.model,
@@ -718,6 +886,9 @@ function emitState() {
     modelsSource: catalog.source,
     baseUrl: config.baseUrl,
     context: agent ? agent.contextUsage() : { tokens: 0, percent: 0 },
+    // The popover's breakdown. Computed on the same tick as the total above so
+    // the parts always add up to the percentage the chip shows.
+    contextBreakdown: agent ? agent.contextBreakdown() : null,
     usage: agent ? agent.usage : { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
     // Both are cheap: the project detection is synchronous and the serial
     // monitor is our own state. The machine scan is not included — the Board
@@ -1742,7 +1913,12 @@ async function handle(cmd) {
       startScheduleSweep();
       const interrupted = findInterruptedRun(cwd);
       if (interrupted) {
-        send({ type: "notice", level: "warn", text: `the previous run was interrupted (${interrupted.sessionId}); its files are in History` });
+        // A recovery, not a warning: the app is telling the user something it
+        // already handled. Amber prose across the transcript made it read as
+        // a problem to act on; the session id was internal bookkeeping. A
+        // quiet line in the same voice as "compacted while idle" says the
+        // same thing without competing for attention.
+        send({ type: "notice", level: "dim", text: "Recovered after an interrupted run. Its files are in History." });
       }
       // A status of `working` with no live run is the fingerprint of a killed
       // process, not of work in progress. Clear it and offer what it was doing.
@@ -1786,7 +1962,11 @@ async function handle(cmd) {
       void refreshCatalog(true);
       return;
     case "setEffort": {
-      if (!["auto", "low", "medium", "high"].includes(cmd.effort)) return;
+      // The renderer sends one of the levels the active model advertises, or
+      // `auto`; the shape check here is a guard against a malformed message,
+      // not an allowlist, because the set is per model and comes from the
+      // endpoint rather than from this file.
+      if (!/^(auto|[A-Za-z][A-Za-z0-9_-]{0,23})$/.test(String(cmd.effort ?? ""))) return;
       config.thinkingEffort = cmd.effort;
       client.options.reasoningEffort = cmd.effort;
       emitState();
@@ -1980,6 +2160,7 @@ async function handle(cmd) {
           networkPolicy: config?.networkPolicy ?? "off",
           kernelSandbox: config?.kernelSandbox ?? "auto",
           kernelSandboxDistro: config?.kernelSandboxDistro ?? "",
+          sandboxFailIfUnavailable: Boolean(config?.sandboxFailIfUnavailable),
           echoReasoning: Boolean(config?.echoReasoning),
           rules: loadRules().map((rule) => ({
             id: rule.id,
@@ -2149,15 +2330,23 @@ async function handle(cmd) {
         filePatch.apiKey = patch.apiKey.trim();
       }
       if (typeof patch.model === "string" && patch.model) filePatch.model = patch.model;
-      if (["ask", "auto", "plan"].includes(patch.mode)) filePatch.permissionMode = patch.mode;
-      if (["auto", "low", "medium", "high"].includes(patch.effort)) filePatch.thinkingEffort = patch.effort;
+      // The settings dialog offered three modes while the runtime has six;
+      // the composer's mode menu is the primary switch, but a mode chosen
+      // from settings must persist too.
+      if (isPermissionMode(patch.mode)) {
+        filePatch.permissionMode = patch.mode;
+      }
+      if (/^(auto|[A-Za-z][A-Za-z0-9_-]{0,23})$/.test(String(patch.effort ?? ""))) filePatch.thinkingEffort = patch.effort;
       if (Number.isFinite(Number(patch.maxTokens))) filePatch.maxTokens = Math.max(256, Math.min(128000, Number(patch.maxTokens)));
       if (Number.isFinite(Number(patch.contextWindow))) {
         filePatch.contextWindow = Math.max(8_000, Math.min(4_000_000, Number(patch.contextWindow)));
       }
       if (patch.sandbox === "off" || patch.sandbox === "enforce") filePatch.sandbox = patch.sandbox;
-      if (["off", "proxy", "open"].includes(patch.networkPolicy)) filePatch.networkPolicy = patch.networkPolicy;
+      if (patch.networkPolicy === "off" || patch.networkPolicy === "open") filePatch.networkPolicy = patch.networkPolicy;
       if (["off", "auto", "wsl"].includes(patch.kernelSandbox)) filePatch.kernelSandbox = patch.kernelSandbox;
+      if (typeof patch.sandboxFailIfUnavailable === "boolean") {
+        filePatch.sandboxFailIfUnavailable = patch.sandboxFailIfUnavailable;
+      }
       if (typeof patch.kernelSandboxDistro === "string") {
         filePatch.kernelSandboxDistro = patch.kernelSandboxDistro.trim();
       }
@@ -2208,7 +2397,10 @@ async function handle(cmd) {
         // written to disk; keep it unless this save explicitly sets a new one.
         const liveMode = config.permissionMode;
         config = loadConfig();
-        if (!["ask", "auto", "plan"].includes(patch.mode)) config.permissionMode = liveMode;
+        // Keep the live mode unless this save explicitly names a new one. The
+        // list here used to be three names long, so choosing acceptEdits in the
+        // composer and then saving an unrelated setting reset the session.
+        if (!isPermissionMode(patch.mode)) config.permissionMode = liveMode;
         client = makeClient();
         permissions.mode = config.permissionMode;
         agent.config.model = config.model;
@@ -2239,9 +2431,18 @@ async function handle(cmd) {
       return;
     }
     case "prompt": {
-      // A known slash command expands into its prompt; anything else is sent
-      // verbatim so a message starting with "/" is never swallowed.
-      const expanded = await expandAnySlash(String(cmd.text ?? ""));
+      const text = String(cmd.text ?? "");
+      // A built-in runs the command; a markdown/MCP command expands into its
+      // prompt. Anything else is sent verbatim, so a message that happens to
+      // start with "/" is never swallowed.
+      const builtin = /^\/([a-z0-9][a-z0-9-_]*)\s*([\s\S]*)$/i.exec(text.trim());
+      if (builtin && runBuiltinSlash(builtin[1].toLowerCase(), builtin[2].trim())) {
+        // The renderer echoed the typed line; say what ran so the transcript
+        // does not show a command that apparently did nothing.
+        send({ type: "command_expanded", name: builtin[1].toLowerCase(), prompt: "" });
+        return;
+      }
+      const expanded = await expandAnySlash(text);
       // `ephemeral` means this one turn is not kept: a probe or a question the
       // user does not want in the transcript. It is decided per send rather
       // than per session so the rest of the conversation stays intact.
@@ -2269,7 +2470,11 @@ async function handle(cmd) {
       return;
     }
     case "setMode": {
-      if (!["ask", "auto", "plan"].includes(cmd.mode)) return;
+      // All six modes the permission layer implements. This list had three,
+      // so choosing "Accept edits", "Refuse instead of asking" or "Bypass
+      // permissions" from the composer menu was silently dropped: the message
+      // was ignored, the menu closed, and the session stayed in its old mode.
+      if (!isPermissionMode(cmd.mode)) return;
       config.permissionMode = cmd.mode;
       permissions.mode = cmd.mode;
       agent.refreshSystemPrompt();
@@ -2305,21 +2510,7 @@ async function handle(cmd) {
       return;
     }
     case "newSession": {
-      if (running) return send({ type: "notice", level: "warn", text: "stop the current turn first" });
-      releaseSessionLock(sessionId);
-      sessionId = newSessionId();
-      sessionTitle = "";
-      titleAttempted = false;
-      createAgent([]);
-      // The new session exists on disk only after the first persist; take its
-      // lock now so two windows cannot both create the same id.
-      const claimed = acquireSessionLock(sessionId, "desktop window");
-      if (!claimed.ok) send({ type: "notice", level: "warn", text: lockConflictMessage(sessionId, claimed.holder) });
-      send({ type: "session_loaded", messages: [] });
-      // A user who chose isolated sessions gets one without asking each time;
-      // failures (not a repo) are a dim note, not an error, because a plain
-      // folder is a normal place to work.
-      if (uiPrefs.isolateByDefault && !worktree) void enterDefaultWorktree();
+      startNewSession();
       return;
     }
     case "loadSession": {
@@ -2676,28 +2867,7 @@ async function handle(cmd) {
       return;
     }
     case "compact": {
-      const before = agent.contextUsage().tokens;
-      try {
-        // The model writes the recap; the old call used the keyword summary,
-        // which made the explicit "compact well" command produce the worst
-        // recap of all the paths.
-        const result = await agent.compactNow({
-          ...(cmd.focus ? { focus: String(cmd.focus) } : {}),
-          ...(Number(cmd.keep) > 0 ? { keepRecent: Number(cmd.keep) } : {}),
-        });
-        if (!result) {
-          send({ type: "notice", level: "dim", text: "nothing to compact" });
-        } else {
-          send({
-            type: "notice",
-            level: "dim",
-            text: `compacted (${result.level}): ~${before} -> ~${agent.contextUsage().tokens} tokens`,
-          });
-        }
-      } catch (error) {
-        send({ type: "notice", level: "warn", text: error instanceof Error ? error.message : String(error) });
-      }
-      send({ type: "run_end", context: agent.contextUsage(), usage: agent.usage, todos: agent.todos.items, files: changedFiles() });
+      await compactConversation(cmd.focus ? String(cmd.focus) : "", Number(cmd.keep) || 0);
       return;
     }
     case "getChanges":
@@ -2829,8 +2999,7 @@ async function handle(cmd) {
       return;
     }
     case "exportSession": {
-      const markdown = sessionToMarkdown(sessionRecord());
-      send({ type: "export_ready", markdown, filename: exportFilename(sessionRecord()) });
+      exportCurrentSession();
       return;
     }
     case "hookTrust": {

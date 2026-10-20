@@ -42,7 +42,14 @@ export const browserOpenTool: Tool = {
   name: "browser_open",
   description:
     "Open a URL in the app's Browser pane and return the page title. Use it when the user asked you to look at a page; the pane stays open for them to see.",
-  readonly: true,
+  // Not readonly, although it writes no file. Opening a page is a network
+  // request the user did not make, and the page's own scripts then run with
+  // the pane's privileges — the same class of action as running `curl`. Under
+  // a read-only label it ran in plan mode, and in ask mode it ran without a
+  // prompt, which is how a "don't touch anything" session could still fetch a
+  // URL. `browser_read` and `browser_screenshot` inspect a page that is
+  // already open and stay readonly.
+  readonly: false,
   parameters: {
     type: "object",
     properties: {

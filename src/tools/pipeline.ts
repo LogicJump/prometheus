@@ -98,6 +98,34 @@ const SILENT_UI: Ui = {
   spinnerStop() {},
 };
 
+/**
+ * Fill in the methods a caller left out, without copying the caller's object.
+ *
+ * A class instance keeps its methods on the prototype; `{ ...instance }` sees
+ * only own properties, so spreading one into a fresh object throws every
+ * method away. This returns the original object when it is complete, and a
+ * Proxy over it otherwise, forwarding each call to the real method when one
+ * exists and to the no-op when it does not.
+ */
+function fillUi(ui: Ui | undefined): Ui {
+  if (!ui) return SILENT_UI;
+  let complete = true;
+  for (const key of Object.keys(SILENT_UI) as (keyof Ui)[]) {
+    if (typeof ui[key] !== "function") {
+      complete = false;
+      break;
+    }
+  }
+  if (complete) return ui;
+  return new Proxy(ui, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (value !== undefined) return value;
+      return SILENT_UI[property as keyof Ui];
+    },
+  });
+}
+
 export class ToolPipeline {
   private readonly tools: () => Tool[];
   private readonly deps: PipelineDeps;
@@ -106,8 +134,14 @@ export class ToolPipeline {
 
   constructor(tools: () => Tool[], deps: PipelineDeps) {
     this.tools = tools;
-    // Tests pass partial UI doubles; fill any missing methods with no-ops.
-    this.deps = { ...deps, ui: { ...SILENT_UI, ...(deps.ui ?? {}) } };
+    // Fill in only the methods a test double omitted. The previous
+    // implementation spread the whole `ui` into a fresh object, which copies
+    // *own* properties and silently drops every method defined on the class
+    // prototype — so `HostUi.toolStart` became the no-op from `SILENT_UI`,
+    // `typeof` was still "function", and the transcript lost every tool row
+    // while the tools themselves ran and reported. A prototype-preserving
+    // fill-in keeps the real object when it already has the method.
+    this.deps = { ...deps, ui: fillUi(deps.ui) };
   }
 
   /** The current tool list, so the loop can tell which calls may run together. */

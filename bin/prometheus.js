@@ -61,7 +61,7 @@ Options:
       --base-url <url>        OpenAI-compatible base URL (default: $OPENAI_BASE_URL or https://api.openai.com/v1)
       --key <key>             API key (default: $OPENAI_API_KEY)
       --mode <mode>           ask | auto | plan | acceptEdits | dontAsk | bypassPermissions (default: ask)
-      --effort <level>        thinking effort: auto | low | medium | high
+      --effort <level>        reasoning level: auto, or one the model advertises (low, medium, high, max, xhigh, …)
   -r, --resume <session-id>   resume a saved session
   -c, --continue              resume the most recent session in this directory
       --max-tokens <n>        per-response token cap (default: 16000)
@@ -74,7 +74,7 @@ Options:
       --token-budget <n>      ceiling on tokens for the whole session
       --allowed-tools <list>  comma-separated tools approved without asking (Tool(name) scoped rules allowed)
       --disallowed-tools <list> tools refused outright, even in auto mode
-      --dont-ask              approve every tool in a non-interactive run (dangerous; use in a sandbox)
+      --dont-ask              never prompt: refuse anything without a standing grant
       --detach                run in the background and return at once; follow with "prometheus attach"
       --ephemeral             do not save a session transcript
       --worker-id <id>        internal: the worker record this run belongs to
@@ -350,8 +350,12 @@ if (positionals.length > 0 && COMMANDS.has(positionals[0])) {
 }
 
 const mode = values.mode;
-if (mode && mode !== "ask" && mode !== "auto" && mode !== "plan") {
-  console.error(`Invalid --mode "${mode}". Use ask, auto, or plan.`);
+// The list comes from the runtime, not a copy. Three names were accepted here
+// while the permission layer had six, so `--mode acceptEdits` and
+// `--mode dontAsk` were a usage error from a build that supported both.
+const { PERMISSION_MODES, isPermissionMode } = await import("../src/config.ts");
+if (mode && !isPermissionMode(mode)) {
+  console.error(`Invalid --mode "${mode}". Use ${PERMISSION_MODES.join(", ")}.`);
   process.exit(2);
 }
 
@@ -375,8 +379,11 @@ if (values.resume) {
   }
 }
 const effort = values.effort;
-if (effort && !["auto", "low", "medium", "high"].includes(effort)) {
-  console.error(`Invalid --effort "${effort}". Use auto, low, medium, or high.`);
+// The levels are per model and come from the endpoint, so this checks the
+// shape of the value rather than against a fixed list: a gateway that offers
+// `max` or `xhigh` must be usable from the command line.
+if (effort && !/^(auto|[A-Za-z][A-Za-z0-9_-]{0,23})$/.test(String(effort))) {
+  console.error(`Invalid --effort "${effort}". Use auto, or a level the model advertises (low, medium, high, max, xhigh, …).`);
   process.exit(2);
 }
 
@@ -421,11 +428,17 @@ try {
 // A one-shot run exits after one turn, so it has no one to answer a prompt:
 // the process used to stop dead on the question with stdin ignored. Saying so
 // up front turns that hang into a refusal that names the flag which grants it.
+//
+// `--dont-ask` does NOT grant anything. It used to set `autoApprove: ["*"]`,
+// which meant the flag that says "do not ask" also said "yes" — so
+// `--mode ask --dont-ask` wrote files without approval, and `--mode dontAsk
+// --dont-ask` allowed everything the mode is named for refusing. The two are
+// different statements: `--allowed-tools` is the grant, `--dont-ask` only
+// decides what happens when a call has none.
 if (positionals.length > 0) {
   config = {
     ...config,
     unattended: true,
-    ...(values["dont-ask"] ? { autoApprove: ["*"] } : {}),
   };
 }
 

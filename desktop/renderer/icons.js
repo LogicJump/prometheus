@@ -66,6 +66,8 @@ const ICONS = {
   globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5a13.5 13.5 0 0 1 0 17 13.5 13.5 0 0 1 0-17"/>',
   clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
   image: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.7"/><path d="m4 17.5 4.8-4.3 3.7 3.3 2.9-2.5L20 17.5"/>',
+  paperclip: '<path d="M20 11.5 12.3 19.2a4.9 4.9 0 0 1-7-7l7.8-7.8a3.3 3.3 0 0 1 4.7 4.7l-7.8 7.8a1.7 1.7 0 0 1-2.4-2.4l7.1-7.1"/>',
+  slash: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M13.5 8.5 10.5 15.5"/>',
   layers: '<path d="M12 3.5 3.5 8 12 12.5 20.5 8Z"/><path d="M3.5 12 12 16.5 20.5 12"/><path d="M3.5 16 12 20.5 20.5 16"/>',
   robot: '<rect x="4" y="7.5" width="16" height="11.5" rx="3"/><circle cx="9" cy="13" r="1.2" fill="currentColor" stroke="none"/><circle cx="15" cy="13" r="1.2" fill="currentColor" stroke="none"/><path d="M12 3.5v4"/><path d="M2.5 12.5v3M21.5 12.5v3"/>',
   'corner-up-right': '<path d="M6 19v-6a3 3 0 0 1 3-3h9"/><path d="m14 6 4 4-4 4"/>',

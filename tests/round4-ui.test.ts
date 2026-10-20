@@ -278,3 +278,95 @@ test("an unchanged source is returned from the cache without a rebuild", async (
   assert.equal(second, first);
   assert.equal(renderer.blocks[0], cached);
 });
+
+/* ---------- sidebar resize ---------- */
+
+test("the sidebar resize handle exists and is keyboard reachable", async () => {
+  // The renderer has no DOM under node --test, so the contract is asserted on
+  // the markup: a separator with a tab stop, and the script that wires it.
+  const html = await import("node:fs").then((fs) => fs.readFileSync("desktop/renderer/index.html", "utf8"));
+  assert.match(html, /id="sidebar-resizer"/);
+  assert.match(html, /role="separator"/);
+  assert.match(html, /tabindex="0"/);
+  const app = await import("node:fs").then((fs) => fs.readFileSync("desktop/renderer/app.js", "utf8"));
+  assert.match(app, /prometheus\.sidebarWidth/);
+  assert.match(app, /SIDEBAR_MIN/);
+  assert.match(app, /SIDEBAR_MAX/);
+});
+
+test("the stylesheet has balanced braces", async () => {
+  // A stray `}` silently discards every rule after it, which is how the
+  // sidebar buttons stopped responding and the thinking block stopped
+  // centring: the CSS parsed, the browser reported no error, and the rules
+  // simply were not there. Braces are the one structural property a stylesheet
+  // can be checked for without a browser.
+  const css = await import("node:fs").then((fs) => fs.readFileSync("desktop/renderer/styles.css", "utf8"));
+  let depth = 0;
+  let line = 1;
+  const problems: string[] = [];
+  for (const char of css) {
+    if (char === "\n") line++;
+    else if (char === "{") depth++;
+    else if (char === "}") {
+      depth--;
+      if (depth < 0) {
+        problems.push(`extra } on line ${line}`);
+        depth = 0;
+      }
+    }
+  }
+  if (depth !== 0) problems.push(`${depth} unclosed block(s) at end of file`);
+  assert.deepEqual(problems, []);
+});
+
+test("the rewind action is laid out beside the bubble, not over it", async () => {
+  // The button used to be absolutely positioned at `right: 28px` inside the
+  // turn, which landed on top of the user bubble. The fix is structural: the
+  // turn is a flex row, so the two cannot overlap at any bubble width.
+  const css = await import("node:fs").then((fs) => fs.readFileSync("desktop/renderer/styles.css", "utf8"));
+  const turnRule = /\.turn\.user\s*\{([^}]*)\}/.exec(css)?.[1] ?? "";
+  assert.match(turnRule, /display:\s*flex/);
+  assert.match(turnRule, /justify-content:\s*flex-end/);
+  const rewind = /\.rewind-button\s*\{([^}]*)\}/.exec(css)?.[1] ?? "";
+  assert.ok(!/position:\s*absolute/.test(rewind), "the rewind button must not be positioned over the bubble");
+  // The bubble hands alignment to the flex row.
+  assert.match(css, /\.turn\.user \.user-bubble\s*\{[^}]*float:\s*none/);
+});
+
+test("the user turn has no clearfix pseudo-element inside its flex row", async () => {
+  // `.turn.user::after { clear: both }` was a clearfix for the floated bubble.
+  // Once the turn became a flex row the pseudo-element turned into a third
+  // flex item, which pushed the bubble sideways and made consecutive user
+  // messages overlap. A flex container does not need a clearfix.
+  const css = await import("node:fs").then((fs) => fs.readFileSync("desktop/renderer/styles.css", "utf8"));
+  assert.ok(!/\.turn\.user::after\s*\{[^}]*clear:\s*both/.test(css), "a clearfix inside the flex row breaks its layout");
+});
+
+test("the rewind button is ordered before the bubble so right edges line up", async () => {
+  // `attachRewind` appends the button after the bubble. In a flex row with
+  // `justify-content: flex-end`, that made the button the right-most item, so
+  // a turn with a button had its bubble stop short of the right edge while a
+  // turn without one reached it — consecutive messages looked ragged.
+  const css = await import("node:fs").then((fs) => fs.readFileSync("desktop/renderer/styles.css", "utf8"));
+  const rewind = /\.rewind-button\s*\{([^}]*)\}/.exec(css)?.[1] ?? "";
+  assert.match(rewind, /order:\s*-1/, "the button must sit before the bubble in the flex row");
+});
+
+test("the progress line reports output tokens only and clears with the turn", async () => {
+  const app = await import("node:fs").then((fs) => fs.readFileSync("desktop/renderer/app.js", "utf8"));
+  const host = await import("node:fs").then((fs) => fs.readFileSync("desktop/host.js", "utf8"));
+  // Output tokens are the figure that measures the answer. The total included
+  // the prompt, which on the first heartbeat was six figures and read as a
+  // runaway bill rather than as progress.
+  assert.match(host, /outputTokens:\s*usage\.outputTokens/);
+  assert.ok(!/tokens:\s*usage\.inputTokens \+ usage\.outputTokens/.test(host), "the prompt tokens must not be in the live readout");
+  assert.match(app, /progress\.outputTokens > 0/);
+  // The line is created and removed with the turn, never left behind.
+  assert.match(app, /function ensureProgress/);
+  assert.match(app, /function clearProgress/);
+  assert.match(app, /if \(busy\) \{[\s\S]{0,200}startProgressTicker\(\)/);
+  assert.match(app, /else \{\s*clearProgress\(\);/);
+  // No sentence explaining the gateway's buffering: the spinner and the count
+  // already say "working".
+  assert.ok(!/progressServerQuiet|progressWaiting|progressStreaming/.test(app), "the progress line is not a status essay");
+});

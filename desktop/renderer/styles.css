@@ -32,6 +32,11 @@
   --accent-hover: #6cb0f5;
   --accent-soft: rgba(76, 157, 240, 0.14);
   --accent-text: #8dc0f7;
+  /* Context-breakdown slices need more than one hue; these are quiet
+     siblings of the accent, not a second palette. */
+  --accent-warm: #c98b4b;
+  --accent-2: #4b9ac9;
+  --accent-3: #9a7bd1;
   --success: #4fb286;
   --warn: #d6a244;
   --danger: #e06a5e;
@@ -68,7 +73,13 @@
   --sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
   --shadow-composer: 0 10px 34px rgba(0, 0, 0, 0.42);
   --shadow-popover: 0 14px 40px rgba(0, 0, 0, 0.5);
-  --sidebar-width: calc(264px * var(--ui-scale));
+  /* The sidebar width. `--sidebar-user-width` is written by the resize handle
+     and remembered; when it is absent the scaled default applies. A drag
+     writes `--sidebar-drag-width` on the element itself so the pointer tracks
+     without going through the transition. */
+  --sidebar-width: 264px;
+  /* The reading width is the user's preference, kept as a plain number so the
+     bounded column below can be expressed in terms of it. */
   --reading-width: 780px;
   --font-scale: 1;
   --mark-size: 22px;
@@ -92,6 +103,9 @@
   --accent-hover: #8cc4ff;
   --accent-soft: rgba(108, 176, 255, 0.22);
   --accent-text: #a9d1ff;
+  --accent-warm: #e8b06a;
+  --accent-2: #7cc0ea;
+  --accent-3: #bda1ee;
   --success: #5ddc9a;
   --warn: #ffcc66;
   --danger: #ff8a7a;
@@ -120,6 +134,9 @@
   --accent-hover: #003a93;
   --accent-soft: rgba(0, 71, 179, 0.14);
   --accent-text: #003a93;
+  --accent-warm: #8a5310;
+  --accent-2: #10587e;
+  --accent-3: #5a2f9e;
   --success: #00663f;
   --warn: #6b4a00;
   --danger: #9c1f14;
@@ -148,6 +165,9 @@
   --accent-hover: #1858bd;
   --accent-soft: rgba(31, 111, 235, 0.1);
   --accent-text: #17539f;
+  --accent-warm: #a8620f;
+  --accent-2: #0f6a94;
+  --accent-3: #6a3fb0;
   --success: #1f7a52;
   --warn: #8a6415;
   --danger: #b8382c;
@@ -236,8 +256,11 @@ svg {
 }
 
 .sidebar {
-  width: var(--sidebar-width);
-  flex: 0 0 var(--sidebar-width);
+  /* One width declaration, not two. A second `width` later in the same rule
+     with a different custom-property fallback is the kind of duplication that
+     reads as intentional and behaves differently under `contain: layout`. */
+  width: var(--sidebar-drag-width, var(--sidebar-width));
+  flex: 0 0 var(--sidebar-drag-width, var(--sidebar-width));
   display: flex;
   flex-direction: column;
   background: var(--sidebar);
@@ -246,11 +269,61 @@ svg {
   /* The single left edge for every row in this column. Declared here so the
      header and the button row below it read the same number. */
   --rail-inset: 12px;
-  -webkit-app-region: drag;
-  /* `contain` keeps a width animation from re-laying-out the conversation
-     column while the sidebar opens and closes. */
-  contain: layout paint;
+  /* The header strip is the window's drag area, not the whole column. Marking
+     the entire sidebar `drag` made every button inside it unclickable on
+     Windows: the OS routes mouse events in a drag region to the window
+     manager, and a child only gets them back if it opts out with `no-drag`.
+     The `no-drag` declarations scattered through this file were patches for
+     that, and the ones that were never added — the new-chat button, session
+     rows, the search field — simply did not respond. The region now covers
+     the brand row only, so the rest of the column behaves like a normal
+     document. */
+  -webkit-app-region: no-drag;
   transition: width 180ms ease, flex-basis 180ms ease, padding 180ms ease;
+  position: relative;
+}
+
+/* The one part of the sidebar that drags the window: the brand row, which is
+   empty space beside the logo. Its buttons opt back out in
+   `.sidebar-head-actions`. */
+.sidebar-head {
+  -webkit-app-region: drag;
+}
+
+/* A 5 px strip on the right edge. It is invisible until hovered or focused so
+   it does not add a visible line to the column; `.resizing` keeps it visible
+   for the whole drag, when the pointer is often off the strip itself. */
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 3;
+  background: transparent;
+  -webkit-app-region: no-drag;
+  transition: background var(--fast) var(--ease);
+}
+
+.sidebar-resizer:hover,
+.sidebar-resizer:focus-visible,
+.sidebar-resizer.resizing {
+  background: var(--accent);
+  outline: none;
+}
+
+/* While dragging, the pointer is captured by the strip, so the cursor has to
+   be forced on the whole document or it flickers back to the text cursor. */
+body.resizing-sidebar,
+body.resizing-sidebar * {
+  cursor: col-resize !important;
+  user-select: none;
+}
+
+/* A width animation during a drag would lag one frame behind the pointer. */
+body.resizing-sidebar .sidebar {
+  transition: none;
 }
 
 .sidebar button,
@@ -270,6 +343,9 @@ svg {
   border-right: 0;
   overflow: hidden;
   pointer-events: none;
+  /* A drag sets `--sidebar-drag-width` on the element; folding while that is
+     still set must win, or the collapsed rail stays at the dragged width. */
+  --sidebar-drag-width: 0px !important;
 }
 
 /* 侧栏的一条对齐线：logo 的左边距和上边距是同一个数。
@@ -1694,6 +1770,76 @@ svg {
   }
 }
 
+/* ---------- turn progress line ---------- */
+
+/* A live line at the bottom of the transcript while a turn runs.
+
+   The status dot in the top bar already pulsed, but it is 8 px in the far
+   corner: during a long tool call there was nothing in the conversation to
+   look at, so the wait felt like a hang. This line sits where the answer will
+   appear and changes every second — elapsed time, what the turn is doing, how
+   many tool calls have finished, and how much text has streamed. */
+.turn-progress {
+  max-width: var(--column-width);
+  margin: 0 auto 22px;
+  padding: 0 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--sans);
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+  min-height: 20px;
+}
+
+.turn-progress[hidden] {
+  display: none;
+}
+
+/* A ring rather than a dot: rotation reads as "still working" at a glance,
+   where opacity pulsing is ambiguous with a disabled control. */
+.turn-progress-spinner {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+  border-top-color: var(--accent);
+  animation: turn-spin 800ms linear infinite;
+}
+
+@keyframes turn-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* The counters are reference, not prose: mono keeps them from reflowing the
+   sentence as the digits change width. */
+.turn-progress-meta {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.turn-progress-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Reduced motion stops the ring; the numbers still update once a second, so
+   the line remains a progress readout without any animation. */
+:root[data-motion="reduced"] .turn-progress-spinner {
+  border-top-color: var(--border-strong);
+  border-left-color: var(--accent);
+  animation: none;
+}
+
 .icon-button {
   position: relative;
   display: grid;
@@ -1721,7 +1867,11 @@ svg {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 32px 0 16px;
+  /* A side gutter on the scroll container itself, so the blocks inside are
+     centred against the space that exists rather than the space they wish
+     existed. Without it a narrow window had `margin: 0 auto` collapse to zero
+     and the conversation hugged the window edge. */
+  padding: 32px 16px 16px;
   min-height: 0;
 }
 
@@ -1792,8 +1942,19 @@ mark.find-hit.current {
   --reading-width: 980px;
 }
 
+/* `--reading-width` is the user's preference; `--column-width` is that
+   preference bounded by the space that actually exists. Every block that
+   centred itself on the reading width uses the bounded one, so a 980 px
+   preference on a 700 px window becomes a 700 px column with symmetric
+   gutters instead of a left-hugging wall of text. `100vw` is the outer bound
+   because the root cannot see the sidebar; `.transcript` narrows it further
+   through its own padding. */
+:root {
+  --column-width: min(var(--reading-width), calc(100vw - 120px));
+}
+
 .turn {
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 0 auto 22px;
   padding: 0 28px;
 }
@@ -1838,7 +1999,7 @@ mark.find-hit.current {
   display: flex;
   align-items: center;
   gap: 12px;
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 4px auto 24px;
   padding: 0 28px;
   font-size: var(--text-sm);
@@ -1855,15 +2016,29 @@ mark.find-hit.current {
   white-space: nowrap;
 }
 
-/* Rewind is a quiet action: visible on hover, never competing with the text. */
+/* Rewind is a quiet action: visible on hover, never competing with the text.
+   The turn is a flex row — the action on the left, the bubble on the right.
+   The button used to be absolutely positioned inside the turn at
+   `right: 28px`, which put it squarely on top of the bubble it belongs to.
+   A row cannot overlap its own children at any bubble width, so the button
+   never covers the message no matter how long it is. */
 .turn.user {
-  position: relative;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .rewind-button {
-  position: absolute;
-  top: 2px;
-  right: 28px;
+  /* `order: -1` puts the action before the bubble so it sits in the empty
+     space on the left. Without it the button — which `attachRewind` appends
+     after the bubble — became the last flex item and `justify-content:
+     flex-end` pushed it hard right, so a turn with a rewind button had a
+     bubble that stopped short of the right edge while a turn without one
+     reached it. Two consecutive messages then looked ragged. */
+  order: -1;
+  flex: 0 0 auto;
+  margin-top: 6px;
   padding: 2px 7px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
@@ -1874,16 +2049,22 @@ mark.find-hit.current {
   transition: opacity 120ms ease;
 }
 
+/* The bubble keeps its own float out of the way: the flex row owns the
+   alignment now, and a float inside a flex item does nothing useful. */
+.turn.user .user-bubble {
+  float: none;
+  clear: none;
+  margin-left: auto;
+}
+
 .turn.user:hover .rewind-button,
 .rewind-button:focus-visible {
   opacity: 1;
 }
 
-.turn.user::after {
-  content: "";
-  display: block;
-  clear: both;
-}
+/* The clearfix that used to live here existed for the floated bubble. The
+   turn is a flex row now, so the pseudo-element became a third flex item that
+   pushed the bubble sideways and made consecutive user turns overlap. */
 
 .turn.assistant .markdown {
   overflow-wrap: anywhere;
@@ -2035,7 +2216,7 @@ mark.find-hit.current {
    groups a build's steps. The block is a list of actions, not a second
    transcript, so it sits at a lower contrast than the prose. */
 .tool-group {
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 2px auto 18px;
   padding: 0 28px;
   display: flex;
@@ -2148,16 +2329,34 @@ mark.find-hit.current {
 .tool-expand {
   flex: 0 0 auto;
   margin-left: auto;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-  padding: 1px 6px;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
   border-radius: var(--radius-sm);
-  opacity: 0;
-  transition: opacity 120ms ease;
+  color: var(--text-faint);
+  /* Visible at rest, faint: the row should say "there is more here" without
+     being hovered, which is what the reference implementation does. Hover and
+     keyboard focus bring it to full contrast. */
+  opacity: 0.45;
+  transition: opacity 120ms ease, transform 160ms var(--ease);
+}
+
+/* A closed row turns its chevron a quarter turn to point right, the way a
+   disclosure triangle does; opening rotates it back down. */
+.tool-expand svg {
+  width: 12px;
+  height: 12px;
+  transform: rotate(-90deg);
+}
+
+.tool-row.open .tool-expand svg {
+  transform: none;
 }
 
 .tool-row:hover .tool-expand,
-.tool-row.open .tool-expand {
+.tool-row.open .tool-expand,
+.tool-expand:focus-visible {
   opacity: 1;
 }
 
@@ -2186,11 +2385,9 @@ mark.find-hit.current {
 .tool-output.entering {
   opacity: 0;
 }
-  border-left: 1px solid var(--border);
-}
 
 .thinking {
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 0 auto 10px;
   padding: 0 28px;
   font-size: var(--text-sm);
@@ -2240,7 +2437,7 @@ mark.find-hit.current {
 }
 
 .plan {
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 0 auto 18px;
   padding: 0 28px;
 }
@@ -2301,7 +2498,7 @@ mark.find-hit.current {
 }
 
 .notice {
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 0 auto 12px;
   padding: 0 28px;
   font-size: var(--text-sm);
@@ -2599,7 +2796,7 @@ mark.find-hit.current {
 }
 
 .pending-permission {
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 0 auto 10px;
   border: 1px solid var(--accent);
   background: var(--accent-soft);
@@ -2681,7 +2878,7 @@ mark.find-hit.current {
 
 .composer {
   position: relative;
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -2744,6 +2941,142 @@ mark.find-hit.current {
 
 .composer-bar .controls {
   gap: 5px;
+}
+
+/* The bottom row, Claude's shape: "+" and the mode on the left, the model,
+   its window and the reasoning level on the right. */
+.composer-bar .controls-right {
+  margin-left: auto;
+}
+
+.plus-control {
+  position: relative;
+}
+
+.plus-button {
+  color: var(--text-secondary);
+}
+
+.plus-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  width: 230px;
+  padding: 4px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-popover);
+  z-index: 20;
+  animation: slide-up 120ms ease-out;
+}
+
+.plus-menu[hidden] {
+  display: none;
+}
+
+.plus-menu button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.plus-menu button:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.plus-menu button svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  opacity: 0.75;
+}
+
+/* The mode is a label, not a segmented rail: six modes never fit, and the
+   menu it opens is the whole list. Reads as plain text until hovered, the way
+   a status line does — it is a setting you glance at, not a button you press
+   often. */
+.mode-control {
+  position: relative;
+}
+
+.mode-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.mode-picker:hover,
+.mode-picker[aria-expanded="true"] {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.mode-picker svg {
+  width: 11px;
+  height: 11px;
+  opacity: 0.6;
+}
+
+/* The context chip: the window size next to the model, the fill in the
+   popover. A percentage alone was unreadable — 17% of what? */
+.context-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 7px;
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.context-chip:hover,
+.context-chip[aria-expanded="true"] {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.context-pct {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.effort-picker {
+  font-family: var(--sans);
+  text-transform: capitalize;
+}
+
+.effort-hint {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  text-transform: none;
+}
+
+.effort-fixed {
+  padding: 7px 10px;
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+.effort-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 #input {
@@ -2840,11 +3173,15 @@ mark.find-hit.current {
   vertical-align: 1px;
 }
 
+/* The composer is the positioning context and the box is at the bottom of
+   the window, so `bottom: 100%` put the menu above the top edge — it existed
+   in the DOM with 15 rows and was never on screen. Anchored below the input
+   row instead, it opens upward from the line being typed into. */
 .command-menu {
   position: absolute;
   bottom: calc(100% + 6px);
-  left: 0;
-  right: 0;
+  left: 10px;
+  right: 10px;
   max-height: 240px;
   overflow-y: auto;
   background: var(--surface-raised);
@@ -2867,6 +3204,18 @@ mark.find-hit.current {
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The argument a built-in takes, right-aligned so the rows read as a table.
+   A markdown command has no column here: it inserts its own name and the
+   arguments are free text. */
+.command-arg {
+  margin-left: auto;
+  padding-left: 10px;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
   white-space: nowrap;
 }
 
@@ -3230,7 +3579,7 @@ mark.find-hit.current {
 /* ---------- sub-agent group ---------- */
 
 .subagent {
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 2px auto 10px;
   padding: 8px 12px 9px 14px;
   border-left: 2px solid var(--border-strong);
@@ -3376,7 +3725,7 @@ mark.find-hit.current {
 
 /* A result that arrived on its own, after the turn that started it. */
 .background-report {
-  max-width: var(--reading-width);
+  max-width: var(--column-width);
   margin: 2px auto 14px;
   padding: 12px 14px;
   border: 1px solid var(--border);
@@ -3771,17 +4120,8 @@ mark.find-hit.current {
 }
 
 /* Auto mode with isolation off: a warning ring, so the state is visible. */
-.segmented button.unsandboxed {
+.mode-option.unsandboxed {
   box-shadow: inset 0 0 0 1px var(--warn);
-  color: var(--warn);
-}
-
-.segmented button[data-mode="plan"].active {
-  color: var(--accent-text);
-}
-
-.segmented button[data-mode="auto"].active {
-  color: var(--success);
 }
 
 .segmented button[data-effort="high"].active {
@@ -3827,6 +4167,78 @@ mark.find-hit.current {
 
 .chip-key {
   font-family: var(--sans);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.mode-control {
+  position: relative;
+}
+
+.mode-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  width: 268px;
+  padding: 4px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-popover);
+  z-index: 20;
+  animation: slide-up 120ms ease-out;
+}
+
+.mode-menu[hidden] {
+  display: none;
+}
+
+.mode-option {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+}
+
+.mode-option:hover {
+  background: var(--surface-hover);
+}
+
+.mode-option.active {
+  background: var(--accent-soft);
+}
+
+.mode-option-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.mode-option-label {
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.mode-option.active .mode-option-label {
+  color: var(--accent-text);
+}
+
+.mode-option-desc {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+/* A neutral badge, not a coloured one: "recommended" is advice, and the
+   accent is already spoken for by the selected row. */
+.mode-badge {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   font-size: var(--text-xs);
   color: var(--text-faint);
 }
@@ -4002,7 +4414,7 @@ mark.find-hit.current {
   top: -6px;
   transform: translateY(-100%);
   z-index: 30;
-  width: 240px;
+  width: 268px;
   padding: 12px 14px;
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
@@ -4022,10 +4434,111 @@ mark.find-hit.current {
 }
 
 .usage-row.total {
-  margin-top: 6px;
+  margin-top: 8px;
   padding-top: 8px;
   border-top: 1px solid var(--border);
   color: var(--text);
+}
+
+.usage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 7px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.usage-head-value {
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* One bar, sliced by kind. `flex: <tokens>` makes the widths proportional to
+   the counts without any arithmetic in the renderer, and the 2px gap reads as
+   a separator rather than as missing space. */
+.usage-stack {
+  display: flex;
+  gap: 2px;
+  height: 6px;
+  margin-bottom: 10px;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.usage-slice {
+  min-width: 2px;
+  border-radius: 1px;
+  transition: flex-grow 220ms ease;
+}
+
+.usage-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.usage-part {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.usage-swatch {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.usage-part-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-part-tokens,
+.usage-part-pct {
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-part-pct {
+  min-width: 42px;
+  text-align: right;
+}
+
+.usage-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
+.usage-foot-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: var(--text-sm);
+}
+
+.usage-foot-item .usage-value {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
 }
 
 .usage-value {

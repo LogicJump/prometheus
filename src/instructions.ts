@@ -22,7 +22,10 @@ import { homedir } from "node:os";
 import { globToRegExp } from "./tools/fsUtil.ts";
 
 const FILE_NAMES = ["PROMETHEUS.md", "AGENTS.md", "CLAUDE.md"];
-const CONFIG_HOME = join(homedir(), ".prometheus");
+// Same override as `config.ts`: a test suite has to be able to point the whole
+// agent at a temp directory, or its results depend on the developer's own
+// `~/.prometheus`.
+const CONFIG_HOME = process.env.PROMETHEUS_HOME?.trim() || join(homedir(), ".prometheus");
 const MAX_IMPORT_DEPTH = 4;
 
 export interface Rule {

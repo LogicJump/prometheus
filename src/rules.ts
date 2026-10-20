@@ -154,11 +154,22 @@ export function matchRuleAgainst(
 ): ApprovalRule | null {
   for (const rule of rules) {
     if (rule.tool !== "*" && rule.tool !== toolName) continue;
+    // A rule with no `match` covers one of two things. For a tool whose
+    // argument is a name (a path, an MCP server prefix) it is a deliberate
+    // whole-tool grant. For a shell it can only have come from an older
+    // "Always allow" that was stored without narrowing — and reading it as
+    // "every command" is what let one approval authorize `rm -rf build`.
+    // Such a rule matches nothing; the user has to approve once more, which
+    // is the narrower mistake.
+    if (!rule.match) {
+      if (COMMAND_TOOLS.has(toolName)) continue;
+      return rule;
+    }
     const candidate = argument ?? summary;
-    if (!globMatch(rule.match ?? "", candidate)) {
+    if (!globMatch(rule.match, candidate)) {
       // A path rule written as `src/**` should also match `src/a/b.ts` when
       // the tool reports an absolute path in the summary.
-      if (!argument || !globMatch(rule.match ?? "", summary)) continue;
+      if (!argument || !globMatch(rule.match, summary)) continue;
     }
     return rule;
   }
@@ -172,6 +183,26 @@ export type RememberChoice = "always-tool" | "always-detail";
  * path; a shell command remembers the command line, never a blanket "all
  * commands".
  */
+/**
+ * Tools whose argument is arbitrary code rather than a name.
+ *
+ * "Always allow this tool" is a reasonable statement about `write_file` (the
+ * path still has to be inside the workspace) and an unreasonable one about a
+ * shell: the arguments *are* the program. A grant for one of these is always
+ * narrowed to the exact call, whatever scope the user picked.
+ */
+const COMMAND_TOOLS = new Set(["bash"]);
+
+/**
+ * Turn an "always allow" answer into a rule.
+ *
+ * A file tool remembers the exact path; a shell command remembers the command
+ * line, never a blanket "all commands". The old code returned an unmatched
+ * whole-tool rule for `always-tool`, and `matchRuleAgainst` reads a missing
+ * match as "any detail" — so one click on "Always allow" in front of
+ * `bash: npm test` authorized every later command in that workspace, and the
+ * audit log recorded `rm -rf build` as "allowed by rule".
+ */
 export function ruleFromChoice(toolName: string, detail: string, scope: RuleScope, cwd: string, choice: string): ApprovalRule {
   // `detail` is what the rule is narrowed to. An empty one means the user
   // chose the whole tool, so the note carries the name alone instead of a
@@ -183,6 +214,7 @@ export function ruleFromChoice(toolName: string, detail: string, scope: RuleScop
     ...(scope === "project" ? { cwd } : {}),
     note: detail ? `${toolName}: ${detail.slice(0, 80)}` : `${toolName}: every call`,
   };
-  if (choice === "always-tool" || !detail) return addRule(rule);
-  return addRule({ ...rule, match: detail.split("\n")[0].slice(0, 200) });
+  const wholeTool = choice === "always-tool" || !detail;
+  if (!wholeTool) return addRule({ ...rule, match: detail.split("\n")[0].slice(0, 200) });
+  return addRule(rule);
 }

@@ -266,6 +266,12 @@ function applyUiPreference(key, value) {
       state.uiScale = Number(value);
       document.documentElement.style.setProperty("--ui-scale", String(value));
       localStorage.setItem("prometheus.uiScale", String(value));
+      // The sidebar width is stored unscaled, so zooming has to re-apply it:
+      // otherwise a resized column would shrink relative to the rest of the UI
+      // on every zoom step. Settings and the shell are separate modules, so
+      // this goes through the same event bus every other cross-module UI
+      // change uses.
+      window.dispatchEvent(new CustomEvent("prometheus:ui-scale", { detail: Number(value) }));
       break;
     case "transcriptWidth":
       document.documentElement.dataset.width = value;
@@ -779,10 +785,16 @@ function buildBehaviorPage() {
         control: sSelect({
           id: "setting-mode",
           value: settings.mode ?? "ask",
+          // Every mode the runtime implements. The composer's menu is the
+          // primary switch, but a settings dialog that offered three of six
+          // was the reason the other three looked unimplemented.
           options: [
             { value: "ask", label: t.modeAsk },
             { value: "auto", label: t.modeAuto },
+            { value: "acceptEdits", label: t.modeAcceptEdits },
             { value: "plan", label: t.modePlan },
+            { value: "dontAsk", label: t.modeDontAsk },
+            { value: "bypassPermissions", label: t.modeBypass },
           ],
           onChange: (value) => applyConfig({ mode: value }),
         }),
@@ -794,11 +806,14 @@ function buildBehaviorPage() {
         control: sSelect({
           id: "setting-effort",
           value: settings.effort ?? "auto",
+          // The levels are per model; the settings pane uses the same list the
+          // composer does, falling back to the common three before the
+          // catalogue has arrived.
           options: [
             { value: "auto", label: t.effortAuto },
-            { value: "low", label: t.effortLow },
-            { value: "medium", label: t.effortMedium },
-            { value: "high", label: t.effortHigh },
+            ...(state.effortChoices?.levels?.length ? state.effortChoices.levels : ["low", "medium", "high"]).map(
+              (level) => ({ value: level, label: level[0].toUpperCase() + level.slice(1) }),
+            ),
           ],
           onChange: (value) => applyConfig({ effort: value }),
         }),
@@ -868,15 +883,31 @@ function buildBehaviorPage() {
         }),
       }),
       sRow({
+        id: "setting-sandbox-fail",
+        label: s.sandboxFail,
+        desc: s.sandboxFailDesc,
+        control: sSelect({
+          id: "setting-sandbox-fail",
+          value: settings.sandboxFailIfUnavailable === true ? "on" : "off",
+          options: [
+            { value: "off", label: s.sandboxFailOff },
+            { value: "on", label: s.sandboxFailOn },
+          ],
+          onChange: (value) => applyConfig({ sandboxFailIfUnavailable: value === "on" }),
+        }),
+      }),
+      sRow({
         id: "setting-network",
         label: s.network,
         desc: s.networkDesc,
         control: sSelect({
           id: "setting-network",
-          value: ["off", "proxy", "open"].includes(settings.networkPolicy) ? settings.networkPolicy : "off",
+          // Two options, because there are two behaviours. "Proxy only" was
+          // offered and then silently rewritten to "off" at load time, so
+          // choosing it changed nothing and the setting lied.
+          value: settings.networkPolicy === "open" ? "open" : "off",
           options: [
             { value: "off", label: s.networkOff },
-            { value: "proxy", label: s.networkProxy },
             { value: "open", label: s.networkOpen },
           ],
           onChange: (value) => applyConfig({ networkPolicy: value }),

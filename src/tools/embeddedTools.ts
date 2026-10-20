@@ -379,7 +379,20 @@ const serialTool: Tool = {
   name: "embed_serial",
   description:
     "Read the board's serial console for a bounded time and return parsed log lines with timestamps, levels and tags. Use it to see whether the firmware booted, to catch a panic, or to wait for a readiness message. The read always stops: on the timeout, on a matching pattern, or at a line cap. Defaults to the board selected in the Board pane when omitted.",
+  // Read-only, except for one argument. The label keeps a plain log tail free
+  // of prompts (plan mode, ask-mode reads); `write` sends bytes to hardware,
+  // which is why the tool also declares `mutation` — the permission layer then
+  // stops treating the call as a read when that argument is present.
   readonly: true,
+  /**
+   * The one argument that makes this call a write.
+   *
+   * `readonly` is a static property of the tool, but this tool's danger is an
+   * argument: reading the console is safe, sending bytes to a board is not.
+   * The permission layer asks `mutation` when it is present, so `write` is
+   * gated by the mode and never runs in plan mode.
+   */
+  mutation: (input) => (typeof input.write === "string" && input.write !== "" ? `serial write: ${String(input.write).slice(0, 40)}` : null),
   parameters: {
     type: "object",
     properties: {

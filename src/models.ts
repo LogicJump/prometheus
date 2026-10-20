@@ -17,6 +17,23 @@ export interface ModelInfo {
   supportsTools: boolean;
   supportsVision: boolean;
   supportsReasoning: boolean;
+  /**
+   * The reasoning levels this model accepts, in the endpoint's own spelling,
+   * low to high.
+   *
+   * Advertised by OpenAI-compatible gateways as `reasoning_efforts`, and the
+   * reason a fixed four-value enum cannot work: one model offers
+   * `low/high/max`, another `high/xhigh`, a third only `medium`. Sending a
+   * level the model does not list is a 400 on a strict gateway and silently
+   * ignored on a lenient one, so the picker is built from this list.
+   */
+  reasoningEfforts?: string[];
+  /** The level to send when the user chose "auto". */
+  reasoningDefault?: string;
+  /** A model that always reasons at one level and takes no parameter. */
+  reasoningFixed?: string;
+  /** False when the model cannot turn reasoning off at all. */
+  reasoningCanDisable?: boolean;
 }
 
 export interface ModelCatalog {
@@ -44,14 +61,48 @@ interface RawModel {
   supports_reasoning?: boolean;
   capabilities?: { tool_calls?: boolean; vision?: boolean; reasoning?: boolean; function_call?: boolean };
   abilities?: { functionCall?: boolean; function_call?: boolean; vision?: boolean; reasoning?: boolean };
+  /** OpenAI-compatible gateways that describe their reasoning levels. */
+  reasoning_efforts?: unknown;
+  reasoning_default_effort?: unknown;
+  reasoning_fixed_effort?: unknown;
+  reasoning_can_disable?: unknown;
+}
+
+/**
+ * The reasoning levels a model advertises, normalised.
+ *
+ * Order is the endpoint's, which is low to high for every gateway seen so far;
+ * re-sorting alphabetically would put `xhigh` before `high`. An entry that is
+ * not a non-empty string is dropped rather than shown as a broken row.
+ */
+function reasoningEfforts(raw: RawModel): string[] | undefined {
+  if (!Array.isArray(raw.reasoning_efforts)) return undefined;
+  const levels = raw.reasoning_efforts
+    .filter((level): level is string => typeof level === "string" && level.trim().length > 0)
+    .map((level) => level.trim());
+  // Duplicates would produce two menu rows with the same label.
+  const unique = [...new Set(levels)];
+  return unique.length > 0 ? unique : undefined;
 }
 
 type CacheFile = Record<string, { fetchedAt: string; models: ModelInfo[] }>;
 
+/**
+ * Bump when `ModelInfo` gains a field that comes from the endpoint.
+ *
+ * The cache otherwise keeps a catalogue parsed by an older build for up to
+ * `CACHE_TTL_MS`, so a new field (`reasoningEfforts`) stays missing and the
+ * feature looks unimplemented until the hour runs out. A version mismatch
+ * re-reads the endpoint once.
+ */
+const CACHE_VERSION = 2;
+
 function readCache(): CacheFile {
   try {
     if (!existsSync(CACHE_FILE)) return {};
-    return JSON.parse(readFileSync(CACHE_FILE, "utf8")) as CacheFile;
+    const parsed = JSON.parse(readFileSync(CACHE_FILE, "utf8")) as CacheFile & { version?: number };
+    if (parsed.version !== CACHE_VERSION) return {};
+    return parsed;
   } catch {
     return {};
   }
@@ -62,7 +113,7 @@ function writeCache(key: string, models: ModelInfo[]): void {
     mkdirSync(CONFIG_HOME, { recursive: true });
     const cache = readCache();
     cache[key] = { fetchedAt: new Date().toISOString(), models };
-    writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2), "utf8");
+    writeFileSync(CACHE_FILE, JSON.stringify({ version: CACHE_VERSION, ...cache }, null, 2), "utf8");
   } catch {
     /* cache is best-effort */
   }
@@ -73,6 +124,14 @@ function normalize(raw: RawModel): ModelInfo | null {
   if (!id) return null;
   const explicitTools =
     raw.supports_tool_calls ?? raw.capabilities?.tool_calls ?? raw.capabilities?.function_call ?? raw.abilities?.functionCall ?? raw.abilities?.function_call;
+  const efforts = reasoningEfforts(raw);
+  const fixed = typeof raw.reasoning_fixed_effort === "string" ? raw.reasoning_fixed_effort.trim() : "";
+  const byDefault = typeof raw.reasoning_default_effort === "string" ? raw.reasoning_default_effort.trim() : "";
+  // A default that is not in the advertised list would make "auto" send a
+  // level the model does not accept; the highest advertised level is the
+  // honest fallback, since that is what "auto" means when a gateway does not
+  // say.
+  const fallbackDefault = efforts ? efforts[efforts.length - 1] : undefined;
   return {
     id,
     name: raw.name || id,
@@ -80,6 +139,12 @@ function normalize(raw: RawModel): ModelInfo | null {
     supportsTools: explicitTools !== false,
     supportsVision: Boolean(raw.supports_vision ?? raw.capabilities?.vision ?? raw.abilities?.vision),
     supportsReasoning: Boolean(raw.supports_reasoning ?? raw.capabilities?.reasoning ?? raw.abilities?.reasoning),
+    ...(efforts ? { reasoningEfforts: efforts } : {}),
+    ...(efforts && (byDefault || fallbackDefault)
+      ? { reasoningDefault: byDefault && efforts.includes(byDefault) ? byDefault : fallbackDefault }
+      : {}),
+    ...(fixed ? { reasoningFixed: fixed } : {}),
+    ...(typeof raw.reasoning_can_disable === "boolean" ? { reasoningCanDisable: raw.reasoning_can_disable } : {}),
   };
 }
 

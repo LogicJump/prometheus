@@ -109,13 +109,17 @@ test("inline interpreter code that reaches the network is refused when the polic
   }
 });
 
-test("the proxy policy is reported as unimplemented rather than silently treated as off", () => {
+test("the unimplemented proxy policy is gone, and an old config still means off", async () => {
+  const { validNetwork: validNetworkForTest } = await import("../src/config.ts");
+  // A config file that still says `proxy` keeps the behaviour it always had
+  // (off) instead of being rejected, and the settings UI no longer offers a
+  // choice that is silently discarded.
+  assert.equal(validNetworkForTest("proxy"), "off");
+  assert.equal(validNetworkForTest("open"), "open");
+  assert.equal(validNetworkForTest("off"), "off");
+  assert.equal(validNetworkForTest("nonsense"), undefined);
   const root = workspace();
   try {
-    // The refusal names the policy, so the user learns it is not a working switch.
-    const verdict = classifyCommand("curl http://example.com", root, { ...ENFORCE, network: "proxy" });
-    assert.equal(verdict.class, "confirm");
-    assert.match(String(verdict.reason), /proxy/i);
     // "open" means open.
     assert.equal(classifyCommand("curl http://example.com", root, { ...ENFORCE, network: "open" }).class, "allow");
   } finally {

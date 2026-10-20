@@ -10,7 +10,19 @@
  * is still bounded by the sandbox classifier.
  */
 export type PermissionMode = "ask" | "auto" | "plan" | "acceptEdits" | "dontAsk" | "bypassPermissions";
-export type ThinkingEffort = "auto" | "low" | "medium" | "high";
+/**
+ * A reasoning level, in the endpoint's own spelling.
+ *
+ * Deliberately an open string. The four levels this build started with
+ * (`low`/`medium`/`high` plus `auto`) are what OpenAI's first `reasoning_effort`
+ * accepted; gateways now advertise their own sets — `low/high/max`,
+ * `high/xhigh`, `minimal` — per model, and a closed union made every one of
+ * them a type error to send. `"auto"` is the one value that is never sent: it
+ * means "use the model's own default", which `/models` reports.
+ */
+export type ThinkingEffort = string;
+/** The sentinel meaning "do not send a level; let the model choose". */
+export const EFFORT_AUTO = "auto";
 
 /**
  * The board the user is working with, chosen in the Board pane.
@@ -88,7 +100,7 @@ export interface Config {
   /** Command sandbox strength. "enforce" classifies and confines commands. */
   sandbox?: "off" | "enforce";
   /** Network access for commands: off rejects fetchers and injects a dead proxy. */
-  networkPolicy?: "off" | "proxy" | "open";
+  networkPolicy?: "off" | "open";
   /** Model ids tried in order when the active model is unavailable. */
   fallbackModels?: string[];
   /** Board selected in the UI; tools use it as a default when an argument is omitted. */
@@ -244,6 +256,17 @@ export interface Tool {
   parameters: Record<string, unknown>;
   /** Read-only tools never prompt in ask mode and are the only ones allowed in plan mode. */
   readonly: boolean;
+  /**
+   * A per-call escape from `readonly`: the arguments that make this call a
+   * write, or null when it is a plain read.
+   *
+   * `readonly` is a property of the tool, but some tools are only dangerous
+   * for one argument. `embed_serial` tails a console (safe) or sends bytes to
+   * a board (not safe); under a static `readonly: true` the second half ran in
+   * plan mode and without a prompt. The permission layer treats a non-null
+   * answer exactly as it treats `readonly: false`.
+   */
+  mutation?: (input: Record<string, unknown>) => string | null;
   /**
    * Safe to run alongside another call in the same batch.
    *

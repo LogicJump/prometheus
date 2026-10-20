@@ -11,7 +11,7 @@ import { ansi as style } from "./render.ts";
 import { Permissions } from "./permissions.ts";
 import { listSessions, loadSession, newSessionId, saveSession, ForeignSessionWriter, type SessionFile } from "./sessions.ts";
 import { acquireSessionLock, releaseSessionLock, lockConflictMessage } from "./sessionLock.ts";
-import { CONFIG_HOME, ALLOWED_MODELS } from "./config.ts";
+import { CONFIG_HOME, ALLOWED_MODELS, PERMISSION_MODES, validEffort, validMode } from "./config.ts";
 import { existsSync } from "node:fs";
 
 function existsSyncSafe(path: string): boolean {
@@ -34,7 +34,7 @@ const HELP = `${style.bold("Commands")}
   /help                show this help
   /model [name]        show or switch the model
   /models [refresh]    list models advertised by the endpoint
-  /mode [ask|auto|plan] show or switch the permission mode
+  /mode [name]         show or switch the permission mode (ask, auto, acceptEdits, plan, dontAsk, bypassPermissions)
   /effort [auto|low|medium|high] show or switch thinking effort
   /plan                shortcut for /mode plan
   /yolo                shortcut for /mode auto (no confirmation prompts)
@@ -358,9 +358,11 @@ export class Repl {
         await this.listModels(arg === "refresh");
         return;
       case "mode": {
-        const mode = arg as Config["permissionMode"];
-        if (mode !== "ask" && mode !== "auto" && mode !== "plan") {
-          this.ui.info(`mode: ${this.config.permissionMode} (use /mode ask|auto|plan)`);
+        // Every mode the permission layer implements; this accepted three and
+        // told the user the others did not exist.
+        const mode = validMode(arg);
+        if (!mode) {
+          this.ui.info(`mode: ${this.config.permissionMode} (use /mode ${PERMISSION_MODES.join("|")})`);
           return;
         }
         this.config = { ...this.config, permissionMode: mode };
@@ -369,9 +371,14 @@ export class Repl {
         return;
       }
       case "effort": {
-        const level = arg as Config["thinkingEffort"];
-        if (!["auto", "low", "medium", "high"].includes(level)) {
-          this.ui.info(`thinking effort: ${this.config.thinkingEffort} (use /effort auto|low|medium|high)`);
+        // The levels are the model's own, discovered from the endpoint; the
+        // REPL names the ones it knows and accepts anything else the user's
+        // gateway advertises rather than refusing a spelling this build has
+        // never seen.
+        const level = validEffort(arg);
+        if (!level) {
+          const available = this.modelEfforts().join("|");
+          this.ui.info(`thinking effort: ${this.config.thinkingEffort} (use /effort auto|${available})`);
           return;
         }
         this.config = { ...this.config, thinkingEffort: level };
@@ -542,10 +549,17 @@ cost: ${spent === null ? "unknown (model has no price)" : `$${spent.toFixed(4)}`
   }
 
   private catalogSource = "";
+  /** Reasoning levels advertised for the active model, low to high. */
+  private catalogEfforts: string[] = [];
+
+  private modelEfforts(): string[] {
+    return this.catalogEfforts.length > 0 ? this.catalogEfforts : ["low", "medium", "high"];
+  }
 
   private async listModels(refresh: boolean): Promise<void> {
     const catalog = await discoverModels(this.config.baseUrl, this.config.apiKey, { force: refresh });
     this.catalogSource = catalog.source;
+    this.catalogEfforts = catalog.models.find((model) => model.id === this.config.model)?.reasoningEfforts ?? [];
     if (catalog.models.length === 0) {
       this.ui.warn("no models were advertised by the endpoint");
       return;
@@ -556,6 +570,13 @@ cost: ${spent === null ? "unknown (model has no price)" : `$${spent.toFixed(4)}`
         model.contextLength ? `${Math.round(model.contextLength / 1000)}K ctx` : "",
         model.supportsReasoning ? "reasoning" : "",
         model.supportsVision ? "vision" : "",
+        // The levels are the reason a per-model picker is needed; naming them
+        // here is what tells the user that `/effort max` will be accepted.
+        model.reasoningFixed
+          ? `effort ${model.reasoningFixed} (fixed)`
+          : model.reasoningEfforts
+            ? `effort ${model.reasoningEfforts.join("/")}`
+            : "",
       ]
         .filter(Boolean)
         .join(" · ");

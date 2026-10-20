@@ -222,8 +222,12 @@ test("a UI that can ask scopes the grant to the exact call when asked to", async
   // A command no other test or session has an approval for.
   const command = `round3-scope-${newSessionId()}`;
   const asked = [];
+  const prompted = [];
   const ui = {
-    confirm: async () => "always",
+    confirm: async (question) => {
+      prompted.push(question);
+      return "always";
+    },
     ask: async (question, options) => {
       asked.push({ question, options });
       return "always-detail";
@@ -256,13 +260,15 @@ test("a UI that can ask scopes the grant to the exact call when asked to", async
   try {
     const verdict = await permissions.check(permissionTool, { command });
     assert.equal(verdict.allowed, true);
-    assert.equal(asked.length, 1, "the scope question is actually asked");
-    assert.match(asked[0].question, /remember/i);
+    // A shell is never offered the scope question: "every call of bash" would
+    // be a grant to run anything, so there is only one honest answer and the
+    // dialog is skipped.
+    assert.equal(asked.length, 0, "no scope question for a shell command");
 
     // A second, different command must ask again: the grant was for one call.
     const second = await permissions.check(permissionTool, { command: `${command}-other` });
     assert.equal(second.allowed, true);
-    assert.equal(asked.length, 2, "the unrelated command was not covered by the first approval");
+    assert.equal(prompted.length, 2, "the unrelated command was not covered by the first approval");
 
     // A UI with no ask keeps the narrow default without failing.
     const quiet = new Permissions({ permissionMode: "ask", autoApprove: [] }, { ...ui, ask: undefined });

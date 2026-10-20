@@ -51,8 +51,15 @@ export interface ChatClientOptions {
   apiKey: string;
   model: string;
   maxTokens: number;
-  /** "auto" leaves the endpoint default; low/medium/high are sent as reasoning_effort. */
-  reasoningEffort?: "auto" | "low" | "medium" | "high";
+  /**
+   * The reasoning level sent as `reasoning_effort`.
+   *
+   * Any level the endpoint advertises. `"auto"` (and an absent value) sends
+   * nothing, so the model uses its own default; every other string goes on the
+   * wire exactly as given, because the spellings are the gateway's
+   * (`xhigh`, `max`, `minimal`) and translating them would invent a level.
+   */
+  reasoningEffort?: string;
   /**
    * Echo `reasoning_content` from earlier assistant turns back to the endpoint.
    *

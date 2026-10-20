@@ -71,16 +71,57 @@ function readDir(dir: string, origin: string): Command[] {
   return out;
 }
 
+/**
+ * The commands the app itself implements.
+ *
+ * The composer's `/` menu listed only files from `commands/`, so a user who
+ * had never written one saw an empty menu — the built-ins existed (the
+ * renderer's command palette had them) but were not part of the list the menu
+ * reads. These carry an empty `body`: a name here is not a prompt template,
+ * it is a verb the host handles.
+ */
+export const BUILTIN_COMMANDS: ReadonlyArray<{ name: string; description: string; argumentHint: string }> = [
+  { name: "clear", description: "Start a new conversation", argumentHint: "" },
+  { name: "compact", description: "Compact the conversation, optionally with a focus", argumentHint: "[focus]" },
+  { name: "context", description: "What is filling the context window", argumentHint: "" },
+  { name: "cost", description: "Tokens and dollars spent this session", argumentHint: "" },
+  { name: "effort", description: "Change the reasoning level", argumentHint: "[level]" },
+  { name: "export", description: "Save this conversation as Markdown", argumentHint: "" },
+  { name: "init", description: "Write a PROMETHEUS.md for this project", argumentHint: "" },
+  { name: "memory", description: "Show the memory and instruction files in use", argumentHint: "" },
+  { name: "mode", description: "Change the permission mode", argumentHint: "[mode]" },
+  { name: "model", description: "Switch the model", argumentHint: "[id]" },
+  { name: "models", description: "List the models the endpoint advertises", argumentHint: "[refresh]" },
+  { name: "plan", description: "Plan before changing anything", argumentHint: "" },
+  { name: "rewind", description: "Undo the last turns and restore their files", argumentHint: "[n]" },
+  { name: "sessions", description: "List saved conversations", argumentHint: "" },
+  { name: "usage", description: "Token usage by model and day", argumentHint: "" },
+];
+
 /** Merge global and project commands; a project command overrides its global twin. */
 export function listCommands(cwd: string): Command[] {
   const merged = new Map<string, Command>();
+  // Built-ins first, so a markdown file of the same name replaces one instead
+  // of appearing twice.
+  for (const builtin of BUILTIN_COMMANDS) {
+    merged.set(builtin.name, { ...builtin, body: "", source: "builtin" });
+  }
   for (const command of readDir(join(CONFIG_HOME, "commands"), "global")) merged.set(command.name, command);
   for (const command of readDir(join(cwd, ".prometheus", "commands"), "project")) merged.set(command.name, command);
   return [...merged.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** True for a name that names a built-in rather than a markdown template. */
+export function isBuiltinCommand(name: string): boolean {
+  return BUILTIN_COMMANDS.some((command) => command.name === name.replace(/^\//, "").toLowerCase());
+}
+
 export function findCommand(cwd: string, name: string): Command | null {
-  return listCommands(cwd).find((command) => command.name === name.replace(/^\//, "").toLowerCase()) ?? null;
+  const wanted = name.replace(/^\//, "").toLowerCase();
+  // A built-in is a verb the host handles, not a prompt template; returning it
+  // here would expand to its empty body and send an empty message.
+  if (isBuiltinCommand(wanted)) return null;
+  return listCommands(cwd).find((command) => command.name === wanted) ?? null;
 }
 
 /** Expand a command with the text typed after it. */

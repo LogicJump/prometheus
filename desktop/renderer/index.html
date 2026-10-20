@@ -46,6 +46,17 @@
           <input id="session-search" type="search" spellcheck="false" autocomplete="off" />
         </div>
         <nav class="session-list" id="session-list" aria-label="Sessions"></nav>
+        <!-- Drag handle on the sidebar's right edge. It is a focusable
+             separator so the width can also be changed with the keyboard
+             (arrow keys), not only with a mouse. -->
+        <div
+          class="sidebar-resizer"
+          id="sidebar-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          tabindex="0"
+        ></div>
       </aside>
 
       <!-- Main column -->
@@ -239,30 +250,36 @@
                 </div>
                 <div class="composer-bar">
                   <div class="controls">
-                    <div class="segmented" id="mode-control" role="radiogroup" aria-label="Permission mode">
-                      <button role="radio" data-mode="ask" class="active" data-i18n="modeAsk">Ask</button>
-                      <button role="radio" data-mode="auto" data-i18n="modeAuto">Auto</button>
-                      <button role="radio" data-mode="plan" data-i18n="modePlan">Plan</button>
-                    </div>
-                    <div class="model-control" id="model-control">
-                      <button class="chip-button model-picker" id="model-picker" aria-haspopup="listbox" aria-expanded="false">
-                        <span id="model-label" data-i18n="loadingModels">loading models…</span>
-                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                    <!-- The "+" is the one place things are added to a turn:
+                         files, a folder, a slash command. The permission mode
+                         lives here too, the way it does in Claude: it is a
+                         setting for the turn, not something steered with every
+                         message, and six modes never fit a rail. -->
+                    <div class="plus-control" id="plus-control">
+                      <button class="icon-button small plus-button" id="plus-button" aria-haspopup="menu" aria-expanded="false" data-i18n-title="plusMenuTitle">
+                        <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
                       </button>
-                      <div class="model-menu" id="model-menu" role="listbox" hidden></div>
-                    </div>
-                    <div class="effort-control" id="effort-control">
-                      <button class="chip-button" id="effort-picker" aria-haspopup="menu" aria-expanded="false">
-                        <span class="chip-key" data-i18n="effortLabel">Thinking</span>
-                        <span id="effort-label">Auto</span>
-                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
-                      </button>
-                      <div class="effort-menu" id="effort-menu" role="menu" hidden>
-                        <button role="menuitemradio" data-effort="auto" data-i18n="effortAuto">Auto</button>
-                        <button role="menuitemradio" data-effort="low" data-i18n="effortLow">Low</button>
-                        <button role="menuitemradio" data-effort="medium" data-i18n="effortMedium">Med</button>
-                        <button role="menuitemradio" data-effort="high" data-i18n="effortHigh">High</button>
+                      <div class="plus-menu" id="plus-menu" role="menu" hidden>
+                        <button role="menuitem" id="plus-add-files">
+                          <svg class="icon" aria-hidden="true"><use href="#i-paperclip"></use></svg>
+                          <span data-i18n="plusAddFiles">Add files or photos</span>
+                        </button>
+                        <button role="menuitem" id="plus-add-folder">
+                          <svg class="icon" aria-hidden="true"><use href="#i-folder"></use></svg>
+                          <span data-i18n="plusAddFolder">Add folder</span>
+                        </button>
+                        <button role="menuitem" id="plus-slash">
+                          <svg class="icon" aria-hidden="true"><use href="#i-slash"></use></svg>
+                          <span data-i18n="plusSlash">Slash commands</span>
+                        </button>
                       </div>
+                    </div>
+                    <div class="mode-control" id="mode-control">
+                      <button class="mode-picker" id="mode-picker" aria-haspopup="menu" aria-expanded="false">
+                        <span id="mode-label" data-i18n="modeAsk">Ask</span>
+                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                      </button>
+                      <div class="mode-menu" id="mode-menu" role="menu" hidden></div>
                     </div>
                     <div class="board-control" id="board-control" hidden>
                       <button class="chip-button board-picker" id="board-picker" aria-haspopup="menu" aria-expanded="false">
@@ -273,30 +290,43 @@
                       <div class="board-menu" id="board-menu" role="menu" hidden></div>
                     </div>
                   </div>
-                  <div class="meter" id="usage-meter" tabindex="0" role="button" aria-haspopup="dialog" aria-expanded="false" data-i18n-title="usageTitle">
-                    <span id="context-label">0%</span>
-                    <div class="meter-track"><div class="meter-fill" id="context-fill"></div></div>
-                    <span class="meter-sep"></span>
-                    <span id="usage-label">0 tok</span>
+                  <div class="controls controls-right">
+                    <div class="model-control" id="model-control">
+                      <button class="chip-button model-picker" id="model-picker" aria-haspopup="listbox" aria-expanded="false">
+                        <span id="model-label" data-i18n="loadingModels">loading models…</span>
+                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                      </button>
+                      <div class="model-menu" id="model-menu" role="listbox" hidden></div>
+                    </div>
+                    <div class="effort-control" id="effort-control">
+                      <button class="chip-button effort-picker" id="effort-picker" aria-haspopup="menu" aria-expanded="false">
+                        <span id="effort-label">Auto</span>
+                        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"></use></svg>
+                      </button>
+                      <div class="effort-menu" id="effort-menu" role="menu" hidden></div>
+                    </div>
+                    <!-- The usage chip sits last: it is the session's running
+                         accounting, not a control for the next message. -->
+                    <button class="context-chip" id="usage-meter" aria-haspopup="dialog" aria-expanded="false" data-i18n-title="usageTitle">
+                      <span id="context-length">—</span>
+                      <span class="context-pct" id="context-label">0%</span>
+                    </button>
                   </div>
                 </div>
-                <div class="usage-popover" id="usage-popover" hidden role="dialog" aria-label="Token usage">
-                  <div class="usage-row">
+                <div class="usage-popover" id="usage-popover" hidden role="dialog" aria-label="Context window">
+                  <div class="usage-head">
                     <span data-i18n="usageContext">Context window</span>
-                    <span class="usage-value" id="usage-context-value">—</span>
+                    <span class="usage-head-value" id="usage-context-value">—</span>
                   </div>
-                  <div class="usage-track"><div class="usage-fill" id="usage-context-fill"></div></div>
-                  <div class="usage-row">
-                    <span data-i18n="usageInput">Input</span>
-                    <span class="usage-value" id="usage-input-value">0</span>
-                  </div>
-                  <div class="usage-row">
-                    <span data-i18n="usageCached">Cached</span>
-                    <span class="usage-value" id="usage-cached-value">0</span>
-                  </div>
-                  <div class="usage-row">
-                    <span data-i18n="usageOutput">Output</span>
-                    <span class="usage-value" id="usage-output-value">0</span>
+                  <!-- One bar, segmented by kind: the width of each colour is
+                       that part's share of the window, so a glance says which
+                       category is the one worth acting on. -->
+                  <div class="usage-stack" id="usage-stack"></div>
+                  <div class="usage-breakdown" id="usage-breakdown"></div>
+                  <div class="usage-foot">
+                    <span class="usage-foot-item"><span data-i18n="usageInput">Input</span> <span class="usage-value" id="usage-input-value">0</span></span>
+                    <span class="usage-foot-item"><span data-i18n="usageCached">Cached</span> <span class="usage-value" id="usage-cached-value">0</span></span>
+                    <span class="usage-foot-item"><span data-i18n="usageOutput">Output</span> <span class="usage-value" id="usage-output-value">0</span></span>
                   </div>
                   <div class="usage-row total">
                     <span data-i18n="usageTotal">Total this session</span>

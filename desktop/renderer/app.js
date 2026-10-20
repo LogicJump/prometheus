@@ -28,8 +28,6 @@ const modelPicker = $("model-picker");
 const modelMenu = $("model-menu");
 const modelLabel = $("model-label");
 const contextLabel = $("context-label");
-const contextFill = $("context-fill");
-const usageLabel = $("usage-label");
 const pendingPermission = $("pending-permission");
 const pendingQuestion = $("pending-question");
 const sessionList = $("session-list");
@@ -57,6 +55,7 @@ const state = {
   goalRun: null,
   mode: "ask",
   effort: "auto",
+  effortChoices: { levels: [], default: "", fixed: "" },
   model: "",
   models: [],
   modelsSource: "",
@@ -77,6 +76,8 @@ const state = {
   currentThinking: null,
   currentTool: null,
   lastToolNode: null,
+  /** The live "working" line at the bottom of the transcript, while a turn runs. */
+  progress: null,
   pendingPermissionId: null,
   changedFiles: [],
   changes: { files: [], additions: 0, deletions: 0 },
@@ -292,6 +293,110 @@ function addNode(html) {
 
 /* ---------- transcript rendering ---------- */
 
+/**
+ * The line that shows a turn is still alive.
+ *
+ * It lives at the bottom of the transcript rather than in the top bar because
+ * that is where the reader is already looking: during a minute-long tool call
+ * the only thing that changed was an 8 px dot in the corner, which is
+ * indistinguishable from a hang.
+ *
+ * Everything it shows comes from the host's once-a-second heartbeat plus the
+ * text already streaming into the renderer, so there is no new protocol and
+ * nothing here can claim progress that did not happen.
+ */
+function ensureProgress() {
+  if (state.progress?.node?.isConnected) {
+    // A turn that appended content after the line must keep it last, or the
+    // live readout ends up above the answer it describes.
+    transcript.appendChild(state.progress.node);
+    return state.progress;
+  }  const node = document.createElement("div");
+  node.className = "turn-progress";
+  node.innerHTML =
+    `<span class="turn-progress-spinner" aria-hidden="true"></span>` +
+    `<span class="turn-progress-meta"></span>` +
+    `<span class="turn-progress-text"></span>`;
+  transcript.appendChild(node);
+  state.progress = {
+    node,
+    text: node.querySelector(".turn-progress-text"),
+    meta: node.querySelector(".turn-progress-meta"),
+    startedAt: Date.now(),
+    tool: "",
+    retry: 0,
+    outputTokens: 0,
+    chars: 0,
+  };
+  return state.progress;
+}
+
+/** Update the visible half of the progress line; called from several events. */
+function renderProgress() {
+  const progress = state.progress;
+  if (!progress) return;
+  const seconds = Math.max(0, Math.round((Date.now() - progress.startedAt) / 1000));
+  // Minutes read better than 166s for a long tool call.
+  const elapsed = seconds >= 60 ? `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s` : `${seconds}s`;
+  // Output tokens only, and only once the provider has reported some. The
+  // input side is the prompt the user already sent; adding it made the number
+  // jump by six figures on the first heartbeat and read as a runaway bill.
+  // The streamed character count is the pre-usage stand-in because it is the
+  // one figure that is measured rather than estimated.
+  const parts = [elapsed];
+  if (progress.outputTokens > 0) {
+    parts.push(`${formatTokens(progress.outputTokens)} ${t.tokens}`);
+  } else if (progress.chars > 0) {
+    parts.push(`${formatTokens(progress.chars)} ${t.progressChars}`);
+  }
+  progress.meta.textContent = parts.join(" · ");
+
+  // The second half names what is happening. When a tool is running it is the
+  // tool; otherwise the spinner and the growing count already say "working",
+  // and a sentence explaining the gateway's batching is noise between the user
+  // and their answer.
+  progress.text.textContent = progress.tool ? `· ${progress.tool}` : "";
+}
+
+function setProgress(update) {
+  const progress = ensureProgress();
+  if (update.tool !== undefined) progress.tool = String(update.tool ?? "");
+  if (update.retry !== undefined) progress.retry = Number(update.retry) || 0;
+  if (update.outputTokens !== undefined) progress.outputTokens = Number(update.outputTokens) || 0;
+  if (update.chars !== undefined) progress.chars = Number(update.chars) || 0;
+  if (update.startedAt) progress.startedAt = update.startedAt;
+  startProgressTicker();
+  renderProgress();
+}
+
+/** Interval that refreshes the progress clock between host heartbeats. */
+let progressTimer = 0;
+
+function clearProgress() {
+  state.progress?.node?.remove();
+  state.progress = null;
+  if (progressTimer) {
+    clearInterval(progressTimer);
+    progressTimer = 0;
+  }
+}
+
+/**
+ * Tick the clock locally between heartbeats.
+ *
+ * The host's heartbeat is once a second but its arrival is not evenly spaced
+ * (it shares a timer with the rest of the host), so a clock driven only by it
+ * visibly stutters. The elapsed value here is derived from `startedAt`, which
+ * the heartbeat keeps in sync, so the two never disagree.
+ */
+function startProgressTicker() {
+  if (progressTimer) return;
+  progressTimer = setInterval(() => {
+    if (!state.progress) return;
+    renderProgress();
+  }, 250);
+}
+
 function addUserTurn(text, imageCount = 0) {
   const queued = state.busy;
   const images = imageCount > 0 ? `<span class="user-images">${t.imageCount(imageCount)}</span>` : "";
@@ -463,7 +568,12 @@ function addToolRow(name, summary) {
     `<span class="tool-glyph">${icon(toolGlyph(name))}</span>` +
     `<span class="tool-name">${escapeHtml(toolLabel(name))}</span>` +
     `<span class="tool-summary">${escapeHtml(summary || "")}</span>` +
-    `<button class="tool-expand" hidden>${escapeHtml(t.details)}</button>`;
+    // A chevron, not the word "details": it reads as "there is more here" at
+    // a glance and costs no width in a column of many rows. It stays hidden
+    // until there is something to open, so a bare `ls` is still one line. The
+    // icon points down when closed and rotates a quarter turn when open.
+    `<button class="tool-expand" hidden aria-expanded="false" aria-label="${escapeHtml(t.details)}">` +
+    `${icon("chevron-down")}</button>`;
   row.dataset.path = summary || "";
   toolGroup().appendChild(row);
   // The summary of a file tool is its path; clicking opens it in the
@@ -583,12 +693,12 @@ function attachToolOutput(node, name, output) {
   block.append(row, outputNode);
   const button = row.querySelector(".tool-expand");
   button.hidden = expanded;
-  button.textContent = expanded ? t.hide : t.details;
+  button.setAttribute("aria-expanded", String(expanded));
   row.classList.toggle("open", expanded);
   button.addEventListener("click", () => {
     const opening = outputNode.hidden;
     outputNode.hidden = !outputNode.hidden;
-    button.textContent = outputNode.hidden ? t.details : t.hide;
+    button.setAttribute("aria-expanded", String(!outputNode.hidden));
     row.classList.toggle("open", !outputNode.hidden);
     if (!outputNode.hidden) {
       // `hidden` is display:none, so the element cannot be transitioned from
@@ -603,10 +713,18 @@ function attachToolOutput(node, name, output) {
 
 function startThinking() {
   if (state.currentThinking) return;
-  state.currentThinking = addNode(
+  const node = addNode(
     `<div class="thinking streaming"><span class="thinking-label">${escapeHtml(t.thinking)}</span><span class="thinking-text"></span></div>`,
   );
-  state.currentThinkingText = state.currentThinking.querySelector(".thinking-text");
+  // The block is appended, so a model that reasons *between* two paragraphs
+  // would have its reasoning land after the prose it came from — and the next
+  // paragraph would then be appended below the reasoning, splitting one answer
+  // in half. Moving the prose turn under the block keeps the transcript in the
+  // order the model produced it: prose, reasoning, more prose.
+  const current = state.currentAssistant;
+  if (current?.node?.isConnected) node.before(current.node);
+  state.currentThinking = node;
+  state.currentThinkingText = node.querySelector(".thinking-text");
   state.thinkingBuffer = "";
 }
 
@@ -762,6 +880,18 @@ function setBusy(busy) {
   // the finished text is announced again at the end. Marking the region busy
   // suppresses the incremental announcements while streaming.
   transcript.setAttribute("aria-busy", busy ? "true" : "false");
+  // The progress line brackets the turn: it appears when the turn starts and
+  // disappears when it ends, so it is never left behind as a stale "0s".
+  if (busy) {
+    if (!state.progress) {
+      const progress = ensureProgress();
+      progress.startedAt = Date.now();
+      renderProgress();
+      startProgressTicker();
+    }
+  } else {
+    clearProgress();
+  }
   stopButton.hidden = !busy;
   // Enter has always queued a message mid-turn; the button was disabled, so
   // the two ways to send disagreed. The button now queues as well, and says so.
@@ -978,9 +1108,14 @@ function updateCommandMenu() {
     const row = document.createElement("button");
     row.className = `mention-row command-row${index === 0 ? " active" : ""}`;
     row.setAttribute("role", "option");
+    // A built-in runs; a markdown command inserts its name so arguments can be
+    // typed after it. Showing which is which before the click is what keeps
+    // "Enter" from being a guess.
+    const builtin = command.source === "builtin";
     row.innerHTML =
       `<span class="command-name">/${escapeHtml(command.name)}</span>` +
-      `<span class="command-hint">${escapeHtml(command.argumentHint || command.description || "")}</span>`;
+      `<span class="command-hint">${escapeHtml(command.description || command.argumentHint || "")}</span>` +
+      (builtin ? `<span class="command-arg">${escapeHtml(command.argumentHint || "")}</span>` : "");
     row.addEventListener("mousedown", (event) => {
       event.preventDefault();
       applyCommand(command);
@@ -996,9 +1131,17 @@ function closeCommandMenu() {
 }
 
 function applyCommand(command) {
+  closeCommandMenu();
+  // A built-in with no arguments runs on the spot. Inserting "/clear " and
+  // waiting for a second Enter made a one-shot verb feel like a text field.
+  if (command.source === "builtin" && !command.argumentHint) {
+    input.value = "";
+    autoSize();
+    api.send({ cmd: "prompt", text: `/${command.name}` });
+    return;
+  }
   input.value = `/${command.name} `;
   input.setSelectionRange(input.value.length, input.value.length);
-  closeCommandMenu();
   autoSize();
   input.focus();
 }
@@ -1134,10 +1277,7 @@ function formatTokens(n) {
 function updateMeter(context, usage) {
   if (context) {
     state.context = { tokens: context.tokens ?? 0, percent: Math.min(100, Math.round(context.percent ?? 0)) };
-    const percent = state.context.percent;
-    contextLabel.textContent = `${percent}%`;
-    contextFill.style.width = `${percent}%`;
-    contextFill.style.background = percent > 85 ? "var(--danger)" : percent > 60 ? "var(--warn)" : "var(--accent)";
+    contextLabel.textContent = `${state.context.percent}%`;
   }
   if (usage) {
     state.usage = {
@@ -1145,22 +1285,117 @@ function updateMeter(context, usage) {
       outputTokens: usage.outputTokens ?? 0,
       cachedTokens: usage.cachedTokens ?? 0,
     };
-    const total = state.usage.inputTokens + state.usage.outputTokens;
-    usageLabel.textContent = `${formatTokens(total)} ${t.tokens}`;
+    // The bar under the composer used to carry the running spend; the bottom
+    // row now shows the model and its context window instead, and the spend
+    // lives in the popover this chip opens.
   }
   renderUsage();
 }
 
+/**
+ * The model's window next to its name, e.g. "1M" — the figure the popover
+ * explains. Kept to one glance-sized number: the exact window is in the
+ * popover, where there is room for it.
+ */
+function renderContextLength() {
+  const node = $("context-length");
+  if (!node) return;
+  const window = Number(state.contextWindow) || 0;
+  if (!window) {
+    node.textContent = "";
+    return;
+  }
+  node.textContent = window >= 1_000_000 ? `${Math.round(window / 1_000_000)}M` : formatTokens(window);
+}
+
 /** Fill the usage popover from state. Harmless while it is closed. */
 function renderUsage() {
-  const context = state.context ?? { tokens: 0, percent: 0 };
   const usage = state.usage ?? { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
-  $("usage-context-value").textContent = `${formatTokens(context.tokens)} · ${context.percent}%`;
-  $("usage-context-fill").style.width = `${context.percent}%`;
   $("usage-input-value").textContent = formatTokens(usage.inputTokens);
   $("usage-cached-value").textContent = formatTokens(usage.cachedTokens);
   $("usage-output-value").textContent = formatTokens(usage.outputTokens);
   $("usage-total-value").textContent = formatTokens(usage.inputTokens + usage.outputTokens);
+
+  const info = state.contextBreakdown;
+  if (!info) {
+    $("usage-context-value").textContent = "—";
+    $("usage-stack").innerHTML = "";
+    $("usage-breakdown").innerHTML = "";
+    return;
+  }
+
+  // Headline: used / window (percent) — the three facts the chip reduces to
+  // one, spelled out where there is room for all three.
+  $("usage-context-value").textContent =
+    `${formatTokens(info.used)} / ${formatTokens(info.window)} (${info.percent}%)`;
+
+  // A colour per category, in a fixed order so the same slice is the same
+  // colour between sessions. The palette is the app's own four accents plus
+  // neutral greys; it is not a data-viz scheme, because there is one bar and
+  // the labels sit right below it.
+  const COLORS = {
+    messages: "var(--accent)",
+    toolResults: "var(--accent-warm, #c98b4b)",
+    mcpTools: "var(--accent-2, #4b9ac9)",
+    systemTools: "var(--success, #4caf7d)",
+    systemPrompt: "var(--text-faint)",
+    memory: "var(--warn, #c9a24b)",
+    instructions: "var(--accent-3, #9a7bd1)",
+    rules: "var(--text-secondary)",
+  };
+
+  const total = info.window > 0 ? info.window : info.used;
+  const parts = info.parts.filter((part) => part.tokens > 0);
+  const free = Math.max(0, total - info.used);
+  const compactHeadroom = Math.max(0, info.compactAt - info.used);
+
+  const segments = [
+    ...parts.map((part) => ({
+      key: part.key,
+      tokens: part.tokens,
+      color: COLORS[part.key] ?? "var(--text-faint)",
+    })),
+    // The band between "now" and the compaction threshold is still free to
+    // use; past that, compaction starts, so it is drawn as a separate, dimmer
+    // slice rather than pretending the whole window is available.
+    { key: "compactBuffer", tokens: compactHeadroom, color: "var(--border-strong)" },
+    { key: "free", tokens: Math.max(0, free - compactHeadroom), color: "var(--surface-hover)" },
+  ].filter((segment) => segment.tokens > 0);
+
+  $("usage-stack").innerHTML = segments
+    .map(
+      (segment) =>
+        `<span class="usage-slice" style="flex:${segment.tokens};background:${segment.color}" title="${escapeHtml(segment.key)}"></span>`,
+    )
+    .join("");
+
+  const rows = parts
+    .map(
+      (part) =>
+        `<div class="usage-part">` +
+        `<span class="usage-swatch" style="background:${COLORS[part.key] ?? "var(--text-faint)"}"></span>` +
+        `<span class="usage-part-label">${escapeHtml(t.contextPart(part.key))}</span>` +
+        `<span class="usage-part-tokens">${formatTokens(part.tokens)}</span>` +
+        `<span class="usage-part-pct">${((part.tokens / total) * 100).toFixed(1)}%</span>` +
+        `</div>`,
+    )
+    .join("");
+  const freeRow =
+    `<div class="usage-part">` +
+    `<span class="usage-swatch" style="background:var(--surface-hover)"></span>` +
+    `<span class="usage-part-label">${escapeHtml(t.contextFree)}</span>` +
+    `<span class="usage-part-tokens">${formatTokens(Math.max(0, free - compactHeadroom))}</span>` +
+    `<span class="usage-part-pct">${((Math.max(0, free - compactHeadroom) / total) * 100).toFixed(1)}%</span>` +
+    `</div>` +
+    (compactHeadroom > 0
+      ? `<div class="usage-part">` +
+        `<span class="usage-swatch" style="background:var(--border-strong)"></span>` +
+        `<span class="usage-part-label">${escapeHtml(t.contextCompactionBuffer)}</span>` +
+        `<span class="usage-part-tokens">${formatTokens(compactHeadroom)}</span>` +
+        `<span class="usage-part-pct">${((compactHeadroom / total) * 100).toFixed(1)}%</span>` +
+        `</div>`
+      : "");
+  $("usage-breakdown").innerHTML = rows + freeRow;
 }
 
 function setUsagePopover(open) {
@@ -1187,7 +1422,6 @@ $("usage-reset").addEventListener("click", () => {
   // The host owns the counters; a fresh baseline keeps the display honest
   // without pretending the spend never happened.
   state.usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
-  usageLabel.textContent = `0 ${t.tokens}`;
   renderUsage();
   setUsagePopover(false);
 });
@@ -1196,29 +1430,100 @@ document.addEventListener("click", (event) => {
   if (!event.target.closest("#usage-popover") && !event.target.closest("#usage-meter")) setUsagePopover(false);
 });
 
+/**
+ * Every mode the runtime implements, in the order the menu shows them.
+ *
+ * The rail used to carry three of the six, which made the other three
+ * unreachable except through the command palette — a mode nobody can find is
+ * a mode that does not exist. `dontAsk` and `bypassPermissions` sit last
+ * because they are the two that answer without a person.
+ */
+const MODES = ["auto", "ask", "acceptEdits", "plan", "dontAsk", "bypassPermissions"];
+
+function modeCopy(mode) {
+  switch (mode) {
+    case "auto":
+      return { label: t.modeAuto, desc: t.modeAutoDesc };
+    case "acceptEdits":
+      return { label: t.modeAcceptEdits, desc: t.modeAcceptEditsDesc };
+    case "plan":
+      return { label: t.modePlan, desc: t.modePlanDesc };
+    case "dontAsk":
+      return { label: t.modeDontAsk, desc: t.modeDontAskDesc };
+    case "bypassPermissions":
+      return { label: t.modeBypass, desc: t.modeBypassDesc };
+    default:
+      return { label: t.modeAsk, desc: t.modeAskDesc };
+  }
+}
+
+function renderModeMenu() {
+  const menu = $("mode-menu");
+  menu.innerHTML = MODES.map((mode) => {
+    const copy = modeCopy(mode);
+    const active = mode === state.mode;
+    const recommended = mode === "auto" ? `<span class="mode-badge">${escapeHtml(t.modeRecommended)}</span>` : "";
+    const unsafe = mode === "auto" && state.sandbox === "off";
+    return (
+      `<button role="menuitemradio" data-mode="${mode}" aria-checked="${active}"` +
+      ` class="mode-option${active ? " active" : ""}${unsafe ? " unsandboxed" : ""}"` +
+      `${unsafe ? ` title="${escapeHtml(t.sandboxOffBadge)}"` : ""}>` +
+      `<span class="mode-option-head"><span class="mode-option-label">${escapeHtml(copy.label)}</span>${recommended}</span>` +
+      `<span class="mode-option-desc">${escapeHtml(copy.desc)}</span>` +
+      `</button>`
+    );
+  }).join("");
+}
+
 function setMode(mode) {
   state.mode = mode;
-  modeControl.querySelectorAll("button").forEach((button) => {
-    button.classList.toggle("active", button.dataset.mode === mode);
-  });
-  // Make "auto without isolation" visible instead of implicit.
-  const autoButton = modeControl.querySelector('[data-mode="auto"]');
-  if (autoButton) {
-    const unsafe = state.sandbox === "off";
-    autoButton.classList.toggle("unsandboxed", unsafe);
-    autoButton.title = unsafe ? t.sandboxOffBadge : "";
-  }
+  $("mode-label").textContent = modeCopy(mode).label;
+  $("mode-label").removeAttribute("data-i18n");
+  renderModeMenu();
+}
+
+/**
+ * The reasoning levels the active model accepts.
+ *
+ * `auto` is a sentinel — the host sends nothing and the model uses its own
+ * default — and the rest come from the endpoint's `reasoning_efforts`, so the
+ * menu shows `max`/`xhigh` for a model that has them and does not offer a
+ * level the gateway would refuse.
+ */
+function effortLevels() {
+  return state.effortChoices?.levels ?? [];
 }
 
 function setEffort(effort) {
   state.effort = effort;
-  effortControl.querySelectorAll("[data-effort]").forEach((button) => {
-    const active = button.dataset.effort === effort;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-checked", String(active));
-  });
-  const label = effortControl.querySelector(`[data-effort="${effort}"]`);
-  $("effort-label").textContent = label ? label.textContent : t.effortAuto;
+  $("effort-label").textContent = effort === "auto" ? t.effortAuto : effort;
+  renderEffortMenu();
+}
+
+function renderEffortMenu() {
+  const menu = $("effort-menu");
+  const choices = state.effortChoices ?? {};
+  // A model with one fixed level takes no parameter at all; saying so is
+  // clearer than showing a single row the user cannot change.
+  if (choices.fixed && effortLevels().length === 0) {
+    menu.innerHTML =
+      `<div class="effort-fixed">${escapeHtml(t.effortFixed.replace("{level}", choices.fixed))}</div>`;
+    return;
+  }
+  const levels = effortLevels();
+  const list = levels.length > 0 ? levels : ["low", "medium", "high"];
+  menu.innerHTML =
+    [{ level: "auto", label: t.effortAuto }, ...list.map((level) => ({ level, label: level }))]
+      .map((row) => {
+        const active = row.level === state.effort;
+        const hint = row.level === "auto" && choices.default ? `<span class="effort-hint">${escapeHtml(choices.default)}</span>` : "";
+        return (
+          `<button role="menuitemradio" data-effort="${escapeHtml(row.level)}" aria-checked="${active}"` +
+          ` class="${active ? "active" : ""}">` +
+          `<span>${escapeHtml(row.label)}</span>${hint}</button>`
+        );
+      })
+      .join("");
 }
 
 /* ---------- model picker ---------- */
@@ -1238,6 +1543,7 @@ function renderModels(models, current, source, error) {
     // The meter is a share of the model's real context, not a placeholder.
     const active = state.models.find((model) => model.id === current);
     if (active && Number.isFinite(active.contextLength)) state.contextWindow = active.contextLength;
+    renderContextLength();
   } else {
     // Nothing to show: the label must still leave the loading state, or the
     // chip spins forever on a misconfigured endpoint.
@@ -1368,9 +1674,13 @@ function handleEvent(message) {
       if (message.cwd) state.cwd = message.cwd;
       state.locale = message.locale || state.locale;
       applyLocale(state.locale);
+      // Sandbox state first: the mode label marks "auto" when it runs without
+      // isolation, so it has to know before the label is drawn.
+      if (message.sandbox) state.sandbox = message.sandbox;
+      if (message.effortChoices) state.effortChoices = message.effortChoices;
+      if (message.contextBreakdown !== undefined) state.contextBreakdown = message.contextBreakdown;
       setMode(message.mode);
       setEffort(message.effort || "auto");
-      if (message.sandbox) state.sandbox = message.sandbox;
       // Board selection and project kind are cheap, so every state event carries
       // them; the machine scan waits until the pane asks for it.
       if (message.board) {
@@ -1574,8 +1884,22 @@ function handleEvent(message) {
       state.commands = message.commands ?? [];
       break;
 
+    case "context_report": {
+      // `/context` typed in the composer: the same figures the popover shows,
+      // stated in the transcript where the user was already looking.
+      const parts = (message.parts ?? [])
+        .filter((part) => part.tokens > 0)
+        .map((part) => `${t.contextPart(part.key)} ${formatTokens(part.tokens)}`);
+      const used = `${formatTokens(message.used)} / ${formatTokens(message.window)} (${message.percent}%)`;
+      addNotice("dim", `[${used}] ${parts.join(" · ")}`);
+      scrollToBottom();
+      break;
+    }
+
     case "command_expanded":
-      addNotice("dim", `/${message.name}`);
+      // A built-in reports an empty prompt: it ran, it did not expand into
+      // text. Saying "the model was asked" about `/clear` would be a lie.
+      addNotice("dim", message.prompt === "" ? `/${message.name}` : `/${message.name} → ${message.prompt.slice(0, 120)}`);
       break;
 
     case "file":
@@ -1722,6 +2046,9 @@ function handleEvent(message) {
           // the prose. Moving the same element keeps its animation running;
           // recreating it inside the HTML string restarted the blink.
           current.body.appendChild(current.caret);
+          // The character count in the progress line is the visible proof that
+          // text is still arriving, so it is updated on the same frame.
+          if (state.progress) state.progress.chars = current.text.length;
           scrollToBottom();
         });
       }
@@ -1838,13 +2165,16 @@ function handleEvent(message) {
         if (message.summary) summaryEl.textContent = message.summary;
         if (!message.ok) summaryEl.style.color = "var(--danger)";
         setIcon(row.querySelector(".tool-glyph svg"), message.ok ? "check" : "x");
-        // An edit's result is a diff size: make it read like one.
+        // An edit's result is a diff size: make it read like one, with the
+        // file first and the counts after it — "edited types.ts +15 −1" reads
+        // as a sentence, where "+15 −1 types.ts" reads as a table row.
         if (message.ok && (message.name === "edit_file" || message.name === "write_file")) {
           const parts = String(message.summary).match(/\+(\d+)\s+-(\d+)/);
           if (parts) {
+            const name = row.dataset.path || String(message.summary).replace(/\+\d+\s+-\d+/, "").trim();
             summaryEl.innerHTML =
-              `<span class="add">+${parts[1]}</span> <span class="del">−${parts[2]}</span>` +
-              `<span class="tool-path">${escapeHtml(row.dataset.path ?? "")}</span>`;
+              `<span class="tool-path">${escapeHtml(name)}</span> ` +
+              `<span class="add">+${parts[1]}</span> <span class="del">−${parts[2]}</span>`;
           }
         }
         state.currentTool = null;
@@ -2061,6 +2391,15 @@ function handleEvent(message) {
       if (message.retry > 0) parts.push(t.retryCount.replace("{n}", String(message.retry)));
       statusText.hidden = false;
       statusText.textContent = parts.join(" · ");
+      // The same facts, in the transcript where the reader is looking. The
+      // start time is derived from the elapsed value rather than from a local
+      // clock, so the two readouts cannot disagree.
+      setProgress({
+        startedAt: Date.now() - (message.elapsedMs ?? 0),
+        tool: message.tool ?? "",
+        retry: message.retry ?? 0,
+        outputTokens: message.outputTokens ?? 0,
+      });
       break;
     }
 
@@ -2120,6 +2459,9 @@ function handleEvent(message) {
       // plan for this session must build a new one rather than update a node
       // that is no longer in the document.
       planCard = null;
+      // The progress line belonged to the turn that was running in the old
+      // session; leaving it would make the new one look busy.
+      state.progress = null;
       for (const item of message.messages || []) {
         if (item.role === "user") {
           const node = addUserTurn(item.text, item.images ?? 0);
@@ -4218,7 +4560,8 @@ document.addEventListener("keydown", (event) => {
     openWorkbench("files");
   } else if (key === "e") {
     event.preventDefault();
-    const order = ["auto", "low", "medium", "high"];
+    // Cycle through what this model actually accepts, not a fixed four.
+    const order = ["auto", ...(effortLevels().length > 0 ? effortLevels() : ["low", "medium", "high"])];
     const next = order[(order.indexOf(state.effort) + 1) % order.length];
     setEffort(next);
     api.send({ cmd: "setEffort", effort: next });
@@ -4703,29 +5046,120 @@ pendingPermission.querySelectorAll("[data-permission]").forEach((button) => {
   button.addEventListener("click", () => answerPermission(button.dataset.permission));
 });
 
-modeControl.querySelectorAll("button").forEach((button) => {
-  button.addEventListener("click", () => {
-    if (button.dataset.mode === state.mode) return;
-    // Show the choice at once; the host confirms with a state event, and a
-    // rejected mode would be corrected by that same event.
-    setMode(button.dataset.mode);
-    api.send({ cmd: "setMode", mode: button.dataset.mode });
-  });
+// The mode menu is rebuilt on open, so it reads the current labels after a
+// language switch and the current sandbox state after a settings change.
+const modePicker = $("mode-picker");
+const modeMenu = $("mode-menu");
+
+function setModeMenu(open) {
+  if (open) renderModeMenu();
+  modeMenu.hidden = !open;
+  modePicker.setAttribute("aria-expanded", String(open));
+}
+
+modePicker.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setModeMenu(modeMenu.hidden);
 });
 
-effortControl.querySelectorAll("[data-effort]").forEach((button) => {
-  button.addEventListener("click", () => {
-    setEffortMenu(false);
-    if (button.dataset.effort === state.effort) return;
-    setEffort(button.dataset.effort);
-    api.send({ cmd: "setEffort", effort: button.dataset.effort });
-  });
+modeMenu.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-mode]");
+  if (!button) return;
+  setModeMenu(false);
+  if (button.dataset.mode === state.mode) return;
+  // Show the choice at once; the host confirms with a state event, and a
+  // rejected mode would be corrected by that same event.
+  setMode(button.dataset.mode);
+  api.send({ cmd: "setMode", mode: button.dataset.mode });
 });
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#mode-control")) setModeMenu(false);
+});
+
+/* ---------- the "+" menu ---------- */
+
+const plusPicker = $("plus-button");
+const plusMenu = $("plus-menu");
+
+function setPlusMenu(open) {
+  plusMenu.hidden = !open;
+  plusPicker.setAttribute("aria-expanded", String(open));
+}
+
+plusPicker.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setPlusMenu(plusMenu.hidden);
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#plus-control")) setPlusMenu(false);
+});
+
+// Files and photos: the OS dialog, then the same path the drop handler takes,
+// so an image becomes an attachment and anything else becomes a mention chip.
+$("plus-add-files").addEventListener("click", async () => {
+  setPlusMenu(false);
+  const picked = (await api.pickFile({ multiple: true })) ?? [];
+  const paths = Array.isArray(picked) ? picked : [picked];
+  addPathsAsAttachments(paths);
+});
+
+// A folder is added as a mention: the agent then has a path to list rather
+// than a directory tree pre-loaded into the prompt.
+$("plus-add-folder").addEventListener("click", async () => {
+  setPlusMenu(false);
+  const folder = await api.pickDirectory();
+  if (folder) addPathsAsAttachments([folder]);
+});
+
+// Slash commands open the same menu typing "/" does, at the caret.
+$("plus-slash").addEventListener("click", () => {
+  setPlusMenu(false);
+  input.focus();
+  const caret = input.selectionStart;
+  // The menu only opens on "/" at the start of the input or after a space,
+  // which is also the rule the parser uses for a real command.
+  const needsSpace = input.value.length > 0 && !/\s$/.test(input.value.slice(0, caret));
+  input.value = `${input.value.slice(0, caret)}${needsSpace ? " /" : "/"}${input.value.slice(caret)}`;
+  const position = caret + (needsSpace ? 2 : 1);
+  input.setSelectionRange(position, position);
+  autoSize();
+  updateCommandMenu();
+});
+
+/**
+ * Add picked paths to the composer.
+ *
+ * Images go through the attachment strip (the model sees them); anything else
+ * is a mention, which travels with the message as a path the host reads. Kept
+ * separate from the drop handler because the dialog returns paths, not Files.
+ */
+function addPathsAsAttachments(paths) {
+  for (const path of paths) {
+    if (!path) continue;
+    if (/\.(png|jpe?g|gif|webp|bmp)$/i.test(path)) {
+      api
+        .readImage?.(path)
+        ?.then((dataUrl) => dataUrl && addAttachment(dataUrl, path.split(/[\\/]/).pop()))
+        .catch(() => addMentionPath(path));
+      continue;
+    }
+    addMentionPath(path);
+  }
+}
+
+function addMentionPath(path) {
+  if (!state.mentionFiles.includes(path)) state.mentionFiles.push(path);
+  input.focus();
+  addNotice("dim", t.attachmentAdded(path.split(/[\\/]/).pop() || path));
+}
 
 const effortPicker = $("effort-picker");
 const effortMenu = $("effort-menu");
 
 function setEffortMenu(open) {
+  if (open) renderEffortMenu();
   effortMenu.hidden = !open;
   effortPicker.setAttribute("aria-expanded", String(open));
 }
@@ -4733,6 +5167,17 @@ function setEffortMenu(open) {
 effortPicker.addEventListener("click", (event) => {
   event.stopPropagation();
   setEffortMenu(effortMenu.hidden);
+});
+
+// Delegated: the menu is rebuilt whenever the model's level list changes, so
+// per-row listeners would go stale after a model switch.
+effortMenu.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-effort]");
+  if (!button) return;
+  setEffortMenu(false);
+  if (button.dataset.effort === state.effort) return;
+  setEffort(button.dataset.effort);
+  api.send({ cmd: "setEffort", effort: button.dataset.effort });
 });
 
 document.addEventListener("click", (event) => {
@@ -4907,6 +5352,130 @@ if (localStorage.getItem("prometheus.sidebarCollapsed") === "1") {
 }
 
 $("topbar-sidebar-toggle").addEventListener("click", toggleSidebar);
+
+/* ---------- sidebar width ---------- */
+
+/**
+ * The sidebar is resizable by dragging its right edge, and by arrow keys when
+ * the handle is focused.
+ *
+ * The width is stored unscaled, so it means the same thing when the UI scale
+ * changes: a 300 px column stays 300 px of layout at scale 1 and grows with
+ * everything else. The clamp is deliberately generous — below 200 px the
+ * session titles are unreadable, above 520 px the conversation has nothing
+ * left to grow into on a laptop screen — but it is a clamp, not a fixed set;
+ * the user's number is what is remembered.
+ */
+const SIDEBAR_DEFAULT = 264;
+const SIDEBAR_MIN = 200;
+const SIDEBAR_MAX = 520;
+/** Width the drag started from, so mousemove maps to the pointer's absolute
+ *  position rather than accumulating per-event deltas. */
+let sidebarDrag = null;
+
+/**
+ * Clamp the column so it can never crowd out the conversation.
+ *
+ * A wide sidebar is a preference; a sidebar that leaves no room for the
+ * transcript is a broken window. On a narrow window the ceiling drops with it,
+ * and below roughly 760 px the sidebar becomes a drawer anyway (the ≤900 px
+ * media query), so the clamp is mostly about the windowed case.
+ */
+function clampSidebarWidth(width) {
+  const requested = Number.isFinite(width) ? width : SIDEBAR_DEFAULT;
+  const ceiling = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, window.innerWidth - 420));
+  return Math.round(Math.min(ceiling, Math.max(SIDEBAR_MIN, requested)));
+}
+
+function applySidebarWidth(width, options = {}) {
+  const clamped = clampSidebarWidth(width);
+  const scale = Number(localStorage.getItem("prometheus.uiScale")) || 1;
+  document.documentElement.style.setProperty("--sidebar-user-width", `${Math.round(clamped)}px`);
+  document.documentElement.style.setProperty("--sidebar-width", `${Math.round(clamped * scale)}px`);
+  // A drag in progress writes its own variable; a stale value from a drag that
+  // ended in another window would otherwise win over this one.
+  document.querySelector(".sidebar")?.style.removeProperty("--sidebar-drag-width");
+  if (options.persist) localStorage.setItem("prometheus.sidebarWidth", String(Math.round(clamped)));
+  return clamped;
+}
+
+/** While dragging, bypass the token and write the width directly. */
+function setSidebarDragWidth(px) {
+  document.querySelector(".sidebar")?.style.setProperty("--sidebar-drag-width", `${Math.round(px)}px`);
+}
+
+function beginSidebarDrag(event) {
+  const sidebar = document.querySelector(".sidebar");
+  if (!sidebar) return;
+  event.preventDefault();
+  sidebarDrag = {
+    startX: event.clientX,
+    startWidth: sidebar.getBoundingClientRect().width,
+    resizer: $("sidebar-resizer"),
+  };
+  sidebarDrag.resizer.classList.add("resizing");
+  document.body.classList.add("resizing-sidebar");
+  window.addEventListener("pointermove", onSidebarDrag);
+  window.addEventListener("pointerup", endSidebarDrag, { once: true });
+  // Pointer capture keeps the events coming even when the cursor leaves the
+  // 6 px strip, which it does immediately at any normal drag speed.
+  sidebarDrag.resizer.setPointerCapture?.(event.pointerId);
+}
+
+function onSidebarDrag(event) {
+  if (!sidebarDrag) return;
+  setSidebarDragWidth(clampSidebarWidth(sidebarDrag.startWidth + (event.clientX - sidebarDrag.startX)));
+}
+
+function endSidebarDrag() {
+  if (!sidebarDrag) return;
+  window.removeEventListener("pointermove", onSidebarDrag);
+  const sidebar = document.querySelector(".sidebar");
+  const width = sidebar?.getBoundingClientRect().width ?? SIDEBAR_DEFAULT;
+  sidebar?.style.removeProperty("--sidebar-drag-width");
+  sidebarDrag.resizer.classList.remove("resizing");
+  document.body.classList.remove("resizing-sidebar");
+  sidebarDrag = null;
+  // One write at the end: the whole drag is one localStorage update rather
+  // than one per mousemove.
+  applySidebarWidth(width, { persist: true });
+}
+
+{
+  const resizer = $("sidebar-resizer");
+  resizer?.addEventListener("pointerdown", beginSidebarDrag);
+  // The UI scale lives in settings.js; re-apply the unscaled width when it
+  // changes so a resized column keeps its proportion at every zoom level.
+  window.addEventListener("prometheus:ui-scale", () => {
+    applySidebarWidth(Number(localStorage.getItem("prometheus.sidebarWidth")) || SIDEBAR_DEFAULT);
+  });
+  // A window narrowing past the clamp leaves the column wider than it should
+  // be until the next change; re-clamping on resize keeps it inside.
+  window.addEventListener("resize", () => {
+    const stored = Number(localStorage.getItem("prometheus.sidebarWidth"));
+    if (stored) applySidebarWidth(stored);
+  });
+  // Double-click restores the default, the same escape hatch a split view has.
+  resizer?.addEventListener("dblclick", () => {
+    const width = applySidebarWidth(SIDEBAR_DEFAULT, { persist: true });
+    resizer.setAttribute("aria-valuenow", String(Math.round(width)));
+  });
+  resizer?.addEventListener("keydown", (event) => {
+    const step = event.shiftKey ? 32 : 8;
+    const stored = Number(localStorage.getItem("prometheus.sidebarWidth")) || SIDEBAR_DEFAULT;
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const width = applySidebarWidth(stored + (event.key === "ArrowRight" ? step : -step), { persist: true });
+      // The separator role is what makes the new width audible to a screen
+      // reader; without it the handle is a focus stop that does nothing.
+      resizer.setAttribute("aria-valuenow", String(Math.round(width)));
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      const width = applySidebarWidth(SIDEBAR_DEFAULT, { persist: true });
+      resizer.setAttribute("aria-valuenow", String(Math.round(width)));
+    }
+  });
+}
 
 /* ---------- top bar: workspace, changes, terminal ---------- */
 
@@ -5196,6 +5765,9 @@ bootStep("motion", () => {
 });
 bootStep("uiScale", () => {
   document.documentElement.style.setProperty("--ui-scale", localStorage.getItem("prometheus.uiScale") || "1");
+});
+bootStep("sidebarWidth", () => {
+  applySidebarWidth(Number(localStorage.getItem("prometheus.sidebarWidth")) || SIDEBAR_DEFAULT);
 });
 bootStep("fontScale", () => {
   document.documentElement.style.setProperty("--font-scale", localStorage.getItem("prometheus.fontScale") || "1");
