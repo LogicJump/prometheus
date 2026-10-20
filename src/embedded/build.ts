@@ -17,7 +17,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { detectToolchains, tool } from "./toolchain.ts";
 import { buildCommand, type BuildCommand, type DetectedProject, detectProject } from "./project.ts";
@@ -110,6 +110,10 @@ export function findArtifacts(root: string, patterns: string[] | undefined, hint
     const dot = path.lastIndexOf(".");
     const ext = dot > path.lastIndexOf("/") ? path.slice(dot).toLowerCase() : "";
     if (ext === ".elf") return "elf";
+    // Keil's name for an ELF. Same file, same magic, different suffix — and
+    // without this the artifact was found and then thrown away.
+    if (ext === ".axf") return "elf";
+    if (ext === ".out" && /iar/i.test(path)) return "elf";
     if (ext === ".hex") return "hex";
     if (ext === ".bin") return "bin";
     if (ext === ".uf2") return "uf2";
@@ -210,7 +214,11 @@ export function findArtifacts(root: string, patterns: string[] | undefined, hint
  * usage at all - the build succeeded and the one number that tells you whether
  * it fits was missing. The ELF's machine type says which toolchain built it.
  */
-async function sizeOf(elf: string): Promise<MemoryUsage | undefined> {
+async function sizeOf(elf: string, keilPath?: string): Promise<MemoryUsage | undefined> {
+  // A Keil build has no GNU `size` anywhere: its artifacts can only be read by
+  // Keil's own `fromelf`, which lives beside `UV4.exe`.
+  const armKeil = await keilSize(elf, keilPath);
+  if (armKeil) return armKeil;
   const families = await sizeFamilies(elf);
   for (const family of families) {
     const sizeTool = await tool(family);
@@ -226,6 +234,65 @@ async function sizeOf(elf: string): Promise<MemoryUsage | undefined> {
   // binary is not installed, still try the plain one so a bug report has a
   // number rather than a blank.
   return undefined;
+}
+
+/**
+ * Flash and RAM from `fromelf --text -c`, which ships with Keil.
+ *
+ * The output ends with a summary table:
+ *
+ *   Code (inc. data)  RO Data  RW Data  RW Zero   ROM Size  ...
+ *   total             readonly  readwrite  zero
+ *
+ * Keil also prints the image size in a header line on newer versions, so both
+ * the table and that line are read; whichever is present wins.
+ */
+async function keilSize(elf: string, uv4Path?: string): Promise<MemoryUsage | undefined> {
+  const fromelf = fromelfFor(uv4Path);
+  if (!fromelf) return undefined;
+  const result = await run(fromelf, ["--text", "-c", elf], process.cwd(), 30_000);
+  if (result.code !== 0) return undefined;
+  return parseFromelf(result.out);
+}
+
+/**
+ * Total image size from `fromelf --text -c`.
+ *
+ * The summary is:
+ *
+ *   Total RO  Size (Code + RO Data)                 12345 (  12.06kB)
+ *   Total RW  Size (RW Data + ZI Data)               2345 (   2.29kB)
+ *   Total ROM Size (Code + RO Data + RW Data)       12500 (  12.21kB)
+ *
+ * The number before the parenthesis is bytes; the parenthesis is a human
+ * reading. Older versions omit the parenthetical label but keep the totals, so
+ * both spellings are accepted.
+ */
+export function parseFromelf(output: string): MemoryUsage | undefined {
+  const total = (label: RegExp) => {
+    const match = label.exec(output);
+    return match ? Number(match[1]) : undefined;
+  };
+  // `Total RO  Size` — two spaces in the product's own output, one in some.
+  const ro = total(/Total\s+RO\s+Size(?:\s*\([^)]*\))?\s*:?\s+(\d+)/i);
+  const rw = total(/Total\s+RW\s+Size(?:\s*\([^)]*\))?\s*:?\s+(\d+)/i);
+  if (ro === undefined) return undefined;
+  return {
+    flash: ro,
+    // RAM is the initialised data plus the zero-initialised region; that is
+    // what the part has to reserve at run time.
+    ram: rw ?? 0,
+    // `fromelf` prints a per-section table, but its columns are not stable
+    // between Keil versions; the totals are what the caller acts on.
+    sections: [],
+  };
+}
+
+/** `UV4.exe`'s sibling `fromelf.exe`, or nothing when Keil is not installed. */
+function fromelfFor(uv4Path?: string): string | null {
+  if (!uv4Path) return null;
+  const candidate = uv4Path.replace(/UV4(\.exe)?$/i, uv4Path.endsWith(".exe") ? "fromelf.exe" : "fromelf");
+  return candidate !== uv4Path && existsSync(candidate) ? candidate : null;
 }
 
 /** Toolchain kinds to try for an ELF, most likely first. */
@@ -289,10 +356,12 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
     );
   }
   if (project.kind === "keil" || project.kind === "iar") {
+    const ide = project.kind === "keil" ? "Keil MDK" : "IAR EWARM";
+    const program = project.kind === "keil" ? "UV4.exe" : "IarBuild.exe";
     return empty(
-      `This is a ${project.kind === "keil" ? "Keil MDK" : "IAR EWARM"} project. ` +
-        `Its build is driven by a licensed Windows GUI tool this agent does not bundle; ` +
-        `build it in the IDE, or add a CMake/Makefile that produces the same firmware.`,
+      `This is a ${ide} project, and ${program} was not found. ` +
+        `${ide} is licensed and is never bundled with this app, so it has to be installed here first. ` +
+        `Install it, then build again; the project's own build is what this runs, not a replacement for it.`,
     );
   }
 
@@ -313,17 +382,28 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
 
   const timeout = options.timeoutMs ?? 10 * 60_000;
   const result = await run(command.program, command.args, command.cwd, timeout);
-  const parsed = parseDiagnostics(result.out);
+  // Keil prints nothing useful on the console: its diagnostics go to the file
+  // `-o` names. Read it and treat it as the output, so the same parser handles
+  // both kinds of build.
+  let output = result.out;
+  if (command.buildLog) {
+    try {
+      if (existsSync(command.buildLog)) output = readFileSync(command.buildLog, "utf8");
+    } catch {
+      /* an unreadable log leaves the console output, which is still better */
+    }
+  }
+  const parsed = parseDiagnostics(output);
   const collapsed = collapseCascades(parsed.diagnostics);
   const errors = collapsed.filter((entry) => entry.severity === "error").length;
   const ok = result.code === 0 && errors === 0;
 
   const artifacts = ok ? findArtifacts(project.root, command.artifactPatterns, command.artifactHint) : [];
   const elf = artifacts.find((artifact) => artifact.kind === "elf");
-  const usage = elf ? await sizeOf(elf.path) : undefined;
+  const usage = elf ? await sizeOf(elf.path, toolchains.tools.find((entry) => entry.kind === "keil")?.path) : undefined;
 
   const tailLines = options.tailLines ?? 40;
-  const allLines = result.out.split(/\r?\n/).filter((line) => line.trim());
+  const allLines = output.split(/\r?\n/).filter((line) => line.trim());
   const tail = allLines.slice(-tailLines).join("\n");
 
   let summary = `${command.program} ${command.args.join(" ")} → ${ok ? "ok" : `failed (exit ${result.code})`}`;

@@ -28,6 +28,8 @@ export type ToolchainKind =
   | "pio"
   | "arduino-cli"
   | "cargo"
+  | "keil"
+  | "iar"
   | "openocd"
   | "pyocd"
   | "probe-rs"
@@ -85,6 +87,16 @@ export const TOOLCHAIN_INFO: Record<ToolchainKind, { label: string; purpose: str
   pio: { label: "PlatformIO", purpose: "Builds platformio.ini projects across boards and frameworks", group: "build" },
   "arduino-cli": { label: "Arduino CLI", purpose: "Compiles and uploads Arduino sketches", group: "build" },
   cargo: { label: "Cargo", purpose: "Builds Rust firmware and embedded Rust crates", group: "build" },
+  keil: {
+    label: "Keil MDK",
+    purpose: "Builds .uvprojx projects headless; its compilers and device packs are licensed and are never bundled",
+    group: "build",
+  },
+  iar: {
+    label: "IAR EWARM",
+    purpose: "Builds .ewp projects headless; licensed, never bundled",
+    group: "build",
+  },
   openocd: { label: "OpenOCD", purpose: "Debugs and flashes through many probes, and serves GDB", group: "flash" },
   pyocd: { label: "pyOCD", purpose: "Flashes and debugs Arm Cortex-M targets, with a built-in target table", group: "flash" },
   "probe-rs": { label: "probe-rs", purpose: "Flashes and debugs Rust targets through CMSIS-DAP and J-Link", group: "flash" },
@@ -123,6 +135,14 @@ interface Spec {
   names: string[];
   /** Arguments that print a version. */
   versionArgs: string[];
+  /**
+   * Absolute locations to try beyond PATH and the install roots, in order.
+   *
+   * The vendor IDEs are the reason this exists: Keil and IAR install into
+   * fixed directories that are deliberately not on PATH, because two IDEs and
+   * the user's own PATH should not have to agree on a `UV4`.
+   */
+  paths?: string[];
 }
 
 /**
@@ -193,6 +213,37 @@ const SPECS: Spec[] = [
   { kind: "pio", names: ["pio", "pio.exe", "platformio"], versionArgs: ["--version"] },
   { kind: "arduino-cli", names: ["arduino-cli", "arduino-cli.exe"], versionArgs: ["version", "--format", "json"] },
   { kind: "cargo", names: ["cargo", "cargo.exe"], versionArgs: ["--version"] },
+  // Vendor IDEs. Detected only: neither is redistributable, and both refuse to
+  // do anything useful without a licence the user installed themselves.
+  {
+    kind: "keil",
+    names: ["UV4.exe", "UV4"],
+    // `UV4 -h` would open the GUI. The executable's own file version is what
+    // there is to read, so no version args are passed.
+    versionArgs: [],
+    paths: [
+      "C:\\Keil_v5\\UV4\\UV4.exe",
+      "C:\\Keil\\UV4\\UV4.exe",
+      "C:\\Program Files\\Keil_v5\\UV4\\UV4.exe",
+      "C:\\Program Files (x86)\\Keil_v5\\UV4\\UV4.exe",
+      "C:\\Program Files\\Keil\\UV4\\UV4.exe",
+    ],
+  },
+  {
+    kind: "iar",
+    names: ["IarBuild.exe", "IarBuild"],
+    versionArgs: [],
+    paths: [
+      "C:\\Program Files\\IAR Systems\\Embedded Workbench 9.4\\common\\bin\\IarBuild.exe",
+      "C:\\Program Files\\IAR Systems\\Embedded Workbench 9.3\\common\\bin\\IarBuild.exe",
+      "C:\\Program Files\\IAR Systems\\Embedded Workbench 9.2\\common\\bin\\IarBuild.exe",
+      "C:\\Program Files\\IAR Systems\\Embedded Workbench 9.1\\common\\bin\\IarBuild.exe",
+      "C:\\Program Files\\IAR Systems\\Embedded Workbench 9.0\\common\\bin\\IarBuild.exe",
+      "C:\\Program Files (x86)\\IAR Systems\\Embedded Workbench 8.5\\common\\bin\\IarBuild.exe",
+      "C:\\Program Files (x86)\\IAR Systems\\Embedded Workbench 8.4\\common\\bin\\IarBuild.exe",
+      "C:\\Program Files (x86)\\IAR Systems\\Embedded Workbench 8.3\\common\\bin\\IarBuild.exe",
+    ],
+  },
   { kind: "openocd", names: ["openocd", "openocd.exe"], versionArgs: ["--version"] },
   { kind: "pyocd", names: ["pyocd", "pyocd.exe"], versionArgs: ["--version"] },
   { kind: "probe-rs", names: ["probe-rs", "probe-rs.exe"], versionArgs: ["--version"] },
@@ -273,6 +324,16 @@ function locate(spec: Spec, context: SearchContext): { path: string; source: Fou
     if (hit) return hit;
   }
 
+  // A vendor IDE's own install directory. Listed as full paths because the
+  // directory name carries the product version and is not a searchable tree.
+  for (const candidate of spec.paths ?? []) {
+    try {
+      if (statSync(candidate).isFile()) return { path: candidate, source: "install-root" };
+    } catch {
+      /* not installed at this version */
+    }
+  }
+
   return tryDirs(context.installRoots, "install-root") ?? tryDirs(context.pathDirs, "path");
 }
 
@@ -291,6 +352,30 @@ function runVersion(path: string, args: string[]): Promise<string> {
       // Strip the executable name and keep the version-looking part.
       resolve(line.replace(/^.*?([0-9]+(\.[0-9]+)+.*)$/, "$1").slice(0, 80) || line.slice(0, 80));
     });
+  });
+}
+
+/**
+ * The file version of a Windows executable.
+ *
+ * A GUI tool has no `--version` that is safe to run: `UV4 -h` opens Keil, and
+ * spawning a licensed IDE to read a number is not something a detection pass
+ * should do. The PE resource is the version, and reading it is a few bytes.
+ */
+async function fileVersion(path: string): Promise<string> {
+  if (process.platform !== "win32") return "";
+  return new Promise((resolve) => {
+    execFile(
+      "powershell",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-Item -LiteralPath ${JSON.stringify(path)}).VersionInfo.FileVersion`,
+      ],
+      { timeout: 8000, windowsHide: true },
+      (error, stdout) => resolve(error ? "" : String(stdout ?? "").trim().slice(0, 60)),
+    );
   });
 }
 
@@ -344,7 +429,9 @@ export async function detectToolchains(refresh = false): Promise<ToolchainReport
         missing.push(spec.kind);
         return;
       }
-      const version = await runVersion(located.path, spec.versionArgs);
+      const version = spec.versionArgs.length > 0
+        ? await runVersion(located.path, spec.versionArgs)
+        : await fileVersion(located.path);
       const health = spec.kind === "gcc-arm" ? await checkArmCompleteness(located.path) : {};
       found.push({
         kind: spec.kind,

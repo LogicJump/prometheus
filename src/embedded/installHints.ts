@@ -23,6 +23,19 @@ export interface InstallHint {
 }
 
 export const INSTALL_HINTS: Record<string, InstallHint> = {
+  // Licensed, and therefore not a download this app can offer. The command is
+  // a page, not an installer: sending someone to `winget` for Keil would be a
+  // dead end, and pretending a package exists is worse than saying "buy it".
+  keil: {
+    command: "install Keil MDK from keil.com, then reopen this app (a licence is required)",
+    url: "https://www.keil.arm.com/",
+    requires: "a Keil MDK licence; UV4.exe is looked for in C:\\Keil_v5\\UV4 and the Program Files installs",
+  },
+  iar: {
+    command: "install IAR Embedded Workbench from iar.com, then reopen this app (a licence is required)",
+    url: "https://www.iar.com/",
+    requires: "an IAR licence; IarBuild.exe is looked for under Program Files\\IAR Systems",
+  },
   pyocd: {
     command: "pip install pyocd",
     url: "https://pyocd.io/docs/installing.html",

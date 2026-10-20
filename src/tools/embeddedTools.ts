@@ -606,7 +606,13 @@ const projectTool: Tool = {
       lines.push("", `build: ${command.program} ${command.args.join(" ")}`, `in: ${command.cwd}`);
       if (command.artifactPatterns?.length) lines.push(`expects: ${command.artifactPatterns.join(", ")}`);
     } else if (project.kind === "keil" || project.kind === "iar") {
-      lines.push("", `This is a ${project.kind === "keil" ? "Keil MDK" : "IAR EWARM"} project; its build needs the licensed IDE.`);
+      const ide = project.kind === "keil" ? "Keil MDK" : "IAR EWARM";
+      const program = project.kind === "keil" ? "UV4.exe" : "IarBuild.exe";
+      lines.push(
+        "",
+        `This is a ${ide} project. ${program} was not found on this machine; ${ide} is licensed and is never bundled with this app.`,
+        `Install ${ide}, then run embed_build again — it drives the project's own build.`,
+      );
     } else {
       lines.push("", "no build command for this project kind");
     }

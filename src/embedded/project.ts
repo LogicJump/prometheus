@@ -39,6 +39,14 @@ export interface BuildCommand {
   artifactHint?: string;
   /** Build outputs to look for, newest first. */
   artifactPatterns?: string[];
+  /**
+   * A log the tool writes instead of stdout.
+   *
+   * Keil's `UV4 -b` prints nothing useful to the console; the diagnostics are
+   * in the `-o` file. Parsing the file is the difference between a build that
+   * reports "#20: identifier undefined" and one that reports "exit 2".
+   */
+  buildLog?: string;
 }
 
 export interface DetectedProject {
@@ -110,6 +118,29 @@ function cargoEvidence(root: string): string[] {
   // A host-only Rust project is not an embedded project.
   if (!/\[\[bin\]\]|name\s*=/i.test(toml)) return [];
   return evidence.some((item) => item === "embedded dependencies") ? evidence : [];
+}
+
+/**
+ * The `.uvprojx` to hand to `UV4 -b`, as a path relative to the project root.
+ *
+ * Relative on purpose: Keil resolves the project's own relative paths against
+ * its working directory, and an absolute path works but reads as though the
+ * project could be moved. The first one in directory order wins; a tree with
+ * several is rare and the user can pass one explicitly.
+ */
+export function keilProjectFile(root: string): string | null {
+  const files = readdirSyncSafe(root)
+    .filter((name) => /\.uvprojx?$/i.test(name))
+    .sort((a, b) => a.localeCompare(b));
+  return files[0] ? join(root, files[0]) : null;
+}
+
+/** The `.ewp` for `IarBuild`, same convention as Keil's. */
+export function iarProjectFile(root: string): string | null {
+  const files = readdirSyncSafe(root)
+    .filter((name) => /\.ewp$/i.test(name))
+    .sort((a, b) => a.localeCompare(b));
+  return files[0] ? join(root, files[0]) : null;
 }
 
 function readdirSyncSafe(dir: string): string[] {
@@ -314,11 +345,34 @@ export function buildCommand(
         artifactPatterns: ["*.elf", "*.bin", "*.hex", "build/*.elf"],
       };
     }
-    case "keil":
-    case "iar":
-      // Both are Windows-only GUIs with a CLI; they are detected so the agent
-      // can say "this is a Keil project" instead of trying to run CMake.
-      return null;
+    case "keil": {
+      // `UV4 -b` is the documented headless build: it writes the IDE's own
+      // build log and exits with a bitmask (0 clean, 1 warnings, 2 errors,
+      // 11/13/15 for the "could not open project" family). The licence is the
+      // user's; this only drives what they installed.
+      const project1 = keilProjectFile(root);
+      if (!project1) return null;
+      const log = join(root, "build", "keil-build.log");
+      return {
+        kind: "keil",
+        program: toolchains.keil ?? "UV4.exe",
+        args: ["-b", project1, "-j0", "-o", log],
+        cwd: root,
+        artifactPatterns: ["*.axf", "*.hex", "*.bin", "**/*.axf", "**/*.hex", "**/*.bin"],
+        buildLog: log,
+      };
+    }
+    case "iar": {
+      const project1 = iarProjectFile(root);
+      if (!project1) return null;
+      return {
+        kind: "iar",
+        program: toolchains.iar ?? "IarBuild.exe",
+        args: [project1, "-build", options.release ? "Release" : "Debug"],
+        cwd: root,
+        artifactPatterns: ["**/*.out", "**/*.hex", "**/*.bin", "*.out", "*.hex", "*.bin"],
+      };
+    }
     default:
       return null;
   }

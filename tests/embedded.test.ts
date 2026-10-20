@@ -190,13 +190,29 @@ test("CMake presets are read and preferred over a bare build directory", () => {
   assert.deepEqual(command.args, ["--build", "--preset", "release"]);
 });
 
-test("Keil and IAR are identified but produce no build command", () => {
+test("Keil and IAR produce a headless build command once the IDE is installed", () => {
   const keil = scratch("prometheus-keil-");
   writeFileSync(join(keil, "app.uvprojx"), "<Project/>");
   const project = detectProject(keil);
   assert.equal(project.kind, "keil");
-  // The agent should say "this is a Keil project", not try to run CMake.
-  assert.equal(buildCommand(project, {}), null);
+  // No IDE installed: the command still points at the program, so the error
+  // names UV4.exe rather than saying "unsupported project".
+  assert.equal(buildCommand(project, {}).program, "UV4.exe");
+
+  const command = buildCommand(project, { keil: "C:\\Keil_v5\\UV4\\UV4.exe" });
+  assert.equal(command.program, "C:\\Keil_v5\\UV4\\UV4.exe");
+  // -b is the documented batch build; -o names the file the diagnostics land in.
+  assert.deepEqual(command.args.slice(0, 1), ["-b"]);
+  assert.ok(command.args.includes(join(keil, "app.uvprojx")));
+  assert.ok(command.buildLog, "the build log is where UV4 writes its errors");
+  // A Keil ELF is an `.axf`, and that is what the artifact scan must accept.
+  assert.ok(command.artifactPatterns.some((pattern) => pattern.endsWith(".axf")));
+
+  const iar = scratch("prometheus-iar-");
+  writeFileSync(join(iar, "app.ewp"), "<project/>");
+  const iarCommand = buildCommand(detectProject(iar), { iar: "C:\\iar\\IarBuild.exe" });
+  assert.equal(iarCommand.program, "C:\\iar\\IarBuild.exe");
+  assert.deepEqual(iarCommand.args.slice(1), ["-build", "Debug"]);
 });
 
 // ---- probes and targets ----------------------------------------------------
