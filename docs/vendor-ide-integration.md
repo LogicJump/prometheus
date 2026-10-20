@@ -205,3 +205,77 @@ error: ../OBJ/TOUCH.axf:0 [L6218E] Undefined symbol undefined_symbol_x (referred
 - **器件包路径**：Keil 的 pack 在 `TOOLS.INI` 的 `RTEPATH`（这里是 `G:\software\keil5pack`），
   不在现有 CMSIS pack 搜索路径里，SVD/器件参数仍可能找不到。
 - **多 Target**：`TOUCH.uvprojx` 只有一个 Target，没测多 Target 情况。
+
+---
+
+## 九、Keil 的器件包（RTEPATH）
+
+Keil 把器件包放在自己的目录里，路径写在 `TOOLS.INI` 的 `[UV2]` 段：
+
+```ini
+[UV2]
+RTEPATH="G:\software\keil5pack"
+```
+
+这台机器上它不在任何原有搜索路径里，所以 SVD 和器件参数一直是找不到的。
+
+### 做了什么
+
+1. **加进 pack 搜索根**：`packRoots()` 现在会读 `TOOLS.INI` 的 `RTEPATH`。
+   `TOOLS.INI` 的位置从**注册表**取——`HKLM\SOFTWARE\WOW6432Node\Keil\Products\MDK`
+   的 `Path` 是 `G:\software\keil5\ARM`，父目录就是安装根。这比按 `C:\Keil_v5` 猜可靠，
+   而且这就是本机装了非默认路径却能找到它的原因。默认路径仍作为后备保留。
+   `KEIL_TOOLS_INI` 可覆盖。
+
+2. **兼容 Keil 的目录层级**：cpackget 与 Arm 官方是 `root/vendor/version/`，
+   Keil 是 `root/vendor/packName/version/`（多一层）。`installedPacks()` 两种都认。
+   只加根不加这一条的话，扫出来是 0 个包。
+
+3. **SVD 从 `<subFamily>` 继承**：Keil 的 DFP 把 `<debug svd="...">` 写在
+   `<subFamily DsubFamily="STM32F429">` 上，而不是每个 `<device>` 里。现在设备继承所属
+   子家族的 SVD 与 processor。
+
+4. **器件名支持变体**：工程文件写的是 `<Device>STM32F429IGTx</Device>`，而 pdsc 里
+   `STM32F429IGTx` 是 `<variant Dvariant="...">`，`Dname` 只有 `STM32F429IG`。
+   变体现在作为 `aliases` 索引，`STM32F429IG`、`STM32F429IGT`、`STM32F429IGTx` 都能命中。
+
+5. **Keil 的内存命名**：DFP 用 `<memory name="Flash">` / `name="SRAM1"`，没有 `id` 属性。
+   以前只认 `IROM1`/`IRAM1`，所以 flash/RAM 全是 undefined。现在两种都读；
+   Flash 取最大值（多个 bank 是同一地址空间），SRAM 累加。
+
+### 验证
+
+不设任何环境变量、从真实工程目录出发：
+
+```
+LTDC.SSCR → 0x40016808 | source: G:\software\keil5pack\Keil\STM32F4xx_DFP\3.1.1\CMSIS\SVD\STM32F429.svd (device STM32F429, CM4)
+GPIOB.ODR → 0x40020414 | source: ...（同上）
+```
+
+器件查询：
+
+```
+STM32F429IG      -> STM32F429IG  flash=1048576 ram=262144 svd=yes
+STM32F429IGT     -> STM32F429IG  flash=1048576 ram=262144 svd=yes
+STM32F429IGTx    -> STM32F429IG  flash=1048576 ram=262144 svd=yes
+STM32F429ZI      -> STM32F429ZI  flash=2097152 ram=262144 svd=yes
+STM32F103RC      -> STM32F103RC  flash=262144  ram=49152  svd=yes
+```
+
+`tests/round11-keil-packs.test.ts` 13 条覆盖：RTEPATH 只在 `[UV2]` 生效、注释行不算、
+两种目录层级、subFamily 继承、变体别名、Keil 内存命名。其中一条会在本机真的装了
+Keil 时检查 DFP 里的 STM32F429IG。
+
+### 一条被放宽的断言
+
+`tests/gap-fixes-2.test.ts` 原本断言「SVD 搜索目录里不能出现任何带 Keil 的路径」。
+那条约束的本意是**不许猜厂商路径**，而现在的实现是**读实际安装**（TOOLS.INI + 注册表），
+没装 Keil 的机器上不会出现任何 Keil 路径。断言改成：出现厂商路径时该目录必须真实存在，
+且没装 Keil 的机器上必须为零。
+
+### 仍然要注意
+
+- **注册表读取只在 Windows 上做**，且每次进程缓存一次。装了 Keil 但既没有注册表项、
+  也没有默认路径的机器，仍然需要 `KEIL_TOOLS_INI` 或 `PROMETHEUS_TOOLCHAINS`。
+- **pack 版本**：同一 pack 装了多个版本时，`findDeviceInPacks` 取目录遍历到的第一个，
+  不是最新版本。目前没在真实机器上遇到多版本，属于未验证。

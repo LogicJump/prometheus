@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ChatMessage } from "../src/types.ts";
@@ -214,7 +214,17 @@ test("SVD search directories come from the environment, not a vendor path", asyn
     const dirs = svdSearchDirs(workspace);
     assert.ok(dirs.includes(custom), "the configured directory is searched");
     assert.ok(dirs.some((dir) => dir.includes(".prometheus") && dir.includes("svd")), "a project-local directory is searched");
-    assert.ok(!dirs.some((dir) => /STM32Cube|Keil/i.test(dir)), "no vendor install path is hard-coded");
+    // A vendor path may appear only when that vendor is actually installed on
+    // this machine. A `C:\Keil_v5\...` that was guessed at would fail here on a
+    // host without Keil, which is the distinction that matters: discovery is
+    // read from the install (TOOLS.INI, the registry), never assumed.
+    const vendorish = dirs.filter((dir) => /STM32Cube|Keil/i.test(dir));
+    for (const dir of vendorish) {
+      assert.ok(existsSync(dir), `${dir} is reported only because it exists`);
+    }
+    if (!existsSync("G:\\software\\keil5pack") && !existsSync("C:\\Keil_v5") && !existsSync("C:\\Program Files\\Keil_v5")) {
+      assert.equal(vendorish.length, 0, "no Keil install means no Keil path");
+    }
   } finally {
     if (previous === undefined) delete process.env.PROMETHEUS_SVD_DIRS;
     else process.env.PROMETHEUS_SVD_DIRS = previous;
