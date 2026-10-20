@@ -237,17 +237,39 @@ function scrollTarget() {
 
 function scrollToBottom(force = false) {
   const target = scrollTarget();
-  const nearBottom = target.scrollHeight - target.scrollTop - target.clientHeight < 140;
-  if (force || nearBottom) target.scrollTop = target.scrollHeight;
-  updateScrollButton();
+  // One layout read, reused for both decisions. The old shape measured
+  // `scrollHeight` here, wrote `scrollTop`, then measured it again inside
+  // `updateScrollButton` — twice per rAF while text streamed, on a transcript
+  // that grows with every token.
+  const distance = target.scrollHeight - target.scrollTop - target.clientHeight;
+  const nearBottom = distance < 140;
+  const pinned = force || nearBottom;
+  if (pinned) target.scrollTop = target.scrollHeight;
+  // After a pinned scroll the button is certainly not needed; only an
+  // unpinned stream has to look at the distance it already measured.
+  setScrollButtonVisible(!pinned && distance > 220);
 }
 
 function updateScrollButton() {
+  const target = scrollTarget();
+  setScrollButtonVisible(target.scrollHeight - target.scrollTop - target.clientHeight > 220);
+}
+
+function setScrollButtonVisible(away) {
   const button = $("scroll-bottom");
   if (!button) return;
-  const target = scrollTarget();
-  const away = target.scrollHeight - target.scrollTop - target.clientHeight > 220;
-  button.hidden = !away;
+  if (away) {
+    if (!button.hidden) return;
+    button.hidden = false;
+    // Start from the entering state and drop it next frame so the fade runs;
+    // `hidden` is display:none and cannot be transitioned on its own.
+    button.classList.add("entering");
+    requestAnimationFrame(() => button.classList.remove("entering"));
+    return;
+  }
+  if (button.hidden) return;
+  button.hidden = true;
+  button.classList.remove("entering", "leaving");
 }
 
 function hideEmptyState() {
@@ -323,7 +345,15 @@ function addAssistantTurn() {
   const last = transcript.lastElementChild;
   const node = addNode(`<div class="turn assistant"><div class="markdown"></div></div>`);
   if (last && (last.classList.contains("tool-row") || last.classList.contains("tool-group"))) node.classList.add("after-tools");
-  state.currentAssistant = { node, body: node.querySelector(".markdown"), text: "", raf: 0, renderer: new IncrementalRenderer(t.copy) };
+  const body = node.querySelector(".markdown");
+  // The caret is a sibling of the rendered prose, created once. Re-rendering
+  // `innerHTML` each frame used to rebuild the caret element too, which
+  // restarted its 1 s blink animation every frame — the caret never blinked,
+  // it just sat there.
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  body.appendChild(caret);
+  state.currentAssistant = { node, body, caret, text: "", raf: 0, renderer: new IncrementalRenderer(t.copy) };
   return state.currentAssistant;
 }
 
@@ -337,6 +367,7 @@ function flushAssistant() {
   const hadText = current.text.trim().length > 0;
   current.body.innerHTML = current.renderer ? current.renderer.render(current.text) : md(current.text);
   current.body.classList.remove("streaming");
+  current.caret?.remove();
   state.currentAssistant = null;
   bindCodeCopy(current.node);
   // A turn that produced no prose leaves an empty bubble behind.
@@ -504,8 +535,13 @@ function attachInlineDiff(row, change) {
   box.appendChild(body);
   toggle.setAttribute("aria-expanded", String(!body.hidden));
   toggle.addEventListener("click", () => {
+    const opening = body.hidden;
     body.hidden = !body.hidden;
     toggle.setAttribute("aria-expanded", String(!body.hidden));
+    if (opening) {
+      body.classList.add("entering");
+      requestAnimationFrame(() => body.classList.remove("entering"));
+    }
   });
   row.after(box);
   state.lastToolNode = null;
@@ -550,10 +586,18 @@ function attachToolOutput(node, name, output) {
   button.textContent = expanded ? t.hide : t.details;
   row.classList.toggle("open", expanded);
   button.addEventListener("click", () => {
+    const opening = outputNode.hidden;
     outputNode.hidden = !outputNode.hidden;
     button.textContent = outputNode.hidden ? t.details : t.hide;
     row.classList.toggle("open", !outputNode.hidden);
-    if (!outputNode.hidden) outputNode.scrollTop = outputNode.scrollHeight;
+    if (!outputNode.hidden) {
+      // `hidden` is display:none, so the element cannot be transitioned from
+      // it. Paint the entering class for one frame and drop it; the CSS
+      // transition does the rest, and reduced-motion turns it off.
+      outputNode.classList.add("entering");
+      requestAnimationFrame(() => outputNode.classList.remove("entering"));
+      outputNode.scrollTop = outputNode.scrollHeight;
+    }
   });
 }
 
@@ -563,11 +607,25 @@ function startThinking() {
     `<div class="thinking streaming"><span class="thinking-label">${escapeHtml(t.thinking)}</span><span class="thinking-text"></span></div>`,
   );
   state.currentThinkingText = state.currentThinking.querySelector(".thinking-text");
+  state.thinkingBuffer = "";
 }
 
 function appendThinking(text) {
   if (!state.currentThinkingText || !text) return;
-  state.currentThinkingText.textContent += text;
+  // Reasoning arrives one token at a time. Writing `textContent` per token
+  // forced a layout per token; coalescing to one frame matches how the answer
+  // stream is handled and keeps a long chain of thought from stuttering.
+  state.thinkingBuffer = (state.thinkingBuffer ?? "") + text;
+  if (state.thinkingRaf) return;
+  state.thinkingRaf = requestAnimationFrame(() => {
+    state.thinkingRaf = 0;
+    if (!state.currentThinkingText) return;
+    state.currentThinkingText.textContent = state.thinkingBuffer ?? "";
+    // Follow only while the reader is already at the bottom; scrolling up to
+    // read earlier reasoning must not be yanked back down.
+    const pane = scrollTarget();
+    if (pane.scrollHeight - pane.scrollTop - pane.clientHeight < 140) pane.scrollTop = pane.scrollHeight;
+  });
 }
 
 /**
@@ -576,13 +634,22 @@ function appendThinking(text) {
  */
 function endThinking() {
   if (!state.currentThinking) return;
+  if (state.thinkingRaf) {
+    cancelAnimationFrame(state.thinkingRaf);
+    state.thinkingRaf = 0;
+  }
   const node = state.currentThinking;
+  // Flush whatever the last frame did not paint, so the kept block is whole.
+  if (state.currentThinkingText && state.thinkingBuffer) {
+    state.currentThinkingText.textContent = state.thinkingBuffer;
+  }
   const text = state.currentThinkingText?.textContent?.trim() ?? "";
   node.classList.remove("streaming");
   const label = node.querySelector(".thinking-label");
   if (label) label.textContent = text ? t.thoughtBriefly : t.thinking;
   state.currentThinking = null;
   state.currentThinkingText = null;
+  state.thinkingBuffer = "";
 }
 
 function addNotice(level, text) {
@@ -591,21 +658,64 @@ function addNotice(level, text) {
   addNode(`<div class="notice ${cls}">${escapeHtml(text)}</div>`);
 }
 
+/**
+ * The task plan.
+ *
+ * It used to be removed and re-appended on every update, which physically
+ * moved the card to the end of the transcript and pulled the view with it —
+ * a plan that ticks items off while you read it should stay where it is. The
+ * card is created once and its rows are updated in place.
+ */
+/** The current plan card; one per session view, reused across updates. */
+let planCard = null;
+
 function renderPlan(items) {
-  document.querySelectorAll(".plan").forEach((node) => node.remove());
-  if (!items || items.length === 0) return;
-  addNode(
-    `<div class="plan"><div class="plan-card">` +
-      `<div class="plan-title">${escapeHtml(t.plan)}</div>` +
-      items
-        .map(
-          (item) =>
-            `<div class="plan-item ${item.status}"><span class="box">${item.status === "completed" ? icon("check") : ""}</span>` +
-            `<span class="label">${escapeHtml(item.content)}</span></div>`,
-        )
-        .join("") +
-      `</div></div>`,
-  );
+  const pane = scrollTarget();
+  const wasPinned = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 140;
+  let host = planCard;
+  if (!items || items.length === 0) {
+    if (host) host.remove();
+    planCard = null;
+    return;
+  }
+  if (!host || !host.isConnected) {
+    host = document.createElement("div");
+    host.className = "plan";
+    host.innerHTML = `<div class="plan-card"><div class="plan-title">${escapeHtml(t.plan)}</div><div class="plan-items"></div></div>`;
+    planCard = host;
+    // Inserted before the composer, after the last turn, so it does not move
+    // when a later tool row is appended: it is the first child of the run of
+    // turns that follows it.
+    hideEmptyState();
+    if (state.currentAssistant?.node?.isConnected) state.currentAssistant.node.before(host);
+    else transcript.appendChild(host);
+  }
+  const list = host.querySelector(".plan-items");
+  const existing = [...list.children];
+  items.forEach((item, index) => {
+    let row = existing[index];
+    if (!row) {
+      row = document.createElement("div");
+      list.appendChild(row);
+    }
+    row.className = `plan-item ${item.status}`;
+    const box = row.querySelector(".box") ?? row.appendChild(document.createElement("span"));
+    box.className = "box";
+    const boxHtml = item.status === "completed" ? icon("check") : "";
+    if (box.innerHTML !== boxHtml) box.innerHTML = boxHtml;
+    let label = row.querySelector(".label");
+    if (!label) {
+      label = document.createElement("span");
+      label.className = "label";
+      row.appendChild(label);
+    }
+    const text = String(item.content);
+    if (label.textContent !== text) label.textContent = text;
+  });
+  for (const stale of existing.slice(items.length)) stale.remove();
+  // Only follow the plan if the reader was already at the bottom; otherwise
+  // the update would scroll them away from what they were reading.
+  if (wasPinned) pane.scrollTop = pane.scrollHeight;
 }
 
 /* ---------- state ---------- */
@@ -812,7 +922,10 @@ function runFind() {
 function focusFindHit() {
   findHits.forEach((hit, index) => hit.classList.toggle("current", index === findIndex));
   const current = findHits[findIndex];
-  if (current) current.scrollIntoView({ block: "center", behavior: "smooth" });
+  // `behavior: "smooth"` is a JS option, so the CSS reduced-motion rule never
+  // reaches it. Someone who asked for less motion gets an instant jump.
+  const reduce = document.documentElement.dataset.motion === "reduced" || matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (current) current.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
   $("find-count").textContent = findHits.length === 0 ? t.findNone : `${findIndex + 1}/${findHits.length}`;
 }
 
@@ -1604,13 +1717,16 @@ function handleEvent(message) {
           // Only the block still receiving text is re-rendered; completed
           // blocks keep their HTML, so a long answer does not get slower as
           // it grows.
-          current.body.innerHTML = `${current.renderer.render(current.text)}<span class="caret"></span>`;
+          current.body.innerHTML = current.renderer.render(current.text);
+          // The caret survives the rewrite and is re-attached to the end of
+          // the prose. Moving the same element keeps its animation running;
+          // recreating it inside the HTML string restarted the blink.
+          current.body.appendChild(current.caret);
           scrollToBottom();
         });
       }
       break;
     }
-
     case "assistant_end":
       flushAssistant();
       break;
@@ -2000,6 +2116,10 @@ function handleEvent(message) {
       state.currentTool = null;
       state.lastToolNode = null;
       state.currentThinkingText = null;
+      // The plan card is part of the transcript and was just removed; the next
+      // plan for this session must build a new one rather than update a node
+      // that is no longer in the document.
+      planCard = null;
       for (const item of message.messages || []) {
         if (item.role === "user") {
           const node = addUserTurn(item.text, item.images ?? 0);
@@ -2050,11 +2170,30 @@ function handleEvent(message) {
 
     case "session_status":
       // The sidebar row for this conversation reflects what the task is doing.
+      // Only that row is touched: a full `renderSessions` here rebuilt every
+      // row (losing hover and keyboard focus) and then the `sessions` message
+      // that follows rebuilt it again half a second later.
       {
         const current = state.sessions.find((session) => session.id === message.sessionId);
         if (current) {
           current.status = message.status;
-          renderSessions(state.sessions);
+          const row = sessionList.querySelector(`.session-item[data-session-id="${CSS.escape(message.sessionId)}"]`);
+          const state_ = message.status && message.status !== "ready" ? message.status : "";
+          if (row) {
+            let dot = row.querySelector(".session-state");
+            if (state_ && !dot) {
+              dot = document.createElement("span");
+              row.prepend(dot);
+            }
+            if (dot) {
+              if (state_) {
+                dot.className = `session-state ${state_}`;
+                dot.title = t.sessionStatusLabel(state_);
+              } else {
+                dot.remove();
+              }
+            }
+          }
         }
       }
       break;
@@ -2225,6 +2364,8 @@ function closeWorkbench() {
 let terminalCwd = "";
 let terminalBusy = false;
 const terminalLines = [];
+/** Pending paint for coalesced terminal output. */
+let terminalRaf = 0;
 
 function openTerminal() {
   api.send({ cmd: "terminalOpen" });
@@ -2241,9 +2382,17 @@ function appendTerminalText(text) {
     else terminalLines[last] += parts[i];
   }
   while (terminalLines.length > 4000) terminalLines.shift();
-  const pinned = terminalOutput.scrollTop + terminalOutput.clientHeight >= terminalOutput.scrollHeight - 24;
-  terminalOutput.textContent = terminalLines.join("\n");
-  if (pinned) terminalOutput.scrollTop = terminalOutput.scrollHeight;
+  // A 300 MB/s `yes` used to rebuild a 4000-line string on every chunk.
+  // Coalescing to one paint per frame keeps the scrollback intact while
+  // costing the layout one write instead of hundreds.
+  if (terminalRaf) return;
+  terminalRaf = requestAnimationFrame(() => {
+    terminalRaf = 0;
+    const pinned = terminalOutput.scrollTop + terminalOutput.clientHeight >= terminalOutput.scrollHeight - 24;
+    const html = terminalLines.map((line) => `<div class="terminal-line">${escapeHtml(line) || "&nbsp;"}</div>`).join("");
+    terminalOutput.innerHTML = html;
+    if (pinned) terminalOutput.scrollTop = terminalOutput.scrollHeight;
+  });
 }
 
 function setTerminalState({ cwd: nextCwd, busy, exited, scrollback }) {
@@ -2275,6 +2424,8 @@ terminalInput.addEventListener("keydown", (event) => {
 
 $("terminal-restart").addEventListener("click", () => {
   terminalLines.length = 0;
+  if (terminalRaf) cancelAnimationFrame(terminalRaf);
+  terminalRaf = 0;
   terminalOutput.textContent = "";
   api.send({ cmd: "terminalRestart" });
 });
@@ -2345,6 +2496,14 @@ function renderDiff() {
   const scope = state.diffScope;
   const active = scope === "turn" ? state.changes.lastTurn ?? { files: [], additions: 0, deletions: 0 } : state.changes;
   const files = active.files;
+  // The host pushes `changes` every 500 ms while a turn runs. Rebuilding the
+  // pane on every push reset its scroll position, so a person reading a diff
+  // was thrown back to the top twice a second. Identical content now renders
+  // nothing, and a real change keeps the reader where they were.
+  const signature = files.map((file) => `${file.path}:${file.additions}:${file.deletions}:${file.diff?.length ?? 0}`).join("|") + `#${state.selectedChange}#${scope}`;
+  if (signature === diffSignature && diffRoot.childElementCount > 0) return;
+  const previousScroll = diffRoot.scrollTop;
+  diffSignature = signature;
   renderDiffFileList(files);
   diffRoot.innerHTML = "";
   commentEditor = null;
@@ -2353,6 +2512,8 @@ function renderDiff() {
     workbenchMeta.textContent = "";
     return;
   }
+  // Restored at the end of this function, after the content exists again.
+  state.restoreDiffScroll = previousScroll;
   const selected = files.find((file) => file.path === state.selectedChange) ?? files[0];
   state.selectedChange = selected.path;
   workbenchMeta.innerHTML =
@@ -2391,6 +2552,12 @@ function renderDiff() {
       }
       diffRoot.appendChild(row);
     }
+  }
+  // Back to where the reader was; on a first render this is 0, which is the
+  // top, so nothing changes for the common case.
+  if (state.restoreDiffScroll) {
+    diffRoot.scrollTop = state.restoreDiffScroll;
+    state.restoreDiffScroll = 0;
   }
 }
 
@@ -2919,6 +3086,11 @@ $("serial-port").addEventListener("change", () => {
 /* ---------- inline review comments ---------- */
 
 let commentEditor = null;
+/**
+ * What the diff pane currently shows. `changes` arrives twice a second while a
+ * turn runs; this is what lets an identical push be a no-op.
+ */
+let diffSignature = "";
 
 function openLineComment(event, path, line, text) {
   if (event.target.closest(".line-comment, .comment-editor")) return;
@@ -3040,6 +3212,10 @@ function renderDiffFileList(files = state.changes.files) {
 
 function renderChangesPanel() {
   renderGitBar();
+  // The host pushes `changes` every 500 ms during a turn. Rebuilding a hidden
+  // panel costs layout for something nobody can see, and the pane is rendered
+  // from the same state when it opens, so there is nothing to keep fresh.
+  if (workbench.hidden) return;
   changesList.innerHTML = "";
   const { files, additions, deletions } = state.changes;
   // The diff pane already carries the empty state; repeating it here stacked
@@ -3618,6 +3794,10 @@ function renderSessions(sessions) {
     for (const session of shown) {
       const button = document.createElement("button");
       button.className = `session-item${session.id === state.sessionId ? " active" : ""}${session.pinned ? " pinned" : ""}`;
+      // The row can be addressed for a status-only update, which avoids
+      // rebuilding (and losing focus in) the whole sidebar twice per change:
+      // the host sends `session_status` and then a fresh `sessions` list.
+      button.dataset.sessionId = session.id;
       const title = session.title || (session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages);
       // The timestamp is reference, not navigation: it appears on hover and
       // gives the row back its second line of height.
@@ -3695,6 +3875,7 @@ function openSessionMenu(event, session) {
   menu.className = "session-menu";
   const actions = [
     [session.pinned ? t.sessionUnpin : t.sessionPin, () => sendSessionFlags(session, { pinned: !session.pinned })],
+    [t.sessionOpenSplit, () => openSplitPicker(session)],
     [t.sessionRename, () => renameSession(session)],
     [t.sessionFork, () => api.send({ cmd: "forkSession", id: session.id })],
     [session.archived ? t.sessionUnarchive : t.sessionArchive, () => {
@@ -3723,8 +3904,71 @@ function openSessionMenu(event, session) {
   sessionMenu = menu;
 }
 
-function sendSessionFlags(session, flags) {
-  api.send({ cmd: "sessionFlags", id: session.id, includeArchived: state.showArchived, ...flags });
+/**
+ * Pick the session to sit beside this one.
+ *
+ * Two sessions in one window would mean two transcripts under one host, and
+ * the session lock exists precisely so that never happens: one writer per
+ * session file. A split is two windows, each with its own host and its own
+ * session, placed side by side by the main process.
+ *
+ * `exclude` is the session the menu was opened on; the current one is
+ * excluded too, because a session cannot be open twice.
+ */
+function openSplitPicker(exclude) {
+  const candidates = state.sessions.filter((session) => session.id !== state.sessionId && session.id !== exclude?.id);
+  if (candidates.length === 0) {
+    void confirmAction(t.splitNeedsAnother, { ok: t.close, cancel: t.cancel });
+    return;
+  }
+  const previous = document.activeElement;
+  const overlay = document.createElement("div");
+  overlay.className = "confirm-overlay";
+  overlay.innerHTML =
+    `<div class="confirm-dialog split-dialog" role="dialog" aria-modal="true">` +
+    `<div class="confirm-text">${escapeHtml(t.splitPick)}</div>` +
+    `<div class="split-list"></div>` +
+    `<div class="confirm-actions"><button class="confirm-cancel">${escapeHtml(t.cancel)}</button></div>` +
+    `</div>`;
+  const list = overlay.querySelector(".split-list");
+  for (const session of candidates.slice(0, 40)) {
+    const title = session.title || (session.summary && session.summary !== "(no messages)" ? session.summary : t.noMessages);
+    const row = document.createElement("button");
+    row.className = "split-option";
+    row.innerHTML =
+      `<span class="split-option-title">${escapeHtml(title)}</span>` +
+      `<span class="split-option-meta">${escapeHtml(relativeDate(session.updatedAt))}</span>`;
+    row.addEventListener("click", () => {
+      close();
+      // Open the picked session beside this one; the current window keeps its
+      // own session. Whichever is `exclude` is the one that was right-clicked.
+      api.splitWindow({ sessionId: session.id, cwd: session.cwd });
+    });
+    list.appendChild(row);
+  }
+  document.body.appendChild(overlay);
+
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey, true);
+    if (previous && typeof previous.focus === "function") previous.focus();
+  };
+  function onKey(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+    }
+  }
+  document.addEventListener("keydown", onKey, true);
+  overlay.querySelector(".confirm-cancel").addEventListener("click", close);
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) close();
+  });
+  list.querySelector(".split-option")?.focus();
+}
+
+function sendSessionFlags(session, flags) {  api.send({ cmd: "sessionFlags", id: session.id, includeArchived: state.showArchived, ...flags });
 }
 
 function renameSession(session) {
@@ -4887,6 +5131,7 @@ topbarMenu.addEventListener("click", (event) => {
   setTopbarMenu(false);
   if (row.id === "menu-export") api.send({ cmd: "exportSession" });
   else if (row.id === "menu-new-window") api.newWindow();
+  else if (row.id === "menu-split-view") openSplitPicker(null);
   else if (row.id === "menu-shortcuts") openShortcuts();
   else if (row.id === "menu-clear") clearConversation();
 });

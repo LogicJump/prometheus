@@ -8,6 +8,7 @@ import { SandboxError, classifyCommand, sandboxEnv, shellFor, type SandboxPolicy
 import { trimToolOutput } from "../context.ts";
 import { spillToolOutput } from "../spill.ts";
 import { jobContainmentSupported, killTree, openJob, type JobHandle } from "../winsandbox.ts";
+import { availability, run as runKernel } from "../kernelSandbox.ts";
 
 const DEFAULT_TIMEOUT = 120_000;
 
@@ -108,9 +109,32 @@ export const bashTool: Tool = {
       allowedDirs: ctx.config.allowedDirs ?? [],
       ...(ctx.config.sandboxCredentials ? { credentials: ctx.config.sandboxCredentials } : {}),
     };
-    // The pipeline already asked the user; the sandbox is the backstop that
-    // holds even in auto mode.
-    const verdict = classifyCommand(command, ctx.cwd, policy);
+    // The kernel sandbox, when the user enabled it. `wsl` refuses to fall back
+    // — the point of choosing it is that a run which cannot be confined does
+    // not happen — while `auto` uses WSL when it is there and stays on the
+    // policy path when it is not.
+    const kernelMode = ctx.config.kernelSandbox ?? "auto";
+    let kernelDistro: string | undefined;
+    if (kernelMode !== "off") {
+      const status = await availability({ ...(ctx.config.kernelSandboxDistro ? { distro: ctx.config.kernelSandboxDistro } : {}) });
+      if (status.state === "ready") kernelDistro = status.distro;
+      else if (kernelMode === "wsl") {
+        return {
+          isError: true,
+          content:
+            `The kernel sandbox is required but unavailable: ${status.reason ?? "WSL is not ready"}. ` +
+            "Install WSL (`wsl --install`) or set kernelSandbox to \"off\" to run on Windows with the policy sandbox only.",
+          display: "sandbox unavailable",
+        };
+      }
+    }
+
+    // Inside WSL the command's paths are Linux paths, so the workspace is
+    // `/mnt/g/...` and Windows semantics would reject every absolute path the
+    // command legitimately uses. The verdict below has to be reached in the
+    // same path space the command will run in.
+    const pathFlavor = kernelMode !== "off" && kernelDistro ? "posix" : "windows";
+    const verdict = classifyCommand(command, ctx.cwd, policy, { paths: pathFlavor });
     if (verdict.class === "deny") {
       return {
         isError: true,
@@ -150,6 +174,45 @@ export const bashTool: Tool = {
         snapshotBefore = await dirtyState(cwd);
       } catch {
         snapshotBefore = null;
+      }
+    }
+
+    if (kernelMode !== "off" && kernelDistro) {
+      {
+        const started = Date.now();
+        const result = await runKernel(
+          {
+            command,
+            cwd,
+            network: policy.network === "open" ? "open" : "off",
+            // A command that can write gets a read-write workspace; anything
+            // else gets the read-only bind, which is the tighter of the two
+            // and costs a build nothing it did not already need permission
+            // for. The classifier has already allowed or confirmed the run.
+            writable: canWriteFiles(command) || REDIRECT_WRITE.test(command),
+            timeoutMs: timeout,
+            ...(policy.credentials ? { env: policy.credentials } : {}),
+          },
+          { distro: kernelDistro, signal: ctx.signal },
+        );
+        const body = result.output ? trimToolOutput(result.output, 30_000) : "(no output)";
+        const pointer = (content: string): string => {
+          const path = spillToolOutput(ctx.sessionId ?? "", "bash", result.output);
+          return path ? `${content}\n\n[full output: ${path}]` : content;
+        };
+        if (snapshotBefore && ctx.sessionId) {
+          void captureBashChanges(ctx.sessionId, cwd, snapshotBefore).catch(() => {});
+        }
+        void started;
+        if (result.timedOut) {
+          return { isError: true, content: pointer(`${body}\n[timed out after ${timeout / 1000}s]`), display: "timed out" };
+        }
+        if (result.code === 0) return { content: pointer(body), display: "exit 0" };
+        // 97 is the wrapper's own "could not enforce read-only" refusal.
+        if (result.code === 97) {
+          return { isError: true, content: pointer(`${body}\n[kernel sandbox refused to run]`), display: "sandbox refused" };
+        }
+        return { isError: true, content: pointer(`${body}\n[exit code ${result.code}]`), display: `exit ${result.code}` };
       }
     }
 

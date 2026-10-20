@@ -45,6 +45,7 @@ import {
 } from "../src/settingsFiles.ts";
 import { readMemorySections, deleteMemory } from "../src/memory.ts";
 import { installFromManifest, installPack } from "../src/packs/install.ts";
+import { availability } from "../src/kernelSandbox.ts";
 import { packsSummary, removePack, verifyPack, pruneTmp } from "../src/packs/registry.ts";
 import { catalogFor, isInstallable, toInstallEntry } from "../src/packs/catalog.ts";
 import { runGoal, runTaskLoop } from "../src/autoloop.ts";
@@ -873,6 +874,8 @@ function disposeTerminal() {
 let boardCache = null;
 /** One inventory scan at a time; concurrent callers share the result. */
 let boardInflight = null;
+/** The kernel sandbox answer, invalidated when the setting changes. */
+let kernelSandboxCache = null;
 /** The target table, once loaded. Never expires within a session. */
 let targetCache = null;
 /** The monitor's open port, if any. */
@@ -1954,9 +1957,14 @@ async function handle(cmd) {
       return;
     }
     case "getSettings":
+      // The WSL probe is ~100 ms and cached for a minute; doing it here rather
+      // than on demand means the settings page never shows a spinner for a
+      // field whose whole purpose is to say whether isolation is real.
+      if (!kernelSandboxCache) kernelSandboxCache = await availability({ ...(config?.kernelSandboxDistro ? { distro: config.kernelSandboxDistro } : {}) });
       send({
         type: "settings",
         settings: {
+          kernelSandboxState: kernelSandboxCache,
           provider: config?.provider ?? providerFor(config?.baseUrl ?? "").id,
           providers: publicProviders(),
           baseUrl: config?.baseUrl ?? "",
@@ -1970,6 +1978,8 @@ async function handle(cmd) {
           fallbackModels: config?.fallbackModels ?? [],
           sandbox: config?.sandbox ?? "enforce",
           networkPolicy: config?.networkPolicy ?? "off",
+          kernelSandbox: config?.kernelSandbox ?? "auto",
+          kernelSandboxDistro: config?.kernelSandboxDistro ?? "",
           echoReasoning: Boolean(config?.echoReasoning),
           rules: loadRules().map((rule) => ({
             id: rule.id,
@@ -2147,6 +2157,10 @@ async function handle(cmd) {
       }
       if (patch.sandbox === "off" || patch.sandbox === "enforce") filePatch.sandbox = patch.sandbox;
       if (["off", "proxy", "open"].includes(patch.networkPolicy)) filePatch.networkPolicy = patch.networkPolicy;
+      if (["off", "auto", "wsl"].includes(patch.kernelSandbox)) filePatch.kernelSandbox = patch.kernelSandbox;
+      if (typeof patch.kernelSandboxDistro === "string") {
+        filePatch.kernelSandboxDistro = patch.kernelSandboxDistro.trim();
+      }
       if (typeof patch.fallbackModels === "string" || Array.isArray(patch.fallbackModels)) {
         const list = Array.isArray(patch.fallbackModels) ? patch.fallbackModels : String(patch.fallbackModels).split(",");
         filePatch.fallbackModels = list.map((model) => String(model).trim()).filter((model) => model && model !== String(patch.model ?? ""));
@@ -2204,6 +2218,12 @@ async function handle(cmd) {
         agent.config.fallbackModels = config.fallbackModels;
         agent.config.sandbox = config.sandbox;
         agent.config.networkPolicy = config.networkPolicy;
+        // The agent holds a reference to `config`, so these are already live;
+        // assigning anyway keeps the list above complete rather than relying
+        // on that detail of the object's shape.
+        agent.config.kernelSandbox = config.kernelSandbox;
+        agent.config.kernelSandboxDistro = config.kernelSandboxDistro;
+        kernelSandboxCache = null;
         agent.config.thinkingEffort = config.thinkingEffort;
         agent.config.permissionMode = config.permissionMode;
         agent.config.echoReasoning = config.echoReasoning;

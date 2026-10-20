@@ -279,6 +279,124 @@ export const CATALOG: CatalogEntryDef[] = [
     env: { pathPrepend: ["payload"], vars: {} },
     validation: { command: "ninja.exe", args: ["--version"], expect: "^1\\.13" },
   },
+  {
+    // probe-rs ships a prebuilt Windows zip from its own release page, so it
+    // can be pinned and verified like any other toolchain here — no Rust
+    // toolchain needed on the user's machine. The archive is flat (binaries at
+    // the root, no wrapper directory), which planExtraction keeps as-is.
+    id: "probe-rs-0.32.0-win32-x64",
+    name: "probe-rs",
+    version: "0.32.0",
+    provider: "probe-rs",
+    platform: "win32",
+    arch: "x64",
+    // 实测 Content-Length：11502414 字节
+    downloadBytes: 11_502_414,
+    unpackedBytes: 42_000_000,
+    sources: [
+      {
+        url: "https://github.com/probe-rs/probe-rs/releases/download/v0.32.0/probe-rs-tools-x86_64-pc-windows-msvc.zip",
+        archive: "zip",
+        // 实测：2026-10-20 下载 11,502,414 字节后计算得到，与发布页的
+        // probe-rs-tools-x86_64-pc-windows-msvc.zip.sha256 逐字相符。
+        sha256: "56fc0564cc23d604b27dc2d57606194159c49f951999f3e47bd2cbffcba64103",
+        bytes: 11_502_414,
+        hosts: GITHUB_HOSTS,
+      },
+    ],
+    license: {
+      name: "MIT OR Apache-2.0",
+      url: "https://github.com/probe-rs/probe-rs/blob/master/LICENSE-MIT",
+      sourceUrl: "https://github.com/probe-rs/probe-rs",
+      separateProcess: true,
+    },
+    provides: ["probe-rs"],
+    executables: [
+      { name: "probe-rs", path: "probe-rs.exe", toolchain: "probe-rs" },
+      { name: "cargo-flash", path: "cargo-flash.exe", toolchain: "probe-rs" },
+      { name: "cargo-embed", path: "cargo-embed.exe", toolchain: "probe-rs" },
+    ],
+    // The binaries sit at the payload root, so the root itself joins PATH.
+    env: { pathPrepend: ["payload"], vars: {} },
+    // `probe-rs --version` prints `probe-rs 0.32.0 (git commit: …)` to stdout.
+    validation: { command: "probe-rs.exe", args: ["--version"], expect: "^probe-rs 0\\.32\\.0" },
+    priority: 10,
+  },
+  {
+    // pyOCD's Windows release is a PyInstaller one-directory build: pyocd.exe
+    // plus `_internal/`. That layout is exactly what a pinned, hashed pack
+    // needs — it does not depend on the user's Python being the right version,
+    // which is the failure `pip install pyocd` produces most often.
+    id: "pyocd-0.46.0-win32-x64",
+    name: "pyOCD",
+    version: "0.46.0",
+    provider: "pyocd",
+    platform: "win32",
+    arch: "x64",
+    downloadBytes: 37_011_537,
+    unpackedBytes: 96_000_000,
+    sources: [
+      {
+        url: "https://github.com/pyocd/pyOCD/releases/download/v0.46.0/pyocd-windows-0.46.0.zip",
+        archive: "zip",
+        // 实测：2026-10-20 下载 37,011,537 字节后计算得到。
+        sha256: "bc36d0277ddf95dd2dab66f9676a779b42c59039aad08ef1493f9b67d7a75fe6",
+        bytes: 37_011_537,
+        hosts: GITHUB_HOSTS,
+      },
+    ],
+    license: {
+      name: "Apache-2.0",
+      url: "https://github.com/pyocd/pyOCD/blob/main/LICENSE",
+      sourceUrl: "https://github.com/pyocd/pyOCD",
+      separateProcess: true,
+    },
+    provides: ["pyocd"],
+    executables: [{ name: "pyocd", path: "pyocd.exe", toolchain: "pyocd" }],
+    env: { pathPrepend: ["payload"], vars: {} },
+    // `pyocd --version` prints the bare number.
+    validation: { command: "pyocd.exe", args: ["--version"], expect: "^0\\.46\\.0" },
+    priority: 10,
+  },
+  {
+    // esptool's release zip has a single wrapper directory
+    // (`esptool-windows-amd64/`), which planExtraction strips, so the payload
+    // root is what was inside it.
+    id: "esptool-5.6.0-win32-x64",
+    name: "esptool",
+    version: "5.6.0",
+    provider: "espressif",
+    platform: "win32",
+    arch: "x64",
+    downloadBytes: 64_810_332,
+    unpackedBytes: 150_000_000,
+    sources: [
+      {
+        url: "https://github.com/espressif/esptool/releases/download/v5.6.0/esptool-v5.6.0-windows-amd64.zip",
+        archive: "zip",
+        // 实测：2026-10-20 下载 64,810,332 字节后计算得到。
+        sha256: "d55a96fbeb97fd4cb05bd93f201e5c8f6518b7bfcde2fc6966fd0190fd891629",
+        bytes: 64_810_332,
+        hosts: GITHUB_HOSTS,
+      },
+    ],
+    license: {
+      name: "GPL-2.0-or-later",
+      url: "https://github.com/espressif/esptool/blob/master/LICENSE",
+      sourceUrl: "https://github.com/espressif/esptool",
+      separateProcess: true,
+    },
+    provides: ["esptool"],
+    executables: [
+      { name: "esptool", path: "esptool.exe", toolchain: "esptool" },
+      { name: "espsecure", path: "espsecure.exe", toolchain: "esptool" },
+      { name: "espefuse", path: "espefuse.exe", toolchain: "esptool" },
+    ],
+    env: { pathPrepend: ["payload"], vars: {} },
+    // `esptool version` prints `esptool v5.6.0` on the first line.
+    validation: { command: "esptool.exe", args: ["version"], expect: "esptool v5\\.6\\.0" },
+    priority: 10,
+  },
 ];
 
 /** 一个条目是否具备安装条件：有哈希才可能出现给用户。 */

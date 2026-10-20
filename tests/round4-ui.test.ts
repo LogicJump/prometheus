@@ -249,3 +249,32 @@ test("the REPL advertises the rewind command", async () => {
   assert.match(source, /case "rewind":/);
   assert.match(source, /\/rewind \[n\]/);
 });
+
+/* ---------- streaming responsiveness ------------------------------------ */
+
+test("an open code fence is not re-rendered for every token", async () => {
+  const { IncrementalRenderer, renderMarkdown } = await import("../desktop/renderer/markdown.js");
+  const renderer = new IncrementalRenderer();
+  const start = "intro\n\n```ts\nconst a = 1;\n";
+  renderer.render(start);
+  // A few characters is below the re-render budget, so the cached HTML is
+  // returned unchanged rather than re-highlighting the whole block.
+  const throttled = renderer.render(start + "x");
+  assert.equal(throttled, renderMarkdown(start));
+  // Enough growth and the new text appears.
+  const grown = renderer.render(start + "x".repeat(400));
+  assert.match(grown, /x{10}/);
+  // A closed fence renders immediately, so the final state is always correct.
+  const closed = renderer.render(start + "x".repeat(5) + "\n```");
+  assert.match(closed, /<\/code>/);
+});
+
+test("an unchanged source is returned from the cache without a rebuild", async () => {
+  const { IncrementalRenderer } = await import("../desktop/renderer/markdown.js");
+  const renderer = new IncrementalRenderer();
+  const first = renderer.render("# Title\n\nbody");
+  const cached = renderer.blocks[0];
+  const second = renderer.render("# Title\n\nbody");
+  assert.equal(second, first);
+  assert.equal(renderer.blocks[0], cached);
+});

@@ -29,11 +29,20 @@ import { searchDatasheets, formatDatasheetHits } from "../embedded/datasheet.ts"
 import { powerCommands, runPowerCommand, describePlan, CYCLE_DEFAULTS, type PowerDevice } from "../embedded/hil.ts";
 import {
   formatMeasurement,
-  parseScpi,
   summarizeSamples,
-  INSTRUMENTS,
   scpiCommands,
 } from "../embedded/instruments.ts";
+import {
+  DRIVERS,
+  driverFor,
+  joulescopeCommand,
+  parseJoulescopeCsv,
+  parsePpk2Output,
+  ppk2Command,
+  sigrokCommand,
+  sigrokResult,
+} from "../embedded/instrumentDrivers.ts";
+import { parseVcd, formatWaveform, digitize, formatDigitalTrace } from "../embedded/waveform.ts";
 import { splitTraceChunk, parseTraceLine, traceCommand, jlinkRttScript, type TraceChannel } from "../embedded/trace.ts";
 import { findDeviceInPacks, installedPacks, readPackIndex, citePack } from "../embedded/cmsisPack.ts";
 
@@ -269,15 +278,21 @@ const traceTool: Tool = {
 const measureTool: Tool = {
   name: "embed_measure",
   description:
-    "Measure voltage, current and power on the target's supply through an instrument the user has attached (SCPI bench supply, Joulescope, Nordic PPK2). Returns mean, peak and charge over the capture window. Reports which instruments are present when none is configured.",
+    "Measure voltage, current and power on the target's supply through an instrument the user has attached (SCPI bench supply, Joulescope, Nordic PPK2), or capture digital signals from a logic analyser (sigrok) as edges. Returns mean, peak and charge over the capture window, or the transitions for a waveform capture. Reports which instruments are present when none is configured.",
   readonly: true,
   parameters: {
     type: "object",
     properties: {
       duration_ms: { type: "integer", description: "Capture window, default 2000" },
-      instrument: { type: "string", description: "Which instrument: scpi, joulescope, ppk2. Default: the first available" },
+      instrument: {
+        type: "string",
+        enum: ["scpi", "pyvisa", "joulescope", "ppk2", "sigrok"],
+        description: "Which instrument; defaults to the first one installed",
+      },
       port: { type: "string", description: "Serial port or VISA resource for the instrument" },
       rate_hz: { type: "integer", description: "Samples per second, when the instrument allows it" },
+      driver: { type: "string", description: "sigrok hardware driver id, e.g. `fx2lafw`, when the device is not auto-detected" },
+      channels: { type: "string", description: "sigrok channel list, e.g. `D0,D1`" },
     },
     additionalProperties: false,
   },
@@ -288,30 +303,56 @@ const measureTool: Tool = {
     // the program name covers a user-installed driver detected as `unknown`.
     const installed = (name: string) =>
       report.tools.some((entry) => entry.kind === name || entry.path.toLowerCase().includes(name.toLowerCase()));
-    const available = INSTRUMENTS.map((instrument) => ({
-      ...instrument,
-      available: instrument.programs.some((program) => installed(program)),
+    const available = DRIVERS.map((driver) => ({
+      ...driver,
+      available: driver.programs.some((program) => installed(program)),
     }));
-    const usable = available.filter((instrument) => instrument.available);
-    const chosen = input.instrument ? String(input.instrument) : usable[0]?.kind;
-    if (!chosen || !usable.some((instrument) => instrument.kind === chosen)) {
+    const usable = available.filter((driver) => driver.available);
+    const requested = input.instrument ? String(input.instrument) : undefined;
+    const chosen = requested ? driverFor(requested) : driverFor(usable[0]?.kind);
+    if (!chosen || !usable.some((driver) => driver.kind === chosen.kind)) {
+      const missing = driverFor(requested);
       return {
         isError: true,
-        content:
-          "No measurement instrument is available. Install one of: " +
-          available.map((instrument) => `${instrument.kind} (${instrument.detail})`).join(", ") +
-          ". Until then, power cannot be measured — do not estimate it from the firmware.",
+        content: missing
+          ? `${missing.kind} is not installed. Install one of: ${missing.programs.join(" or ")} (${missing.detail}).`
+          : "No measurement instrument is available. Install one of: " +
+            available.map((driver) => `${driver.kind} (${driver.detail})`).join(", ") +
+            ". Until then, power cannot be measured — do not estimate it from the firmware.",
         display: "no instrument",
       };
     }
     const request = {
       durationMs: Math.max(100, Number(input.duration_ms ?? 2000)),
       ...(input.rate_hz ? { rateHz: Number(input.rate_hz) } : {}),
+      ...(input.port ? { port: String(input.port) } : {}),
     };
-    if (chosen === "pyvisa" || chosen === "scpi") {
+
+    if (chosen.kind === "sigrok") {
+      const command = sigrokCommand({
+        ...request,
+        ...(input.driver ? { driver: String(input.driver) } : {}),
+        ...(input.channels ? { channels: String(input.channels) } : {}),
+      });
+      if (!command) return { isError: true, content: "could not build a sigrok command", display: "driver error" };
+      const result = await run(command.program, command.args, process.cwd(), command.timeoutMs);
+      const parsed = sigrokResult(result.output);
+      if (!parsed.ok) {
+        return { isError: true, content: `${parsed.error}. Check \`sigrok-cli -L\` for the driver id.`, display: "capture failed" };
+      }
+      const waveform = parseVcd(parsed.vcd ?? "");
+      return {
+        content: formatWaveform(waveform),
+        display: `${waveform.channels.length} channel(s)`,
+        data: { instrument: "sigrok", ...waveform },
+      };
+    }
+
+    if (chosen.kind === "pyvisa") {
       const python = process.platform === "win32" ? "python" : "python3";
       // A short script keeps the VISA dependency optional: it is only imported
       // when a measurement is actually requested.
+      const scpi = { durationMs: request.durationMs, ...(request.rateHz ? { rateHz: request.rateHz } : {}) };
       const script = [
         "import sys",
         "import pyvisa",
@@ -319,7 +360,7 @@ const measureTool: Tool = {
         input.port
           ? `res = rm.open_resource(${JSON.stringify(String(input.port))})`
           : "res = rm.open_resource(rm.list_resources()[0])",
-        "for cmd in " + JSON.stringify(scpiCommands(request)) + ":",
+        "for cmd in " + JSON.stringify(scpiCommands(scpi)) + ":",
         "    res.write(cmd)",
         `import time`,
         `deadline = time.time() + ${request.durationMs} / 1000`,
@@ -330,24 +371,42 @@ const measureTool: Tool = {
       ].join("\n");
       const result = await run(python, ["-c", script], process.cwd(), request.durationMs + 10_000);
       if (result.code !== 0) {
-        return { isError: true, content: `the instrument did not answer: ${result.output.slice(-800)}`, display: "instrument error" };
+        // A machine with pyvisa but no instrument is the common case, and the
+        // raw traceback says nothing useful about it. Name the likely cause.
+        const hint = /could not find an instrument|list_resources\(\)\[0\]|no instrument/i.test(result.output)
+          ? " (pyvisa is installed but no instrument answered; connect one or pass `port`)"
+          : "";
+        return { isError: true, content: `the instrument did not answer${hint}: ${result.output.slice(-800)}`, display: "instrument error" };
       }
       const samples = result.output
         .split(/\r?\n/)
         .map((line) => line.trim().split(/\s+/).map(Number))
         .filter((pair) => pair.length === 2 && pair.every((value) => Number.isFinite(value)))
         .map((pair, index) => ({ t: index, voltage: pair[0], current: pair[1] }));
-      const measurement = summarizeSamples(chosen, samples);
+      const measurement = summarizeSamples(chosen.kind, samples);
       return { content: formatMeasurement(measurement), display: `${samples.length} samples`, data: measurement };
     }
-    // A driver without a wired protocol yet says so instead of reporting a
-    // zero, which would read as "the board draws no current".
+
+    // Joulescope and PPK2 both print a text capture; each parser maps by header
+    // so a column reorder in a new release fails loudly instead of swapping
+    // volts for amps.
+    const command = chosen.kind === "joulescope" ? joulescopeCommand(request) : ppk2Command(request);
+    if (!command) return { isError: true, content: `could not build a ${chosen.kind} command`, display: "driver error" };
+    const result = await run(command.program, command.args, process.cwd(), command.timeoutMs);
+    const parsed = chosen.kind === "joulescope" ? parseJoulescopeCsv(result.output) : parsePpk2Output(result.output);
+    if (!parsed.ok || !parsed.samples) {
+      return {
+        isError: true,
+        content: `${chosen.kind} produced no usable capture: ${parsed.error ?? "unknown reason"}`,
+        display: "capture failed",
+      };
+    }
+    const measurement = summarizeSamples(chosen.kind, parsed.samples);
+    const notes = parsed.notes.length ? `\nnote: ${parsed.notes.join("; ")}` : "";
     return {
-      isError: true,
-      content:
-        `${chosen} is installed but this build has no driver for it yet. ` +
-        `Use a SCPI instrument (pyvisa) for now, or export its output to a file and read it with read_file.`,
-      display: "driver missing",
+      content: `${formatMeasurement(measurement)}${notes}`,
+      display: `${parsed.samples.length} samples`,
+      data: measurement,
     };
   },
 };
@@ -571,4 +630,88 @@ const pinmapTool: Tool = {
   },
 };
 
-export const runtimeTools: Tool[] = [testTool, traceTool, measureTool, powerTool, packsTool, datasheetTool, pinmapTool];
+/**
+ * Read a waveform that already exists on disk.
+ *
+ * Two inputs, both of them formats that are actually specified rather than
+ * guessed at: a VCD file (what sigrok, Verilator and every simulator writes)
+ * and a two-column numeric capture (time, voltage) thresholded into edges.
+ * A vendor's proprietary binary capture is refused by name instead of being
+ * mis-parsed into a plausible-looking wrong waveform.
+ */
+const waveformTool: Tool = {
+  name: "embed_waveform",
+  description:
+    "Summarise a captured waveform: a VCD file from sigrok or a simulator, or a two-column time/voltage CSV. Returns per-channel edge times and duty cycle rather than samples, so a long capture stays readable. Live capture is `embed_measure` with sigrok; this tool reads what is already on disk.",
+  readonly: true,
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "VCD or CSV file, relative to the workspace" },
+      threshold: { type: "number", description: "Voltage that splits high from low, for CSV input" },
+      channel: { type: "string", description: "Channel name filter for VCD input" },
+      max_edges: { type: "integer", description: "How many edges to print per channel, default 40" },
+    },
+    required: ["path"],
+    additionalProperties: false,
+  },
+  summarize: (input) => String(input.path ?? ""),
+  async execute(input, ctx): Promise<ToolResult> {
+    const path = join(ctx.cwd, String(input.path));
+    if (!existsSync(path)) return { isError: true, content: `${input.path} does not exist in the workspace`, display: "not found" };
+    const { readIfFile } = await import("../embedded/pinmap.ts");
+    const text = readIfFile(path, 8 * 1024 * 1024);
+    if (text === null) return { isError: true, content: `${input.path} could not be read`, display: "unreadable" };
+
+    const looksLikeVcd = /^\s*\$timescale|\$enddefinitions|\$var\b/m.test(text);
+    if (looksLikeVcd) {
+      const waveform = parseVcd(text);
+      const filter = String(input.channel ?? "").trim().toLowerCase();
+      const filtered = filter
+        ? { ...waveform, channels: waveform.channels.filter((channel) => channel.name.toLowerCase().includes(filter)) }
+        : waveform;
+      if (filtered.channels.length === 0) {
+        return {
+          isError: true,
+          content: `no channel matches "${filter}"; the file has: ${waveform.channels.map((channel) => channel.name).join(", ") || "none"}`,
+          display: "no match",
+        };
+      }
+      return { content: formatWaveform(filtered), display: `${filtered.channels.length} channel(s)`, data: filtered };
+    }
+
+    // Numeric CSV. The column order is header-driven when there is a header,
+    // and time-then-value otherwise — the two shapes every scope exports.
+    const rows = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+    const header = rows[0]?.toLowerCase() ?? "";
+    const hasHeader = /time|volt|value|current/.test(header);
+    const body = hasHeader ? rows.slice(1) : rows;
+    const samples = body
+      .map((line) => line.split(/[,;\t]/).map((cell) => Number(cell.trim())))
+      .filter((cells) => cells.length >= 2 && Number.isFinite(cells[0]) && Number.isFinite(cells[1]))
+      .map((cells) => ({ t: cells[0], value: cells[1] }));
+    if (samples.length === 0) {
+      return {
+        isError: true,
+        content:
+          `${input.path} is neither a VCD nor a two-column numeric capture. ` +
+          "Proprietary capture formats are not parsed here — export to VCD (sigrok: `-O vcd`) or CSV.",
+        display: "unsupported format",
+      };
+    }
+    const trace = digitize(samples, {
+      name: String(input.path),
+      ...(input.threshold !== undefined ? { threshold: Number(input.threshold) } : { autoThreshold: true }),
+    });
+    return {
+      content: formatDigitalTrace(trace, Math.min(200, Math.max(1, Number(input.max_edges ?? 40)))),
+      display: `${trace.edges.length} edge(s)`,
+      data: trace,
+    };
+  },
+};
+
+export const runtimeTools: Tool[] = [testTool, traceTool, measureTool, powerTool, packsTool, datasheetTool, pinmapTool, waveformTool];

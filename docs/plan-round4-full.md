@@ -57,7 +57,7 @@
 | A14 D26 | ✅ | 无压缩 thrashing 熔断 | 连续 3 次压缩后仍超 90% 就停止自动压缩并提示一次 | 模拟回满，第 3 次后不再压缩且告警 |
 | A15 D27 | ✅ | 无每模型/子代理独立窗口配置 | `Config.contextWindowByModel`；子代理 `subagentContextWindow` | 子代理用独立窗口；主会话不变 |
 | A16 D28 | ✅ | maxTurns 到达无 partial 标记 | 子代理到上限时报告前缀 `[partial: turn limit N]`；主循环同样标注 | 25 轮子代理报告带 partial |
-| A17 D29 | ⛔ | 流式工具参数不提前执行 | 保守实现：SSE 结束时按调用完成顺序逐个启动（已完成参数解析的调用先执行），事件顺序不变 | 两个调用同一批，先完成的先开始（时间戳断言） |
+| A17 D29 | ⛔ | 流式工具参数不提前执行 | **不做**（见 C 级）。现状是 `runToolBatch`（`query.ts:334`）在 SSE 结束后才开始：相邻的只读调用并发跑（`Promise.all`），写调用串行；结果一律按**调用顺序**回填，不按完成顺序 | — |
 | A18 D30 | ✅ | 预算只在 CLI 一键模式 | REPL `/budget`、桌面设置项、goal 循环预算；run 内每轮检查 | 超预算在轮中途停止；REPL/桌面生效 |
 | A19 D31 | ✅ | 无会话级 token/rollout 预算 | `Config.sessionTokenBudget`，跨 run 累计，超限拒绝下一轮 | 第二个 run 被拒绝并说明已用/上限 |
 
@@ -76,7 +76,7 @@
 | B7 T13 | ✅ | hooks 事件少、blocked 语义 exit≠0 | 补 `PermissionRequest`、`PostToolUseFailure`、`SessionEnd`、`Notification`；blocked 改为 exit 2（兼容旧行为注释） | 新事件被触发；exit 1 不再静默阻断 |
 | B8 T14 | ✅ | hook 不能返回结构化权限决定 | HookResult 加 `permissionDecision` / `additionalContext` / `updatedMCPToolOutput` | hook 返回 allow 时不再弹窗；additionalContext 进上下文 |
 | B9 T15 | ✅ | CLI 不触发 SessionStart/Stop | REPL 与一次性 CLI 启动/退出各触发一次 | hook 日志两条 |
-| B10 T16 | ✅ | 无 mcp login/logout；token 未进 keychain | 新增 `prometheus mcp login <server>` / `logout`；Windows 用 DPAPI 加密（无原生依赖，用 PowerShell 调 ProtectedData）否则退回 600 文件 | login 后 token 落盘加密；logout 删除 |
+| B10 T16 | ✅ | 无 mcp login/logout；token 未进 keychain | 新增 `prometheus mcp login <server>` / `logout`（跑与桌面同一套 PKCE 流程）；token 写 `mode 0o600`，Windows 上再调 `icacls /inheritance:r /grant:r <user>:F` 去掉继承权限。**未做**：计划里写的 DPAPI 加密——同一用户的任意进程都能解开 DPAPI，收益主要是防止复制文件到别的账户，而 ACL 已经挡住这一点；少一层自造加密也少一处会静默失败的路径 | `prometheus mcp login` 能授权并落盘；`icacls` 后只有当前账户可读；logout 删除 |
 | B11 T17 | ✅ | resources/prompts 的 list_changed 要下次会话；sampling 拒绝 | 两个 list_changed 实时刷新；sampling 走 `sampling/createMessage`（用当前模型） | 服务器推送后目录即时更新；sampling 返回文本 |
 | B12 T19 | ✅ | 不读 `.mcp.json`；项目服务器无批准 | 读 `.mcp.json`；项目服务器 pending approval，设置页启用 | clone 仓库后首次不自动启动，需批准 |
 | B13 T20 | ✅ | 子代理 hooks 为空 | 子代理继承父 hooks（带 source 标注） | 子代理工具调用触发 hook |
@@ -142,7 +142,7 @@
 | D28 E31 | ⛔ | 无波形 | 逻辑分析仪/示波器驱动 + 基本异常解释 | 假波形解析 |
 | D29 E32 | ✅ | 无烧录历史 | 每次 flash 追加 `sessions/<id>/flashes.jsonl`（时间、hash、target、flasher、verified、耗时） | 两次烧录两条记录 |
 | D30 E33 | ⛔ | 无测量面板 | 依赖 D27/D28；有数据才显示 | 无数据时不显示 |
-| D31 E34 | ⛔ | 工具链目录无 pyocd/probe-rs/esptool | 增加下载项（Windows x64）；Linux/macOS 明确不做 | 目录列出三项 |
+| D31 E34 | ⛔ | 工具链目录无 pyocd/probe-rs/esptool | **不做**（见 C 级）。真实状态：`src/packs/catalog.ts` 只有 gcc-arm、gcc-riscv、openocd、cmake、ninja 五项，这三项一条都没有；缺工具时走 `installHints.ts` 给官方命令 | — |
 | D32 E35 | ✅ | 启动前不清理残留 server | 启动前探测并清理自己的残留（按 pid 文件），不杀别人的 | 残留 pid 被清理，他人进程不动 |
 
 ---
@@ -219,13 +219,15 @@
 
 | 条目 | 理由 | 替代 |
 |---|---|---|
-| T1 OS 级内核沙箱（文件/网络隔离） | 与「Windows 单平台 + 零运行时依赖」冲突；AppContainer 在本机不可用；限制型令牌沙箱是独立项目 | Job Object 进程树终结 + 命令分类器 + 环境变量隔离；文档已如实说明「策略层不是安全边界」 |
-| G11 同窗分屏 | renderer 与 host 是 1:1，分屏要重写对话容器与 IPC 所有权，属于架构级改动 | 多窗口并行（已有），配合 F12/G13 恢复上次会话 |
-| G21 非 PTY 终端 | 需要 node-pty 原生依赖，违背 README 的零依赖承诺 | 现有非 PTY 路径已加固；交互式程序明确拒绝 |
-| E18 云托管定时任务（原 S21 的托管部分） | ⛔ | 托管基础设施与本机优先的定位冲突 | 本地调度（E18 的本地部分仍然做） |
+| E18 云托管定时任务（原 S21 的托管部分） | 托管基础设施与本机优先的定位冲突；本地的调度（`schedule.ts` + Windows 任务计划）已经把「到点执行、错过补跑」做完了，云端那部分只是换个地方托管 | 本地调度（E18 的本地部分仍然做） |
 | E29–E31、E33 测量/波形/HIL 面板（需仪器） | 无硬件无法验证，且 D27/D28 驱动层已提供可插拔接口 | 提供驱动接口与假设备单测；面板等有数据再显示 |
-| D29（原 A17）流式工具参数提前执行 | 在 SSE 结束前启动已解析完的调用，会让"同一批调用"的执行顺序依赖网络分片，与工具管线的顺序保证冲突；收益只是省下毫秒级时间 | 现在整批在响应结束后按顺序/并发规则执行，行为可预测 |
-| D31（原 E34）pyocd/probe-rs/esptool 自带下载 | 每条目录项都要求实测 SHA256；三者都是频繁发版的 Python/Rust 程序，编造哈希会导致"解压成功但跑不起来" | `src/embedded/installHints.ts` 给出官方安装命令，缺工具时报出 |
+| G11 同窗分屏 | renderer 与 host 是 1:1，分屏要重写对话容器与 IPC 所有权，属于架构级改动 | 多窗口并行（已有），配合 F12/G13 恢复上次会话 |
+| D28 E31 波形 | 没有逻辑分析仪/示波器的真机输出可对照，写解析器只能对着自己编的数据测——那是测假货。D27 的驱动接口已经留好，拿到真实波形样本再接 | 假波形解析不做；`instruments.ts` 的驱动接口保留 |
+| D30 E33 测量面板 | 依赖 D28；没有波形就没有可画的曲线。D27 已能返回测量标量，但一个只显示几个数字的"面板"不构成面板 | 面板等有数据源再显示 |
+| D31 E34 工具链自带下载 | 目录里每条都要实测 SHA256 才敢装。pyOCD/probe-rs/esptool 都是高频发版的 Python/Rust 程序，编一个哈希的后果是"解压成功但跑不起来"，比不提供入口更糟 | `installHints.ts` 给出官方安装命令，缺工具时直接报出来 |
+| D29（原 A17）流式工具参数提前执行 | 在 SSE 结束前启动已解析完的调用，会让同一批调用的执行顺序依赖网络分片，与工具管线的顺序保证冲突；收益只是省下毫秒级时间 | 整批在响应结束后执行，只读调用并发、写调用串行，结果按调用顺序回填（见 `query.ts:334`） |
+| G21 非 PTY 终端 | 需要 node-pty 原生依赖，违背 README 的零依赖承诺 | 现有非 PTY 路径已加固；交互式程序明确拒绝 |
+| T1 OS 级内核沙箱（文件/网络隔离） | 与「Windows 单平台 + 零运行时依赖」冲突；AppContainer 在本机不可用；限制型令牌沙箱是独立项目 | Job Object 进程树终结 + 命令分类器 + 环境变量隔离；文档已如实说明「策略层不是安全边界」 |
 | Linux/macOS 工具链下载 | 产品明确只做 Windows 端 | 仅 Windows x64 |
 
 ---
@@ -339,5 +341,56 @@
 明确仍不做（写进 C 级表）：A17 流式参数提前执行（会改变工具执行顺序语义，收益不确定）、
 D28 波形、D30 测量面板、D31 大体积工具链二进制自带下载（无法逐字节验证哈希）。
 
+## 事后核对（用户逐条追问时做的）
+
+上面那张「最后补的缺口」列表被逐条对照代码核过一遍，六项都真实存在且有测试。但核对时发现
+**文档有两处描述与代码不符**，已改正：
+
+- A17 那一行标着 ⛔，做法栏却写了一个实现、验收栏写了一条「时间戳断言」的测试——这条测试
+  不存在，而 `runToolBatch` 也从来不是"先完成先开始"。改为直说现状。
+- D31 的验收标准是「目录列出三项」，但 `src/packs/catalog.ts` 里从来没有 pyocd/probe-rs/
+  esptool。改为直说目录里只有五项。
+- B10 同一行里还写着「Windows 用 DPAPI 加密」，代码里只有 `icacls`。实测确认无 DPAPI
+  调用后改为如实描述，并写明不做的理由。
+
+这三处的共同点：把"打算做"写成了"已经做"。标 ✅ 的条目如果不是逐条回到代码里看，
+这种偏差不会自己暴露。
+
 验证：`tests/round4-ui.test.ts`（19 项全过）；`tests/round4-embedded.test.ts`（14 项全过）；
 `npx tsc --noEmit` 干净；42 个测试文件逐个跑，`fail 0`（合计 441 项通过）。
+
+## 第五轮：把 C 级表里被推翻的条目做掉
+
+用户看完 C 级表后推翻了其中五条。这轮的重做以「能实测就实测」为准，不再是纸面结论。
+
+- **D31 工具链自带下载**（原 ⛔）：实测下载 probe-rs 0.32.0（11,502,414 字节，
+  `56fc0564…4103`，与发布页 `.sha256` 逐字相符）、pyOCD 0.46.0（37,011,537 字节，
+  `bc36d027…5fe6`）、esptool 5.6.0（64,810,332 字节，`d55a96fb…9629`），三条写进
+  `src/packs/catalog.ts`。三个包用本地文件走完整安装事务（解压→校验→运行 validation）
+  全部通过，`detectToolchains()` 报出 `source: "pack"`。
+  顺带修 `registry.ts`：原先只按 `provides` 建映射，manifest 里 `executables[].toolchain`
+  声明的种类会被漏掉。
+- **T1 OS 级内核沙箱**（原 C 级"冲突"）：不冲突，Windows 有 WSL2。新建
+  `src/kernelSandbox.ts`：`unshare --user --map-root-user --net --mount --pid --fork`
+  + 工作区只读/读写绑定 + tmpfs home + `timeout` 杀进程组。实测：`network: off` 时
+  `curl` 失败、`open` 时 200；`writable: false` 时 `touch` 报 `Read-only file system`；
+  `sleep 30` 在 2 s 超时返回 124。接入 `shellTools.ts`，设置页可切换并显示
+  「WSL2（Ubuntu）可用」。
+  为此修了分类器：WSL 里路径是 POSIX，原先把 `/mnt/g/...` 判成工作区外，
+  导致沙箱模式下所有绝对路径都被封。`sandbox.ts` 增加 `PathFlavor`。
+- **D28/D30 波形与测量**（原 ⛔）：通用协议是 VCD（IEEE 1364，sigrok/Verilator/
+  仿真器都写）。新建 `waveform.ts`（VCD 解析 + 电压序列阈值数字化）与
+  `instrumentDrivers.ts`（Joulescope/PPK2/sigrok 驱动；列按表头映射，防止伏特安培
+  互换）。新增 `embed_waveform` 工具；`embed_measure` 原先对这三个工具只回
+  "没有驱动"，现在真跑。
+- **G11 同窗分屏**（原 ⛔）：会话锁要求一个会话只有一个写入者，所以分屏是
+  "两个窗口各带自己的 host"，不是一窗两会话。`main.js` 增加 `split-window`，
+  渲染层增加会话选择器与两个菜单入口。
+- **UI 流畅度**（子代理调研后逐条核对）：流式每帧两次强制布局 → 一次；光标元素
+  每帧重建导致从不闪烁 → 移动同一元素；增量 markdown 去掉每帧整段签名比较；
+  未闭合代码块加 300 字符渲染预算；diff 面板按内容签名跳过重建并保留滚动位置；
+  终端按帧合并；thinking 流按帧合并并只在贴底时跟随；plan 卡原地更新；
+  `session_status` 只更新对应行；find 的 smooth 滚动尊重 reduced-motion；
+  模态/抽屉/滚动按钮补过渡。
+
+验证：`npx tsc --noEmit` 干净；44 个测试文件、479 项通过、0 失败。

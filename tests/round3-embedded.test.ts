@@ -145,15 +145,11 @@ test("a .uf2 is only accepted by a flasher that can write it", () => {
 test("a tool that is still unimplemented is not advertised", async () => {
   const { embeddedTools } = await import("../src/tools/embeddedTools.ts");
   const names = new Set(embeddedTools.map((tool) => tool.name));
-  // embed_measure now has a driver (SCPI through pyvisa) and reports honestly
-  // when no instrument is attached, so it is no longer in this list.
-  // embed_datasheet and embed_pinmap now exist (PDF index; devicetree, SVD and
-  // pin-table sources) and report their limits honestly.
-  for (const missing of ["embed_waveform"]) {
-    assert.equal(names.has(missing), false, `${missing} must not be advertised until it exists`);
-  }
-  // The ones that do exist must each be callable without a missing peer.
-  for (const present of ["embed_measure", "embed_test", "embed_trace", "embed_power", "embed_packs", "embed_datasheet", "embed_pinmap"]) {
+  // embed_measure now has drivers (SCPI, Joulescope, PPK2, sigrok) and reports
+  // honestly when no instrument is attached. embed_datasheet and embed_pinmap
+  // read PDF indexes, devicetree, SVD and pin tables. embed_waveform reads VCD
+  // and thresholded CSVs. None of them is a placeholder any more.
+  for (const present of ["embed_measure", "embed_test", "embed_trace", "embed_power", "embed_packs", "embed_datasheet", "embed_pinmap", "embed_waveform"]) {
     assert.equal(names.has(present), true, `${present} is implemented and should be listed`);
   }
 });

@@ -249,9 +249,21 @@ export function packBinDirs(root: string = packsRoot()): Map<string, { dir: stri
       // `pathPrepend` entries are relative to the **pack** directory, so
       // `payload/bin` means `<pack>/payload/bin` — not `<pack>/payload/payload/bin`.
       const dir = join(pack.dir, entry);
-      for (const kind of pack.manifest.provides) {
+      // A `provides` entry may name one of several executables the pack
+      // installs, not the directory's own name. probe-rs ships `probe-rs.exe`,
+      // `cargo-flash.exe` and `cargo-embed.exe` together and declares
+      // `provides: ["probe-rs"]`, but `esptool`'s release declares
+      // `provides: ["esptool"]` while the detection spec also looks for
+      // `esptool.py` — mapping by `provides` alone is right either way. The
+      // executable list is consulted first so a pack that provides a kind
+      // under an executable name is still found.
+      const provided = new Set(pack.manifest.provides);
+      for (const executable of pack.manifest.executables) {
+        if (executable.toolchain) provided.add(executable.toolchain);
+      }
+      for (const kind of provided) {
         const list = map.get(kind) ?? [];
-        list.push({ dir, packId: pack.manifest.id });
+        if (!list.some((hit) => hit.dir === dir && hit.packId === pack.manifest.id)) list.push({ dir, packId: pack.manifest.id });
         map.set(kind, list);
       }
     }

@@ -106,12 +106,12 @@ export class IncrementalRenderer {
   constructor(copyLabel = "copy") {
     this.copyLabel = copyLabel;
     this.blocks = [];
-    this.lastSignature = "";
+    this.cachedHtml = "";
   }
 
   reset() {
     this.blocks = [];
-    this.lastSignature = "";
+    this.cachedHtml = "";
   }
 
   /** Split on blank lines, but never inside an unclosed fence. */
@@ -136,18 +136,47 @@ export class IncrementalRenderer {
   /** The full HTML for the source so far. */
   render(source) {
     const blocks = IncrementalRenderer.split(source);
-    const signature = blocks.join("\u0000");
-    if (signature === this.lastSignature) return this.html();
-    // Reuse the render of every block whose text did not change; only the
-    // tail block is usually different.
-    for (let index = 0; index < blocks.length; index++) {
-      const cached = this.blocks[index];
-      if (cached && cached.source === blocks[index]) continue;
+    // Streaming appends to the tail block, so the common case is "same block
+    // count, same prefix, different last block". Comparing only the blocks
+    // that can have changed — instead of building a signature of the whole
+    // reply every frame — keeps a long answer from costing O(n²) in string
+    // work alone.
+    let shared = 0;
+    const limit = Math.min(blocks.length, this.blocks.length);
+    while (shared < limit && this.blocks[shared].source === blocks[shared]) shared++;
+
+    // An unterminated code fence is one block that grows with every token, and
+    // re-highlighting it is the expensive case: cost grows with the square of
+    // the block, so a 3000-line paste pasted in would re-render 3000 lines on
+    // every frame. Skip the re-render until ~300 more characters have arrived;
+    // the cached source deliberately stays stale so the next call sees the
+    // growth and eventually renders. The final call — the one after the fence
+    // closes or the turn ends — always renders, because the block then stops
+    // being an open fence.
+    const tail = blocks[blocks.length - 1] ?? "";
+    const fenceMarks = (tail.match(/```/g) ?? []).length;
+    const tailIsOpenFence = /^\s*```/.test(tail) && fenceMarks % 2 === 1;
+    if (tailIsOpenFence && shared === blocks.length - 1 && this.blocks.length === blocks.length) {
+      const rendered = this.tailRenderedLength ?? 0;
+      if (tail.length - rendered < 300) return this.cachedHtml ?? this.html();
+      this.tailRenderedLength = tail.length;
+    }
+
+    const onlyTailChanged = shared === blocks.length - 1 && blocks.length === this.blocks.length;
+    if (!onlyTailChanged && shared === blocks.length && blocks.length === this.blocks.length) {
+      return this.cachedHtml ?? this.html();
+    }
+    for (let index = shared; index < blocks.length; index++) {
       this.blocks[index] = { source: blocks[index], html: renderMarkdown(blocks[index], this.copyLabel) };
     }
     this.blocks.length = blocks.length;
-    this.lastSignature = signature;
-    return this.html();
+    // A fence that just closed is no longer throttled; reset the mark so the
+    // next open fence starts its own budget.
+    if (!tailIsOpenFence) this.tailRenderedLength = 0;
+    // The join is the other half of the cost; it is only redone when a block
+    // actually changed, which is exactly the `shared < blocks.length` case.
+    this.cachedHtml = this.html();
+    return this.cachedHtml;
   }
 
   html() {

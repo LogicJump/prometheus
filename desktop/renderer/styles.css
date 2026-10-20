@@ -247,6 +247,9 @@ svg {
      header and the button row below it read the same number. */
   --rail-inset: 12px;
   -webkit-app-region: drag;
+  /* `contain` keeps a width animation from re-laying-out the conversation
+     column while the sidebar opens and closes. */
+  contain: layout paint;
   transition: width 180ms ease, flex-basis 180ms ease, padding 180ms ease;
 }
 
@@ -749,6 +752,14 @@ svg {
   white-space: pre-wrap;
   word-break: break-word;
   outline: none;
+  /* Each line is its own box so the scrollback can be re-rendered line by
+     line instead of as one text node the layout engine has to re-wrap. */
+  contain: content;
+}
+
+.terminal-line {
+  white-space: pre-wrap;
+  min-height: 1.5em;
 }
 
 .terminal-input-row {
@@ -849,6 +860,13 @@ svg {
   overflow: auto;
   font-family: var(--mono);
   font-size: var(--text-xs);
+  /* The body is hidden with `hidden`, which has no transition; JS paints
+     `.entering` for one frame so opening is a fade rather than a snap. */
+  transition: opacity var(--fast) var(--ease);
+}
+
+.inline-diff-body.entering {
+  opacity: 0;
 }
 
 .inline-diff-body .diff-gutter {
@@ -1993,6 +2011,18 @@ mark.find-hit.current {
   animation: blink 1s steps(2, start) infinite;
 }
 
+/* The caret element is created once per turn and *moved* into the last block
+   of the rendered prose on each frame, rather than being part of the HTML
+   string that is rebuilt. A caret inside the rebuilt string restarted its
+   blink animation on every token, so it never blinked. */
+.markdown > .caret {
+  vertical-align: baseline;
+}
+
+/* Settings, confirm and find dialogs used to appear with no transition at
+   all, while popovers slid in. The entry is defined once, next to the dialog
+   base styles, so every modal moves the same way. */
+
 @keyframes blink {
   50% {
     opacity: 0;
@@ -2147,6 +2177,15 @@ mark.find-hit.current {
   overflow-wrap: anywhere;
   max-height: 320px;
   overflow-y: auto;
+  /* Expanded output used to snap open. It still appears in one layout, but
+     with a short fade so the row does not jump; `.entering` is applied for a
+     single frame from JS because `hidden` cannot be transitioned. */
+  transition: opacity var(--fast) var(--ease);
+}
+
+.tool-output.entering {
+  opacity: 0;
+}
   border-left: 1px solid var(--border);
 }
 
@@ -2337,6 +2376,59 @@ mark.find-hit.current {
 .confirm-actions button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* Split view: pick the session that goes in the second window. The list is
+   the same row rhythm as the session sidebar, inside the dialog surface. */
+.split-dialog {
+  width: min(440px, calc(100vw - 40px));
+}
+
+.split-list {
+  max-height: min(45vh, 360px);
+  overflow-y: auto;
+  margin: 0 -6px 14px;
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.split-option {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: var(--text-sm);
+}
+
+.split-option:hover,
+.split-option:focus-visible {
+  background: var(--surface-hover);
+}
+
+.split-option:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.split-option-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.split-option-meta {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
 }
 
 .notice.warn {
@@ -3259,6 +3351,14 @@ mark.find-hit.current {
   color: var(--text-secondary);
   box-shadow: var(--shadow-popover);
   z-index: 11;
+  /* It is hidden with `[hidden]` (display: none), which cannot transition, so
+     JS paints it with `.entering` for one frame and then removes the class. */
+  transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease);
+}
+
+.scroll-bottom.entering {
+  opacity: 0;
+  transform: translateY(4px);
 }
 
 .scroll-bottom:hover {
@@ -4081,6 +4181,31 @@ mark.find-hit.current {
   max-height: 82vh;
   box-shadow: var(--shadow-popover);
   overflow: hidden;
+  /* Modals used to appear instantly while every popover slid in; this is the
+     same 6 px entry, in the same token, so the two read as one motion
+     language. The reduced-motion rule above switches it off. */
+  transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease);
+}
+
+/* The scrim fades with the dialog rather than appearing behind it. */
+.modal-scrim {
+  transition: opacity var(--fast) var(--ease);
+}
+
+@starting-style {
+  .modal-scrim,
+  .settings-dialog,
+  .shortcuts-dialog,
+  .input-dialog,
+  .confirm-overlay {
+    opacity: 0;
+  }
+  .settings-dialog,
+  .shortcuts-dialog,
+  .input-dialog,
+  .confirm-dialog {
+    transform: translateY(6px);
+  }
 }
 
 .shortcuts-dialog {
@@ -4256,6 +4381,11 @@ mark.find-hit.current {
     inset: 0 auto 0 0;
     z-index: 12;
     box-shadow: var(--shadow-popover);
+    /* The drawer slides on transform, which the compositor can animate
+       without laying out the column; the wide-window rule animates width
+       instead, and carries this transition with it, so the drawer inherited
+       a transition on properties it does not use — it jumped in and out. */
+    transition: transform var(--normal) var(--ease);
   }
   .shell.collapsed .sidebar {
     /* 窄窗口里侧栏是 position: fixed 的抽屉，负 margin 不起作用。

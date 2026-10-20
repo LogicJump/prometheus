@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld("prometheus", {
   pickDirectory: () => ipcRenderer.invoke("pick-directory"),
   pickFile: (options) => ipcRenderer.invoke("pick-file", options),
   newWindow: () => ipcRenderer.send("new-window"),
+  splitWindow: (options) => ipcRenderer.send("split-window", options),
   windowControl: (action) => ipcRenderer.send("window-control", action),
   windowState: () => ipcRenderer.invoke("window-state"),
   onWindowState: (handler) => {

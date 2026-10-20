@@ -510,7 +510,8 @@ test("toolEnv 不会修改 process.env", () => {
 
 // ---- 目录 ------------------------------------------------------------------
 
-import { catalogFor, isInstallable, CATALOG } from "../src/packs/catalog.ts";
+import { catalogFor, isInstallable, CATALOG, catalogEntry } from "../src/packs/catalog.ts";
+import { INSTALL_HINTS } from "../src/embedded/installHints.ts";
 
 test("没有校验和的条目不会出现在可安装列表里", () => {
   // 安装器拒绝无校验的包，所以目录也不该把这种条目摆给用户看。
@@ -564,5 +565,45 @@ test("目录里每个条目本身是自洽的", () => {
     assert.ok(entry.provides.length > 0, `${entry.id} 没有声明提供什么`);
     // 每个条目都必须能在装完后证明自己是可用的。
     assert.ok(entry.validation.command, `${entry.id} 没有验证命令`);
+  }
+});
+
+test("每种烧录器都至少有一个可安装的包，或者有安装提示", () => {
+  // 目录和 installHints 合起来必须覆盖探测器认识的所有烧录工具：
+  // 一个工具既不能下载、又不给安装命令，用户就只剩"自己去网上找"。
+  // 断言的是"有出路"，不是"必须内置下载"——两者都是合格答案。
+  const flashKinds = Object.values(TOOLCHAIN_INFO)
+    .filter((info) => info.group === "flash")
+    .map((info) => Object.entries(TOOLCHAIN_INFO).find(([, value]) => value === info)?.[0])
+    .filter((kind): kind is string => Boolean(kind));
+  assert.ok(flashKinds.includes("pyocd"));
+  const provided = new Set(CATALOG.flatMap((entry) => entry.provides));
+  for (const kind of flashKinds) {
+    const downloadable = provided.has(kind);
+    const hasHint = Boolean(INSTALL_HINTS[kind]?.command);
+    assert.ok(downloadable || hasHint, `${kind} 既不能从目录安装，也没有安装提示`);
+  }
+});
+
+test("三个内置烧录器的条目指向真实发布页的形状", () => {
+  // 哈希是实测的，但 URL 和归档结构是会随项目发布流程漂移的部分。
+  // 这里钉住的是"这条 URL 属于这个项目"，真正的字节校验在安装时做。
+  const cases = [
+    { id: "probe-rs-0.32.0-win32-x64", host: "github.com/probe-rs/probe-rs", exe: "probe-rs.exe" },
+    { id: "pyocd-0.46.0-win32-x64", host: "github.com/pyocd/pyOCD", exe: "pyocd.exe" },
+    { id: "esptool-5.6.0-win32-x64", host: "github.com/espressif/esptool", exe: "esptool.exe" },
+  ];
+  for (const expected of cases) {
+    const entry = catalogEntry(expected.id);
+    assert.ok(entry, `${expected.id} 不在目录里`);
+    assert.ok(entry.sources[0].url.includes(expected.host), `${expected.id} 的 URL 不属于 ${expected.host}`);
+    assert.ok(isInstallable(entry), `${expected.id} 没有可用的哈希，不会出现在安装列表里`);
+    assert.equal(entry.sources[0].sha256.length, 64);
+    assert.ok(
+      entry.executables.some((executable) => executable.path === expected.exe),
+      `${expected.id} 没有声明 ${expected.exe}`,
+    );
+    // 安装后探测器要靠 payload 里的目录找到它。
+    assert.ok(entry.env.pathPrepend.length > 0, `${expected.id} 没有把 payload 加进 PATH`);
   }
 });

@@ -111,10 +111,10 @@ function compareVersions(left, right) {
   return 0;
 }
 
-function startWindow() {
+function startWindow(options = {}) {
   // Read the candidate here, in the browser process, not at module load.
   const explicitWorkspace = app.isPackaged ? cliArgs.find(isDirectory) : undefined;
-  const startCwd = initialWorkspace(explicitWorkspace);
+  const startCwd = options.cwd || initialWorkspace(explicitWorkspace);
   if (process.env.PROMETHEUS_DEBUG_ARGV) {
     try {
       appendFileSync(process.env.PROMETHEUS_DEBUG_ARGV, `startCwd=${startCwd} cliArgs=${JSON.stringify(cliArgs)}\n`);
@@ -123,8 +123,7 @@ function startWindow() {
     }
   }
   const win = new BrowserWindow({
-    width: 1360,
-    height: 880,
+    ...(options.bounds ? options.bounds : { width: 1360, height: 880 }),
     minWidth: 900,
     minHeight: 600,
     show: false,
@@ -187,6 +186,8 @@ function startWindow() {
 
   let host = null;
   let hostCwd = startCwd;
+  /** A session this window was opened for; delivered when the host is ready. */
+  let sessionToLoad = options.loadSession ?? null;
 
   const sendToHost = (payload) => {
     if (!host) return;
@@ -208,10 +209,21 @@ function startWindow() {
       windowsHide: true,
     });
     createInterface({ input: host.stdout }).on("line", (line) => {
+      let message = null;
       try {
-        sendToRenderer(JSON.parse(line));
+        message = JSON.parse(line);
       } catch {
         sendToRenderer({ type: "notice", level: "warn", text: line });
+        return;
+      }
+      sendToRenderer(message);
+      // The host announces itself with `state` once `init` has been handled.
+      // Sending `loadSession` before that races the session id assignment, so
+      // the split window waits for the first state rather than for a timer.
+      if (message?.type === "state" && sessionToLoad) {
+        const id = sessionToLoad;
+        sessionToLoad = null;
+        sendToHost({ cmd: "loadSession", id });
       }
     });
     createInterface({ input: host.stderr }).on("line", (line) => {
@@ -344,6 +356,43 @@ app.whenReady().then(() => {
   // parallel without sharing transcript state.
   ipcMain.on("new-window", () => {
     startWindow();
+  });
+
+  /**
+   * Split view: the current session on the left, `sessionId` on the right.
+   *
+   * This is the same mechanism as "New window" — one window, one host, one
+   * session — placed side by side instead of on top of each other. Two
+   * sessions in one window would mean either one host owning two transcripts
+   * (and the session lock's whole premise, that a window never writes a
+   * transcript another window writes, stops holding) or a renderer that
+   * multiplexes two NDJSON streams. Two windows cost one process each and
+   * keep every existing invariant.
+   *
+   * The child window is positioned to the right of the window that asked for
+   * it and gets the same workspace. `loadSession` is sent once its host says
+   * it is ready, which the host does with its first `state` event.
+   */
+  ipcMain.on("split-window", (event, request = {}) => {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const bounds = parent && !parent.isDestroyed() ? parent.getBounds() : null;
+    const screen = parent && !parent.isDestroyed() ? parent.getContentBounds() : null;
+    const child = startWindow({
+      ...(request.cwd ? { cwd: String(request.cwd) } : {}),
+      ...(request.sessionId ? { loadSession: String(request.sessionId) } : {}),
+      ...(screen
+        ? {
+            bounds: {
+              x: screen.x + Math.floor(screen.width / 2),
+              y: screen.y,
+              width: Math.max(640, Math.floor(screen.width / 2)),
+              height: Math.max(600, screen.height),
+            },
+          }
+        : {}),
+    });
+    void bounds;
+    void child;
   });
 
   // Custom caption buttons: the renderer owns their look, the main process

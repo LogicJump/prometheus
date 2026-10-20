@@ -123,7 +123,23 @@ export class SandboxError extends Error {
 }
 
 /** Classify a command line. Pure: no filesystem access, no spawn. */
-export function classifyCommand(command: string, cwd: string, policy: SandboxPolicy): CommandVerdict {
+/**
+ * Which filesystem the command's paths refer to.
+ *
+ * Under the WSL kernel sandbox the command runs with Linux paths, so the
+ * workspace is `/mnt/g/...` and a Windows `G:\...` string in the command is
+ * not an absolute path there at all. Judging a sandboxed command with Windows
+ * semantics rejected `cd /mnt/g/Develop/Prometheus && ls` as an escape from
+ * the workspace it was actually standing in.
+ */
+export type PathFlavor = "windows" | "posix";
+
+export function classifyCommand(
+  command: string,
+  cwd: string,
+  policy: SandboxPolicy,
+  options: { paths?: PathFlavor } = {},
+): CommandVerdict {
   if (policy.mode === "off") return { class: "allow", violations: [] };
 
   const violations: string[] = [];
@@ -177,7 +193,7 @@ export function classifyCommand(command: string, cwd: string, policy: SandboxPol
   // is invisible to the absolute-path scan, because `etc/passwd` is a relative
   // path resolved by the shell, not by us. The plan for the interpreter bypass
   // named `cd / && cat etc/passwd` as an example and it stayed allowed.
-  const cdEscape = cdOutsideWorkspace(command, cwd, policy.allowedDirs);
+  const cdEscape = cdOutsideWorkspace(command, cwd, policy.allowedDirs, options.paths ?? "windows");
   if (cdEscape) {
     return {
       class: "deny",
@@ -186,7 +202,7 @@ export function classifyCommand(command: string, cwd: string, policy: SandboxPol
     };
   }
 
-  const outside = pathsOutsideWorkspace(command, cwd, policy.allowedDirs);
+  const outside = pathsOutsideWorkspace(command, cwd, policy.allowedDirs, options.paths ?? "windows");
   if (outside.length > 0) {
     return {
       class: "deny",
@@ -215,7 +231,13 @@ export function classifyCommand(command: string, cwd: string, policy: SandboxPol
  * `cd && npm test` inside the workspace is fine, so only a target outside the
  * confined roots is refused.
  */
-export function cdOutsideWorkspace(command: string, cwd: string, allowedDirs: string[]): string | null {
+export function cdOutsideWorkspace(
+  command: string,
+  cwd: string,
+  allowedDirs: string[],
+  paths: PathFlavor = "windows",
+): string | null {
+  if (paths === "posix") return posixCdOutside(command, cwd, allowedDirs);
   const roots = [resolve(cwd), ...allowedDirs.map((dir) => resolve(cwd, dir))];
   const pattern = /(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)cd(?:\s+\/d)?\s+("[^"]+"|'[^']+'|[^\s;&|]+)/gi;
   for (const match of command.matchAll(pattern)) {
@@ -242,7 +264,13 @@ export function cdOutsideWorkspace(command: string, cwd: string, allowedDirs: st
  * conservative: a false positive is reported to the model with the offending
  * path, so it can rewrite the command relative to the workspace.
  */
-export function pathsOutsideWorkspace(command: string, cwd: string, allowedDirs: string[]): string[] {
+export function pathsOutsideWorkspace(
+  command: string,
+  cwd: string,
+  allowedDirs: string[],
+  paths: PathFlavor = "windows",
+): string[] {
+  if (paths === "posix") return posixPathsOutside(command, cwd, allowedDirs);
   const roots = [resolve(cwd), ...allowedDirs.map((dir) => resolve(cwd, dir))];
   // Only paths at an argument position count. A slash in the middle of a word
   // (`a/b`, `tests/*.test.ts`, a URL) is relative, not absolute.
@@ -277,8 +305,89 @@ export function pathsOutsideWorkspace(command: string, cwd: string, allowedDirs:
   return [...new Set(outside)].slice(0, 5);
 }
 
-/** Minimal environment for sandboxed commands; secrets are not inherited. */
+/* ---------- POSIX path flavour (WSL kernel sandbox) ---------- */
+
 /**
+ * The WSL side of the workspace.
+ *
+ * A sandboxed command sees the workspace at `/mnt/<drive>/<path>` and nothing
+ * in it is case-sensitive in the way Windows paths are. Keeping the check
+ * lexical, like its Windows counterpart, is deliberate: this is still a policy
+ * layer answering "did the model mean to leave the workspace", and the
+ * kernel's read-only bind is what enforces it.
+ */
+function posixRoot(cwd: string): string {
+  const drive = /^([A-Za-z]):[\\/]*(.*)$/.exec(cwd);
+  if (!drive) return cwd.replace(/\\/g, "/");
+  const rest = drive[2].replace(/\\/g, "/").replace(/\/+$/, "");
+  return `/mnt/${drive[1].toLowerCase()}${rest ? `/${rest}` : ""}`;
+}
+
+function posixInside(roots: string[], target: string): boolean {
+  const normalized = normalizePosix(target);
+  return roots.some((root) => {
+    const base = normalizePosix(root);
+    return normalized === base || normalized.startsWith(`${base}/`);
+  });
+}
+
+/** Resolve `.` and `..` the way the shell's `cd` would, without a filesystem. */
+export function normalizePosix(path: string): string {
+  const absolute = path.startsWith("/");
+  const parts: string[] = [];
+  for (const segment of path.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (parts.length === 0) {
+        if (absolute) continue;
+        parts.push("..");
+        continue;
+      }
+      parts.pop();
+      continue;
+    }
+    parts.push(segment);
+  }
+  return `${absolute ? "/" : ""}${parts.join("/")}` || (absolute ? "/" : ".");
+}
+
+export function posixCdOutside(command: string, cwd: string, allowedDirs: string[]): string | null {
+  const roots = [posixRoot(cwd), ...allowedDirs.map((dir) => posixRoot(resolve(cwd, dir)))];
+  const pattern = /(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)cd\s+("[^"]+"|'[^']+'|[^\s;&|]+)/gi;
+  for (const match of command.matchAll(pattern)) {
+    const raw = match[1].replace(/^["']|["']$/g, "");
+    if (!raw || raw === "~" || raw === "-") {
+      if (raw === "~" || raw === "-") return raw;
+      continue;
+    }
+    if (!raw.startsWith("/")) continue;
+    if (!posixInside(roots, raw)) return raw;
+  }
+  return null;
+}
+
+export function posixPathsOutside(command: string, cwd: string, allowedDirs: string[]): string[] {
+  const roots = [posixRoot(cwd), ...allowedDirs.map((dir) => posixRoot(resolve(cwd, dir)))];
+  const outside: string[] = [];
+  // Absolute tokens, but not the ones the base image itself provides. `/dev`,
+  // `/tmp` and `/proc` are inside the namespace and writable; refusing them
+  // would fail every shell pipeline that uses `/dev/null`.
+  for (const match of command.matchAll(/\/(?=[^\s'"|;&<>()])[^\s'"|;&<>()]*/g)) {
+    const token = match[0];
+    const at = match.index ?? 0;
+    if (at > 0 && /[\w.~-]/.test(command[at - 1])) continue;
+    if (/^\/(dev|tmp|proc|sys)(\/|$)/.test(token)) continue;
+    if (!posixInside(roots, token)) outside.push(token);
+  }
+  // `..` escapes are only meaningful relative to the workspace root.
+  for (const token of command.match(/(?:\.\.\/)+[^\s'"|;&<>()]*/g) ?? []) {
+    const target = normalizePosix(`${roots[0]}/${token}`);
+    if (!posixInside(roots, target)) outside.push(token);
+  }
+  return [...new Set(outside)].slice(0, 5);
+}
+
+/** Minimal environment for sandboxed commands; secrets are not inherited. *//**
  * Variables a sandboxed command may see, plus credentials the user injected.
  *
  * `sandbox.credentials` exists so a build can authenticate without the value

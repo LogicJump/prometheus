@@ -851,6 +851,23 @@ function buildBehaviorPage() {
         }),
       }),
       sRow({
+        id: "setting-kernel-sandbox",
+        label: s.kernelSandbox,
+        desc: state.kernelSandbox?.state === "ready"
+          ? s.kernelSandboxReady.replace("{distro}", String(state.kernelSandbox.distro ?? "WSL"))
+          : state.kernelSandbox?.reason ?? s.kernelSandboxChecking,
+        control: sSelect({
+          id: "setting-kernel-sandbox",
+          value: ["off", "auto", "wsl"].includes(settings.kernelSandbox) ? settings.kernelSandbox : "auto",
+          options: [
+            { value: "off", label: s.kernelSandboxOff },
+            { value: "auto", label: s.kernelSandboxAuto },
+            { value: "wsl", label: s.kernelSandboxRequire },
+          ],
+          onChange: (value) => applyConfig({ kernelSandbox: value }),
+        }),
+      }),
+      sRow({
         id: "setting-network",
         label: s.network,
         desc: s.networkDesc,
@@ -1996,6 +2013,10 @@ function fillSettings(settings) {
   state.outputStyle = settings.outputStyle ?? "default";
   state.archiveAfterDays = settings.archiveAfterDays ?? 0;
   state.sandbox = settings.sandbox === "off" ? "off" : "enforce";
+  // The WSL answer arrives with the settings payload so the row can state the
+  // truth ("Ubuntu is available") instead of offering a switch with no visible
+  // effect.
+  state.kernelSandbox = settings.kernelSandboxState ?? state.kernelSandbox ?? null;
   setMode(state.mode);
   if (!settingsDialog.hidden) rerenderSettingsPage(state.settingsTab);
 }

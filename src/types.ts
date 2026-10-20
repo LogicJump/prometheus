@@ -155,6 +155,10 @@ export interface Config {
    * written to a transcript.
    */
   sandboxCredentials?: Record<string, string>;
+  /** Kernel sandbox: `off` = policy only, `auto` = WSL when present, `wsl` = require it. */
+  kernelSandbox?: "off" | "auto" | "wsl";
+  /** WSL distribution to run sandboxed commands in; empty = the first listed. */
+  kernelSandboxDistro?: string;
   /**
    * Send `reasoning_content` back on later turns. Only for providers whose
    * tool loop needs the previous reasoning; an unknown field is a 400 risk on

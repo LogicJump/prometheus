@@ -58,6 +58,18 @@ interface FileConfig {
   goalBudgetUsd?: number;
   sandboxFailIfUnavailable?: boolean;
   sandboxCredentials?: Record<string, string>;
+  /**
+   * Run shell commands inside WSL2 instead of on Windows.
+   *
+   * `policy` is the classifier only, which is what this build did before the
+   * kernel sandbox existed. `wsl` adds a private network namespace, a
+   * read-only or read-write bind of the workspace, and a tmpfs home. `auto`
+   * uses WSL when it is installed and falls back to `policy` when it is not,
+   * saying so in the status line rather than silently downgrading.
+   */
+  kernelSandbox?: "off" | "auto" | "wsl";
+  /** WSL distribution name; empty means the first one listed. */
+  kernelSandboxDistro?: string;
 }
 
 function readJson(path: string): FileConfig {
@@ -204,6 +216,16 @@ function validCredentials(value: unknown): Record<string, string> | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * Kernel sandbox mode.
+ *
+ * An unrecognised value falls back to `auto`, never to `off`: a typo must not
+ * be the thing that removes confinement. `off` has to be chosen explicitly.
+ */
+function validKernelSandbox(value: unknown): "off" | "auto" | "wsl" {
+  return value === "off" || value === "wsl" ? value : "auto";
+}
+
 /** Split a comma- or space-separated tool list; empty entries are dropped. */
 export function parseToolList(value: string | undefined): string[] {
   if (!value) return [];
@@ -289,6 +311,15 @@ export function loadConfig(cli: Partial<Config> = {}): Config {  mkdirSync(HOME_
     goalBudgetUsd: positiveNumber(cli.goalBudgetUsd ?? file.goalBudgetUsd),
     sandboxFailIfUnavailable: cli.sandboxFailIfUnavailable ?? file.sandboxFailIfUnavailable ?? false,
     sandboxCredentials: validCredentials(cli.sandboxCredentials ?? file.sandboxCredentials),
+    // Default is `auto`: a machine with WSL gets real confinement with no
+    // configuration, and one without it behaves exactly as before. A typo in
+    // the value must not silently weaken the sandbox, so unknown strings fall
+    // back to the default rather than to `off`.
+    kernelSandbox: validKernelSandbox(cli.kernelSandbox ?? file.kernelSandbox),
+    kernelSandboxDistro:
+      typeof (cli.kernelSandboxDistro ?? file.kernelSandboxDistro) === "string"
+        ? String(cli.kernelSandboxDistro ?? file.kernelSandboxDistro).trim() || undefined
+        : undefined,
   };
 
   // A per-model window only helps if it is actually consulted.
