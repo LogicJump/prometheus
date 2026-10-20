@@ -140,7 +140,47 @@ Error: Flash Download failed  -  Target DLL has been cancelled
 
 ---
 
-## 五、仍然做不到的
+## 五、接口清单与覆盖情况
+
+公开接口共 **88 个操作**，当前：**71 个已接通并实测**，**17 个在该版本上不可用**（逐个列在下面，
+并在 `UNSUPPORTED_ON_MDK_5_43` 里带实测理由）。没有「定义了但从不调用」的。
+
+### 本轮补上的（上一版漏掉的）
+
+| 操作 | 实测结果 |
+|---|---|
+| `DBG_CALC_EXPRESSION` | **可用且比命令窗口好**：一次拿到 64 位值加调试器自己的渲染（`main` → `0x08006be0`） |
+| `DBG_RESET` | 可用，复位后目标重新走到 `SystemInit` |
+| `DBG_RUN_TO_ADDRESS` | 可用，停在目标地址 |
+| `DBG_STEP_HLL_N` / `STEP_INSTRUCTION_N` | 可用，按行/按指令走 N 步 |
+| `DBG_DSM_READ` | 可用但**内容很少**：该版本只回一个指令字且 `nLen=0`，如实报告而不是伪造反汇编 |
+| `DBG_ENUM_MENUS` / `MENU_EXEC` | 可用，列出 Trace Data / Performance Analyzer 等 12 项及启用状态 |
+| `DBG_ENUM_VTR` / `VTR_SET` | 枚举可用（`CURR_TID`、`TRAPS`、`STCLK`…）；`VTR_SET` 只对枚举出的名字生效 |
+| `DBG_ITM_REGISTER` / `EVTR_REGISTER` / `EVTR_ENUMSCVDFILES` | 均可用 |
+| `DBG_TIME_INFO` | 可用（仿真器时钟：周期数 + 时间戳） |
+| `PRJ_GET_DEBUG_TARGET` / `PRJ_SET_OUTPUTNAME` | 可用 |
+| `GEN_CHECK_LICENSE` / `GEN_GET_EXTVERSION` | 可用，回 `uVision V5.43.1.0 / UVSOCK V2.29` |
+| `GEN_SHOW` / `HIDE` / `MINIMIZE` | 可用 |
+| `DBG_ADR_SHOWCODE` | 可用（在 IDE 里定位到地址） |
+
+### 该版本上不可用的（不是没写，是接口不工作）
+
+| 操作 | 实测行为 |
+|---|---|
+| `DBG_READ_REGISTERS` | **忽略寄存器名**，对 `PC`/`SP`/`R13`/`R0,R1` 一律回 `0x00000000`。假数据比拒绝更糟，所以改从枚举里按名取 |
+| `DBG_EVAL_WATCH_EXPRESSION` / `REMOVE_WATCH_EXPRESSION` | 任何表达式都回 `NOT_SUPPORTED` |
+| `DBG_EVAL_EXPRESSION_TO_STR` | 永不回复 |
+| `DBG_EVTR_GETSTATUS` | 永不回复 |
+| `DBG_ENUM_SYMTP` | 回 `PARSE_ERROR`（缺该版本不暴露的 symbol-table id） |
+| `DBG_VTR_GET` | 回 `FAILED: Unknown VTR-name`，即使名字是它自己枚举出来的 |
+| `DBG_FILELINE_TO_ADR` | 相对/绝对路径都回 `NO_ADRMAP: Address mapping failed` |
+| `DBG_VERIFY_CODE` | 仿真器目标上回 `FAILED`（没有可校验的 flash） |
+| `DBG_STEP_INTO_N` | 头文件注明不带计数；`_HLL_N` 与 `_INSTRUCTION_N` 可用 |
+| `PRJ_ACTIVE_FILES` / `PRJ_CLOSE` / `PRJ_LOAD` / `GEN_SET_OPTIONS` | 只在非调试会话可用，而这几项在那里没有意义（工程由 `-s` 启动行打开，会话由退出 uVision 结束） |
+| `DBG_WAKE` / `DBG_SLEEP` / `DBG_SET_CALLBACK` | 仿真器专有，接受但无可观察效果 |
+| `PRJ_CMD_PROGRESS` | 是通知（`0x500D` 一族），不是命令 |
+
+## 六、仍然做不到的
 
 诚实清单，都有实测依据：
 
@@ -158,7 +198,7 @@ Error: Flash Download failed  -  Target DLL has been cancelled
 
 ---
 
-## 六、验证
+## 七、验证
 
 `tests/round12-uvsock.test.ts`（17 条）把上面每一条实测到的字节形状固定成断言：
 32 字节头、分片重组、`SSTR` 与「计数不含结尾 0」的区别、`TRNOPT` 的 0 与偏移 3、
@@ -186,7 +226,7 @@ keil_project set_option CDEF    → 读回包含新值
 
 ---
 
-## 七、边界没有变
+## 八、边界没有变
 
 - 安装包里仍然没有任何 Keil 二进制、器件包或编译器。
 - 不下载、不重分发；没有「一键安装」按钮。

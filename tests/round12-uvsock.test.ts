@@ -20,8 +20,13 @@ import {
   messagePayload,
   prjData,
   readCountedString,
+  readDisassembly,
   readMemoryReply,
+  readMenu,
   readSstr,
+  readVset,
+  readVtrFrame,
+  vset,
   readTrnOpt,
   sstr,
   statusName,
@@ -31,6 +36,7 @@ import {
   trnOptValue,
   type AsyncFrame,
 } from "../src/embedded/uvsock.ts";
+import { UNSUPPORTED_ON_MDK_5_43 } from "../src/embedded/keilExtra.ts";
 
 /* ---------- framing ---------- */
 
@@ -200,6 +206,60 @@ test("a memory reply is the address, the bytes, and the error address", () => {
   assert.equal(decoded?.address, 0x20000000);
   assert.deepEqual(decoded?.bytes, [0xa8, 0x09, 0x00, 0x20]);
   assert.equal(decoded?.errorAddress, undefined, "no error address on success");
+});
+
+/* ---------- the operations added after the first audit ---------- */
+
+test("a VSET reply carries a 64-bit value and the debugger's rendering", () => {
+  // Measured for `main`: 05 00 00 00 | e0 6b 00 08 00 00 00 00 | 05 00 00 00 "main "
+  const reply = Buffer.from("05000000e06b000800000000050000006d61696e00", "hex");
+  const decoded = readVset(reply);
+  assert.equal(decoded?.type, 5);
+  assert.equal(decoded?.value, 0x08006be0n);
+  assert.equal(decoded?.text, "main");
+});
+
+test("a VSET request puts no literal value and the expression as an SSTR", () => {
+  const request = vset("main");
+  assert.equal(request.readInt32LE(0), 0, "no literal value");
+  assert.equal(request.readInt32LE(12), 5, "length including the terminator");
+  assert.equal(request.toString("latin1", 16, 21), "main ");
+});
+
+test("a menu entry's label runs to the length, not one short of it", () => {
+  // Measured: 00 00 00 00 | 00 00 00 00 | 01 00 00 00 | 01 00 00 00 | 0a 00 00 00 "Trace Data "
+  const frame: AsyncFrame = { type: 0x5061, echoed: 0, data: Buffer.from("000000000000000001000000010000000a0000005472616365204461746100", "hex"), raw: Buffer.alloc(0) };
+  const entry = readMenu(frame);
+  assert.equal(entry?.label, "Trace Data", "reading length - 1 cut the last letter");
+  assert.equal(entry?.enabled, true);
+});
+
+test("a trace-variable name is counted without its terminator", () => {
+  // Measured AVTR: 12 00 00 00 | 7 zero words | 09 00 00 00 | 2 zero words | "CURR_TID "
+  const body = Buffer.alloc(53);
+  body.writeUInt32LE(0x12, 0);
+  body.writeUInt32LE(9, 32);
+  body.write("CURR_TID ", 44, "latin1");
+  const frame: AsyncFrame = { type: 0x5018, echoed: 0, data: body, raw: Buffer.alloc(0) };
+  assert.equal(readVtrFrame(frame)?.name, "CURR_TID");
+});
+
+test("a disassembly reply reports the word it holds even with a zero length", () => {
+  // Measured for 0x08006be0: address, nLen = 0, then one instruction word.
+  // address(8) | nLen(4) | nErr(4) | ErrAddr(8) | the word at 24
+  const reply = Buffer.from("e06b0008000000000000000000000000000000000000000020c0e30e", "hex");
+  const decoded = readDisassembly(reply);
+  assert.equal(decoded?.address, 0x08006be0);
+  assert.equal(decoded?.bytes, 0);
+  assert.deepEqual(decoded?.words, [0x0ee3c020]);
+});
+
+test("the unsupported list names why, never a bare flag", () => {
+  for (const [name, reason] of Object.entries(UNSUPPORTED_ON_MDK_5_43)) {
+    assert.ok(reason.length > 20, `${name} needs a measured reason`);
+  }
+  // The one that would quietly return a wrong number is named explicitly.
+  assert.match(UNSUPPORTED_ON_MDK_5_43.DBG_READ_REGISTERS ?? "", /0x00000000/);
 });
 
 /* ---------- status names ---------- */

@@ -36,7 +36,6 @@ import {
   currentTarget,
   eraseFlash,
   evaluate,
-  evaluateWatch,
   evalInWindow,
   flashInIde,
   getOption,
@@ -55,6 +54,21 @@ import {
   readTasks,
   readVariables,
   readVtr,
+  readNamedRegisters,
+  showCodeAt,
+  disassemble,
+  execMenu,
+  ideVersionText,
+  licenseInfo,
+  readMenus,
+  resetTarget,
+  runToAddress,
+  setVariable,
+  setVtr,
+  stepMany,
+  timeInfo,
+  windowState,
+  waitForStop,
   removeFile,
   removeGroup,
   run,
@@ -132,15 +146,19 @@ const keilDebugTool: Tool = {
           "run",
           "continue",
           "halt",
+          "reset",
+          "run_to",
           "step",
           "step_into",
           "step_instruction",
           "step_out",
+          "step_many",
           "breakpoints",
           "breakpoint_add",
           "breakpoint_delete",
           "watch_add",
           "registers",
+          "register_read",
           "register_set",
           "variables",
           "stack",
@@ -148,8 +166,17 @@ const keilDebugTool: Tool = {
           "read",
           "write",
           "evaluate",
+          "variable_set",
           "tasks",
           "trace",
+          "trace_set",
+          "disassemble",
+          "menus",
+          "menu_exec",
+          "time",
+          "license",
+          "version",
+          "window",
           "build",
           "rebuild",
           "flash",
@@ -164,13 +191,14 @@ const keilDebugTool: Tool = {
       port: { type: "integer", description: "UVSOCK TCP port when 4823 is taken" },
       location: { type: "string", description: "For breakpoint_add/breakpoint_delete/watch_add: a function, `file:line`, `*0x08001234`, or the breakpoint number" },
       kind: { type: "string", enum: ["exec", "read", "write", "readwrite"], description: "Breakpoint kind (default exec)" },
-      address: { type: "integer", description: "For read/write: the address" },
+      address: { type: "integer", description: "For read/write/run_to/disassemble: the address" },
       width: { type: "string", enum: ["u8", "u16", "u32"], description: "For read/write: access width (default u32)" },
-      count: { type: "integer", description: "For read: how many values (default 1, max 256)" },
+      count: { type: "integer", description: "For read: how many values; for step_many: how many steps (default 1)" },
       value: { type: "integer", description: "For write: the value to store" },
       expression: { type: "string", description: "For evaluate: a debugger expression, e.g. `uwTick` or `&g_state`" },
       name: { type: "string", description: "For a register write: the register name" },
       register_value: { type: "string", description: "For a register write: the new value" },
+      window: { type: "string", enum: ["show", "hide", "minimize"], description: "For action `window`: what to do to the uVision window" },
       timeout_ms: { type: "integer", description: "How long to wait for a stop (default 30000)" },
     },
     required: ["action"],
@@ -212,11 +240,26 @@ const keilDebugTool: Tool = {
         lines.push(...describeStop(await run(session, Number(input.timeout_ms ?? 30_000))));
         const where = await currentLocation(session);
         if (where) lines.push(`at ${describeWhere(where)}`);
+      } else if (action === "reset") {
+        const done = await resetTarget(session);
+        lines.push(...(done.lines.length > 0 ? done.lines : [done.ok ? "target reset" : `reset failed: ${done.message ?? "no reason given"}`]));
+      } else if (action === "run_to") {
+        const address = Number(input.address);
+        if (!Number.isFinite(address)) return { isError: true, content: "run_to needs an `address`.", display: "missing address" };
+        lines.push(...describeStop(await runToAddress(session, address, (_session, mark, timeoutMs) => waitForStop(session, mark, timeoutMs), Number(input.timeout_ms ?? 30_000))));
+        const where = await currentLocation(session);
+        if (where) lines.push(`at ${describeWhere(where)}`);
       } else if (action === "halt") {
         lines.push(...describeStop(await halt(session)));
       } else if (action === "step" || action === "step_into" || action === "step_instruction" || action === "step_out") {
         const kind = action === "step" ? "over" : action === "step_into" ? "into" : action === "step_instruction" ? "instruction" : "out";
         lines.push(...describeStop(await step(session, kind, Number(input.timeout_ms ?? 15_000))));
+        const where = await currentLocation(session);
+        if (where) lines.push(`at ${describeWhere(where)}`);
+      } else if (action === "step_many") {
+        const steps = Math.max(1, Math.min(1000, Number(input.count ?? 1)));
+        const kind = input.width === "u8" ? "instruction" : "line";
+        lines.push(...describeStop(await stepMany(session, steps, kind, (_session, mark, timeoutMs) => waitForStop(session, mark, timeoutMs))));
         const where = await currentLocation(session);
         if (where) lines.push(`at ${describeWhere(where)}`);
       } else if (action === "breakpoints") {
@@ -260,6 +303,11 @@ const keilDebugTool: Tool = {
         for (const entry of list) lines.push(`${entry.name.padEnd(6)} ${entry.value}${entry.isPC ? "   <- PC" : ""}`);
         const groups = await readRegisterGroups(session);
         if (groups.length > 0) lines.push("", `groups: ${groups.join(", ")}`);
+      } else if (action === "register_read") {
+        const list = String(input.location ?? input.expression ?? "").split(/[,\s]+/).filter(Boolean);
+        if (list.length === 0) return { isError: true, content: "register_read needs register names in `location`, e.g. `PC,SP,LR`.", display: "missing registers" };
+        const values = await readNamedRegisters(session, list);
+        for (const entry of values) lines.push(`${entry.name} = ${entry.value || "(not in the register enumeration)"}`);
       } else if (action === "register_set") {
         const name = input.name ? String(input.name) : "";
         const value = input.register_value !== undefined ? String(input.register_value) : "";
@@ -323,19 +371,67 @@ const keilDebugTool: Tool = {
       } else if (action === "evaluate") {
         const expression = input.expression ? String(input.expression) : "";
         if (!expression) return { isError: true, content: "evaluate needs an `expression`.", display: "missing expression" };
-        // The command window is the path the debugger actually supports; the
-        // dedicated watch request answers NOT_SUPPORTED on this uVision.
-        const direct = await evaluateWatch(session, expression);
-        const viaWindow = direct.ok && direct.value ? null : await evalInWindow(session, expression);
-        const value = direct.ok && direct.value ? direct.value : viaWindow?.value;
-        if (value) lines.push(`${expression} = ${value}`);
-        else lines.push(`the debugger could not evaluate ${expression}${viaWindow?.lines.length ? `: ${viaWindow.lines.join(" ")}` : ""}`);
+        // `CALC_EXPRESSION` is the interface's own evaluator; the command
+        // window is the fallback for forms it refuses.
+        const direct = await evaluate(session, expression);
+        if (direct.ok) {
+          const rendered = direct.text && direct.text !== expression ? direct.text : `0x${(direct.value ?? 0n).toString(16)}`;
+          lines.push(`${expression} = ${rendered}${direct.value !== undefined ? ` (${direct.value})` : ""}`);
+        } else {
+          const viaWindow = await evalInWindow(session, expression);
+          lines.push(viaWindow.ok ? `${expression} = ${viaWindow.value}` : `the debugger could not evaluate ${expression}: ${direct.message ?? viaWindow.lines.join(" ")}`);
+        }
+      } else if (action === "variable_set") {
+        const name = input.expression ? String(input.expression) : "";
+        const value = input.value !== undefined ? String(input.value) : "";
+        if (!name) return { isError: true, content: "variable_set needs an `expression` naming the variable.", display: "missing variable" };
+        const reply = await setVariable(session, name, value);
+        lines.push(reply.ok ? `${name} = ${value}` : `could not set it: ${reply.message ?? reply.statusName}`);
+      } else if (action === "disassemble") {
+        const address = Number(input.address);
+        if (!Number.isFinite(address)) return { isError: true, content: "disassemble needs an `address`.", display: "missing address" };
+        const decoded = await disassemble(session, address, Math.max(4, Math.min(256, Number(input.count ?? 8) * 4)));
+        if (!decoded) lines.push("the debugger refused the disassembly request");
+        else if (decoded.words.length === 0) lines.push(`the debugger holds no instruction at ${hex(decoded.address)} (it reported ${decoded.bytes} bytes)`);
+        else {
+          lines.push(`disassembly at ${hex(decoded.address)}:`);
+          decoded.words.forEach((word, index) => lines.push(`  ${hex(decoded.address + index * 4)}  ${word.toString(16).padStart(8, "0")}`));
+        }
+      } else if (action === "menus" || action === "menu_exec") {
+        const entries = await readMenus(session);
+        if (action === "menus") {
+          const list = entries.map((entry) => `${entry.id} ${entry.enabled ? "" : "(disabled) "}${entry.label}`);
+          lines.push(entries.length > 0 ? list.join(", ") : "the debugger reported no menu entries");
+        } else {
+          const id = Number(input.count ?? input.value ?? -1);
+          if (!Number.isFinite(id) || id < 0) return { isError: true, content: "menu_exec needs a menu `id` from the `menus` list.", display: "missing id" };
+          const reply = await execMenu(session, id);
+          lines.push(reply.ok ? `ran menu ${id}` : `could not run it: ${reply.message ?? reply.statusName}`);
+        }
+      } else if (action === "time") {
+        const clock = await timeInfo(session);
+        lines.push(clock ? `${clock.cycles} cycles, tStamp ${clock.seconds}` : "the debugger did not report a clock (it is simulator-only)");
+      } else if (action === "license") {
+        const info = await licenseInfo(session);
+        lines.push(info.licensed ? "uVision reports a valid licence" : "uVision did not report a valid licence");
+      } else if (action === "version") {
+        const info = await ideVersionText(session);
+        lines.push(info ? `uVision V${info.uv}, socket interface V${info.socket}` : "the IDE did not report its version");
+      } else if (action === "window") {
+        const state = (input.window as "show" | "hide" | "minimize" | undefined) ?? "hide";
+        const reply = await windowState(session, state);
+        lines.push(reply.ok ? `uVision window: ${state}` : `could not change it: ${reply.message ?? reply.statusName}`);
+      } else if (action === "trace_set") {
+        const name = input.location ? String(input.location) : "";
+        if (!name) return { isError: true, content: "trace_set needs a `location` naming the trace variable.", display: "missing name" };
+        const reply = await setVtr(session, name, true);
+        lines.push(reply.ok ? `trace variable ${name} enabled` : `could not enable it: ${reply.message ?? reply.statusName}`);
       } else if (action === "tasks") {
         const tasks = await readTasks(session);
         lines.push(tasks.length ? tasks.map((task) => `#${task.id} ${task.name} @ ${hex(task.address)}`).join("\n") : "no RTOS tasks reported (bare-metal target, or no awareness plugin)");
       } else if (action === "trace") {
         const items = await readVtr(session);
-        lines.push(items.length ? items.map((item) => `${item.name}${item.value !== undefined ? ` = ${item.value}` : ""}`).join("\n") : "no trace variables reported");
+        lines.push(items.length ? items.map((item) => item.name).join(", ") : "no trace variables reported");
       } else if (action === "build" || action === "rebuild") {
         const started = await buildInIde(session, action === "rebuild");
         const wanted = started.lines.filter((line) => /error|warning|Program Size|Build target|Rebuild target/i.test(line));

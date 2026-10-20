@@ -315,6 +315,29 @@ export function readSstr(payload: Buffer, offset = 0): string {
 }
 
 /**
+ * `UV_DBG_DSM_READ`: the disassembly window's content at an address.
+ *
+ * Request is the same `AMEM` as a memory read. The measured reply for
+ * `0x08006be0` is 24 bytes:
+ *
+ *   e0 6b 00 08 00 …    the echoed address
+ *   00 00 00 00         length — 0 on this build
+ *   20 c0 e3 0e         a single word: 0x0ee3c020, `b.w` to an address
+ *
+ * so this build answers with one instruction-sized word and no length. A zero
+ * length is therefore reported as zero bytes, not as "nothing at that
+ * address": the word is what the debugger holds.
+ */
+export function readDisassembly(payload: Buffer): { address: number; words: number[]; bytes: number } | null {
+  if (payload.length < 24) return null;
+  const address = Number(payload.readBigUInt64LE(0));
+  const bytes = payload.readUInt32LE(8);
+  const words: number[] = [];
+  for (let at = 24; at + 4 <= payload.length; at += 4) words.push(payload.readUInt32LE(at));
+  return { address, bytes, words };
+}
+
+/**
  * Read a length-prefixed string that is not an `SSTR`.
  *
  * `SSTR` is `{ i32 nLen; char szStr[256] }` with `nLen` counting the
@@ -324,26 +347,86 @@ export function readSstr(payload: Buffer, offset = 0): string {
  * of every group name.
  */
 /**
- * A `TVAL`, the union `VSET` carries: `{ i32 vType; i64 value; }`.
+ * A `VSET` reply: `{ TVAL val; SSTR str }`.
  *
- * `vType` picks which member is meaningful — 0 none, then unsigned/signed
- * widths, then the 64-bit and float forms. The tools only need a readable
- * rendering, so everything is widened to `bigint` and formatted there.
+ * The value is a 64-bit number at offset 4 and the rendered text is an `SSTR`
+ * at offset 12. Measured across five expressions:
+ *
+ *   main   → type 5, 0x08006be0, "main"
+ *   $      → type 9, 0x08006458, "$"
+ *
+ * The header's `VTT_TYPE` enum does **not** match the numbers this build
+ * sends (4, 5, 8 and 9 were all observed for plain integer results), so the
+ * type is carried through as a number and never used to pick a member of a
+ * union. The 64-bit field is correct for every expression tried, and the text
+ * is the debugger's own rendering.
  */
-export const VT = { NONE: 0, U8: 1, S8: 2, U16: 3, S16: 4, U32: 5, S32: 6, U64: 7, S64: 8, F32: 9, F64: 10 } as const;
+export function readVset(payload: Buffer): { type: number; value: bigint; text: string } | null {
+  if (payload.length < 16) return null;
+  return {
+    type: payload.readInt32LE(0),
+    value: payload.readBigInt64LE(4),
+    text: readSstr(payload, 12),
+  };
+}
 
-export function readTval(payload: Buffer, offset = 0): { type: number; value: number | bigint | null } | null {
-  if (payload.length < offset + 12) return null;
-  const type = payload.readInt32LE(offset);
-  const raw = payload.subarray(offset + 4, offset + 12);
-  if (type === 0) return { type, value: null };
-  if (type === VT.F32) return { type, value: raw.readFloatLE(0) };
-  if (type === VT.F64) return payload.length >= offset + 12 ? { type, value: payload.readDoubleLE(offset + 4) } : null;
-  if (type === VT.S64) return { type, value: raw.readBigInt64LE(0) };
-  if (type === VT.U64) return { type, value: raw.readBigUInt64LE(0) };
-  const signed = type === VT.S8 || type === VT.S16 || type === VT.S32;
-  if (signed) return { type, value: raw.readInt32LE(0) };
-  return { type, value: raw.readUInt32LE(0) };
+/** Build a `VSET` request carrying an expression. */
+export function vset(expression: string): Buffer {
+  const buffer = Buffer.alloc(12 + 260);
+  buffer.writeInt32LE(0, 0); // no literal value; the expression is in the string
+  buffer.writeInt32LE(Buffer.byteLength(expression, "latin1") + 1, 12);
+  Buffer.from(expression, "latin1").copy(buffer, 16);
+  return buffer;
+}
+
+/** One entry of the debugger's menu model (`MENUENUM`). */
+export interface MenuEntry {
+  id: number;
+  group: number;
+  enabled: boolean;
+  label: string;
+}
+
+/** `MENUENUM`: `{ i32 id, i32 group, i32 info, u32 flags, u32 len, char label[] }`. */
+export function readMenu(frame: AsyncFrame): MenuEntry | null {
+  const data = frame.data;
+  if (frame.type !== 0x5061 || data.length < 20) return null;
+  const id = data.readInt32LE(0);
+  const group = data.readInt32LE(4);
+  const flags = data.readUInt32LE(12);
+  const length = data.readUInt32LE(16);
+  if (length === 0 || 20 + length > data.length + 1) return null;
+  // `length` is the character count, terminator included, so the text ends
+  // one byte earlier — reading `length - 1` cut the last letter off every
+  // label ("Trace Dat").
+  return { id, group, enabled: (flags & 1) === 1, label: data.subarray(20, 20 + length).toString("latin1").replace(/\0.*$/s, "") };
+}
+
+/**
+ * `AVTR`, the trace-variable record: `{ u32 type, u32 nRes[7], u32 nameLen,
+ * char name[] }`.
+ *
+ * Measured: `12 00 00 00`, seven zero words, `09 00 00 00 "CURR_TID"` —
+ * 40 bytes of head and then the name. The first word is the variable's type,
+ * not its number.
+ */
+export function readVtrFrame(frame: AsyncFrame): { name: string; type: number } | null {
+  if (frame.type !== 0x5018 || frame.data.length < 40) return null;
+  // `{ u32 type, u32 nRes[7], u32 nameLen, u32 nRes[2], char name[] }`;
+  // `nameLen` counts the terminator (9 for "CURR_TID" + NUL). Measured on all
+  // five frames this target reports: the name starts at 44 and the record
+  // ends exactly at `44 + nameLen`.
+  // The record does not end after the first name: the measured frames carry
+  // more fields after it, so the length is validated but not used as an
+  // end-of-record bound.
+  // `nameLen` counts the characters only — 9 for "CURR_TID", 5 for "TRAPS" —
+  // unlike `SSTR`, whose length includes the terminator. Reading it the SSTR
+  // way kept the NUL of one name as a trailing space.
+  const length = frame.data.readUInt32LE(32);
+  if (length === 0) return null;
+  const name = frame.data.subarray(44, 44 + length).toString("latin1").replace(/ +$/, "").trim();
+  if (!name) return null;
+  return { name, type: frame.data.readUInt32LE(0) };
 }
 
 export function readCountedString(payload: Buffer, offset = 0): string {
@@ -352,7 +435,7 @@ export function readCountedString(payload: Buffer, offset = 0): string {
   if (length === 0 || length > 4096) return "";
   const start = offset + 4;
   const end = Math.min(start + length, payload.length);
-  return payload.subarray(start, end).toString("latin1").replace(/$/, "");
+  return payload.subarray(start, end).toString("latin1").replace(/\0$/, "");
 }
 
 /** `PRJDATA`: `{ u32 nLen, u32 nCode, char szNames[] }` with NUL-separated names. */

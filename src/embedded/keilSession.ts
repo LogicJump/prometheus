@@ -43,6 +43,7 @@ import {
   readMemoryReply,
   readSstr,
   readTrnOpt,
+  readVtrFrame,
   trnOptValue,
   sstr,
   trnOpt,
@@ -543,22 +544,6 @@ export async function writeMemory(session: KeilSession, address: number, bytes: 
   };
 }
 
-/** Evaluate an expression through the command window and return its line(s). */
-export async function evaluate(session: KeilSession, expression: string): Promise<{ ok: boolean; lines: string[]; message?: string }> {
-  // `EXECCMD { u32 bEcho; u32 nRes[7]; SSTR sCmd }`
-  const payload = Buffer.alloc(4 + 28 + 260);
-  payload.writeUInt32LE(1, 0); // echo to the command window, which is how the answer comes back
-  sstr(expression).copy(payload, 32);
-  const reply = await session.client.send(OP.DBG_EXEC_CMD, payload, 12_000);
-  const frames = await session.client.collect(400);
-  const lines = frames.map((frame) => commandWindowText(frame)).filter(Boolean);
-  return {
-    ok: reply.ok && lines.length > 0,
-    lines,
-    ...(!reply.ok ? { message: reply.message ?? reply.statusName } : {}),
-  };
-}
-
 /** Where the program is stopped, as `file:line` when the symbols allow it. */
 export async function currentLocation(session: KeilSession): Promise<{ address: number; file?: string; line?: number } | null> {
   const registers = readPCFrom(await readRegisters(session));
@@ -804,32 +789,6 @@ export async function readVariables(session: KeilSession): Promise<Variable[]> {
   return parseVariables(frames);
 }
 
-/**
- * Evaluate a watch expression.
- *
- * `UV_DBG_EVAL_WATCH_EXPRESSION` answers `NOT_SUPPORTED` on uVision 5.43a for
- * every expression, so the command window is the working path: `EVAL <expr>`
- * prints the value there and the reply echoes it. This is kept as a separate
- * call so a build that does support the interface is used directly.
- */
-export async function evaluateWatch(session: KeilSession, expression: string): Promise<{ ok: boolean; value?: string; message?: string }> {
-  const payload = Buffer.alloc(520);
-  sstr(expression).copy(payload, 0);
-  const reply = await session.client.send(OP.DBG_EVAL_WATCH_EXPRESSION, payload, 10_000);
-  if (!reply.ok) return { ok: false, message: reply.message ?? reply.statusName };
-  const value = readSstr(reply.data, 20);
-  return { ok: Boolean(value), ...(value ? { value } : {}) };
-}
-
-/** Evaluate through the command window, which every build supports. */
-export async function evalInWindow(session: KeilSession, expression: string): Promise<{ ok: boolean; value?: string; lines: string[] }> {
-  const result = await evaluate(session, `EVAL ${expression}`);
-  // The window echoes the command first, then its answer.
-  const answer = result.lines.filter((line) => line.trim() !== `EVAL ${expression}` && !/^\s*\^/.test(line));
-  const text = answer.join(" ").trim();
-  return { ok: text.length > 0 && !/^\*\*\* error/i.test(text), ...(text ? { value: text } : {}), lines: result.lines };
-}
-
 /** Tasks, for an RTOS-aware target (RTX, or FreeRTOS with its awareness plugin). */
 export async function readTasks(session: KeilSession): Promise<{ id: number; name: string; address: number }[]> {
   const mark = session.client.mark;
@@ -847,18 +806,15 @@ export async function readTasks(session: KeilSession): Promise<{ id: number; nam
 }
 
 /** The trace/VTR items the target exposes. */
-export async function readVtr(session: KeilSession): Promise<{ name: string; value?: number }[]> {
+export async function readVtr(session: KeilSession): Promise<{ name: string; type: number }[]> {
   const mark = session.client.mark;
   await session.client.send(OP.DBG_ENUM_VTR, Buffer.alloc(32), 10_000);
   const frames = await session.client.collect(1500, 0x5019, mark);
   return frames
-    .filter((frame) => frame.type === 0x5018)
-    .map((frame) => {
-      const name = frame.data.subarray(0, 64).toString("latin1").replace(/\0.*$/s, "");
-      const value = frame.data.length >= 72 ? frame.data.readUInt32LE(68) : undefined;
-      return { name, ...(value !== undefined ? { value } : {}) };
-    })
-    .filter((entry) => entry.name);
+    .map(readVtrFrame)
+    .filter((entry): entry is { name: string; type: number } => entry !== null)
+    // The same variables are reported more than once in one burst.
+    .filter((entry, index, all) => all.findIndex((other) => other.name === entry.name) === index);
 }
 
 /* ---------- registers, memory, addresses ---------- */
@@ -900,7 +856,7 @@ export async function addressToSource(session: KeilSession, address: number): Pr
   if (data.length < 20) return null;
   const line = data.readUInt32LE(0);
   // Measured reply for `0x08006460`: the line, the address, a file index, a
-  // function index, then reserved zeros, then `"system_stm32f4xx.c SystemInit "`.
+  // function index, then reserved zeros, then `"system_stm32f4xx.cSystemInit"`.
   // The reserved words are not a fixed size this header documents, so the two
   // strings are found by scanning for the first printable runs rather than by
   // trusting an offset — which is what made every stop report "(no source)".
@@ -942,3 +898,32 @@ export async function getOutputName(session: KeilSession): Promise<string> {
   const reply = await session.client.send(OP.PRJ_GET_OUTPUTNAME, Buffer.alloc(4), 8_000);
   return reply.ok ? readSstr(reply.data, 0) : "";
 }
+
+/* ---------- operations beyond the core loop ---------- */
+
+export {
+  debugTargetKind,
+  disassemble,
+  evalInWindow,
+  evaluate,
+  execMenu,
+  ideVersion,
+  ideVersionText,
+  licenseInfo,
+  readMenus,
+  readScvdFiles,
+  closeProject,
+  readNamedRegisters,
+  registerItm,
+  resetTarget,
+  runToAddress,
+  setEventRecorder,
+  setOutputName,
+  setVariable,
+  setVtr,
+  showCodeAt,
+  stepMany,
+  timeInfo,
+  UNSUPPORTED_ON_MDK_5_43,
+  windowState,
+} from "./keilExtra.ts";
