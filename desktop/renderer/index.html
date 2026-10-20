@@ -352,14 +352,13 @@
                 <button role="tab" aria-selected="false" tabindex="-1" data-pane="browser" data-i18n="paneBrowser">Browser</button>
               </div>
               <div class="workbench-meta" id="workbench-meta"></div>
-              <div class="diff-scope" id="diff-scope" role="radiogroup" aria-label="Diff scope" hidden>
-                <button role="radio" data-scope="session" class="active" data-i18n="scopeSession">Session</button>
-                <button role="radio" data-scope="turn" data-i18n="scopeTurn">Last turn</button>
-              </div>
               <button class="icon-button small" id="close-workbench" data-i18n-title="closePane">
                 <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
               </button>
             </div>
+            <!-- The session/last-turn switch is a property of the diff, not of
+                 the pane strip. It shares the git bar's row so it costs no
+                 vertical space of its own. -->
             <div class="comments-bar" id="comments-bar" hidden>
               <span class="comments-count" id="comments-count"></span>
               <button class="btn btn-quiet small" id="comments-clear" data-i18n="commentClear">Clear</button>
@@ -375,6 +374,10 @@
                     <span id="git-branch-name">—</span>
                   </button>
                   <span class="git-sync" id="git-sync"></span>
+                  <div class="diff-scope" id="diff-scope" role="radiogroup" aria-label="Diff scope" hidden>
+                    <button role="radio" data-scope="session" class="active" data-i18n="scopeSession">Session</button>
+                    <button role="radio" data-scope="turn" data-i18n="scopeTurn">Last turn</button>
+                  </div>
                 </div>
                 <div class="pr-bar" id="pr-bar" hidden>
                   <span class="pr-state" id="pr-state"></span>

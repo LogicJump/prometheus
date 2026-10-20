@@ -677,9 +677,15 @@ body.resizing-sidebar .sidebar {
 /* ---------- workbench pane (diff / file) ---------- */
 
 .workbench {
-  width: 46%;
-  min-width: 340px;
-  max-width: 720px;
+  /* Percent of the whole window, not of the space left after the sidebar.
+     46% of 1360 is 625, but the shared row had already given 346 to the
+     sidebar, so the inspector took a third of what remained and left the
+     conversation 548 px — narrow enough that the composer wrapped and the
+     prose column collapsed. A fixed 400 px reads better at every size: the
+     inspector is a reference pane, not a second editor. */
+  width: 420px;
+  min-width: 320px;
+  max-width: 560px;
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
@@ -693,19 +699,35 @@ body.resizing-sidebar .sidebar {
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  overflow-x: auto;
+  overflow: hidden;
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
+  /* The tab strip gets the head to itself and scrolls. The scope switch and
+     the meta text sit beside it only when there is room; at 400 px they were
+     taking 140 of the 400 and leaving the tabs 193 px for nine labels. */
+  min-width: 0;
 }
 
 .workbench-tabs {
+  /* One scrollable row rather than a wrapped block. Nine tabs in a 400 px
+     pane wrapped to two rows and pushed the pane's own content down 60 px;
+     scrolling keeps the header one line high at every width. */
+  flex: 1 1 auto;
+  min-width: 0;
   display: inline-flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 2px;
   padding: 2px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.workbench-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .workbench-tabs button {
@@ -716,19 +738,42 @@ body.resizing-sidebar .sidebar {
   white-space: nowrap;
 }
 
+/* In a 400 px inspector the nine labels need a little less each to fit
+   without scrolling; the row is still the only way to change panes, so it is
+   better to tighten it than to hide its last tab behind a scroll. */
+@media (max-width: 1500px) {
+  .workbench-tabs button {
+    padding: 4px 4px;
+    font-size: var(--text-base);
+  }
+}
+
 .workbench-tabs button.active {
   background: var(--surface-hover);
   color: var(--text);
 }
 
 .workbench-meta {
-  flex: 1;
+  /* Reference text, not a control: it yields before the switch does. */
+  flex: 0 1 auto;
+  min-width: 0;
   font-family: var(--mono);
   font-size: var(--text-sm);
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The scope switch shares the git bar's row: it is a property of the diff,
+   and giving it a row of its own cost 33 px of a pane that is 834 px tall. */
+.diff-scope {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.diff-scope-row {
+  display: none;
 }
 
 .diff-scope {
@@ -2933,20 +2978,29 @@ mark.find-hit.current {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
+  gap: 8px;
+  /* One line, always. Wrapping turned the two halves into two rows the moment
+     the inspector opened, which made the composer twice as tall exactly when
+     vertical space was scarce. Anything that will not fit is hidden by
+     `.controls-right`'s overflow rule rather than pushed to a second row. */
+  flex-wrap: nowrap;
+  min-width: 0;
   padding-top: 7px;
   border-top: 1px solid var(--border);
 }
 
 .composer-bar .controls {
   gap: 5px;
+  min-width: 0;
 }
 
 /* The bottom row, Claude's shape: "+" and the mode on the left, the model,
    its window and the reasoning level on the right. */
 .composer-bar .controls-right {
   margin-left: auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .plus-control {
@@ -4295,6 +4349,11 @@ mark.find-hit.current {
 
 .model-picker {
   max-width: 210px;
+  /* The model name is the one chip worth keeping whole, but it must give way
+     first when the inspector is open: an ellipsised `space-bu…` still names
+     the model, while a wrapped row costs a whole line of the composer. */
+  min-width: 0;
+  flex: 0 1 auto;
 }
 
 .model-picker.unavailable {
