@@ -41,6 +41,16 @@ const GCC = /^(.+?):(\d+):(?:(\d+):)?\s*(fatal error|error|warning|note|remark):
 const KEIL = /^(.+?)\((\d+)\):\s*(error|warning|note):\s*(?:((?:#|W|L)?\d+[-A-Z]?):\s*)?(.*)$/;
 const IAR = /^(.+?)\((\d+)\)\s*:\s*(error|warning|note)\[([^\]]+)\]:\s*(.*)$/;
 const MSVC = /^(.+?)\((\d+)(?:,(\d+))?\)\s*:\s*(error|warning)\s+([A-Z]+\d+):\s*(.*)$/;
+/**
+ * armclang and armlink, which name the output file rather than a source.
+ *
+ *   ..\OBJ\TOUCH.axf: Error: L6218E: Undefined symbol x (referred from main.o).
+ *
+ * These carry no line number: a link error is about the whole image. They were
+ * ignored entirely, so a build that failed to link reported "0 errors" — the
+ * most misleading thing this parser can do.
+ */
+const ARM_LINK = /^(.+?):\s*(Error|Warning):\s*([A-Z]+\d+[A-Z]?):\s*(.+)$/i;
 // GCC prints the context after a `file: ` prefix (`main.c: In function 'main':`)
 // or bare (`In function 'main':`), so the prefix is optional.
 const CONTEXT = /^(?:\S+:\s*)?(In function|In file included from|At top level|from)\b.*$/;
@@ -148,6 +158,27 @@ export function parseDiagnostics(output: string): ParseResult {
           severity,
           ...(code ? { code } : {}),
           message,
+          ...(pendingContext ? { context: pendingContext } : {}),
+        });
+        pendingContext = undefined;
+        continue;
+      }
+    }
+
+    // armclang / armlink name the image, not a line. This is checked before
+    // GCC because it is the more specific shape (`file: Error: Lxxxx:`), and
+    // before the generic "error" test below, which used to swallow these into
+    // `unparsed` and let a failed link report zero errors.
+    match = ARM_LINK.exec(line);
+    if (match) {
+      const severity = severityOf(match[2]);
+      if (severity) {
+        diagnostics.push({
+          file: cleanPath(match[1]),
+          line: 0,
+          severity,
+          code: match[3],
+          message: match[4].trim().slice(0, 400),
           ...(pendingContext ? { context: pendingContext } : {}),
         });
         pendingContext = undefined;

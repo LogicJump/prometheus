@@ -386,6 +386,16 @@ export interface MemoryUsage {
   /** Bytes of RAM it needs at rest: .data + .bss. */
   ram: number;
   sections: { name: string; size: number; address: number }[];
+  /**
+   * False when `ram` is a lower bound rather than the figure the linker placed.
+   *
+   * `fromelf --text -z` reports the zero-initialised region as 0 in its ROM
+   * totals, so an image read that way shows only the initialised bytes. A
+   * Keil build that did not relink has no other source, and saying "108 bytes
+   * of RAM" for an image that reserves two megabytes is worse than saying the
+   * number is partial.
+   */
+  ramExact?: boolean;
 }
 
 export function parseSize(output: string): MemoryUsage {

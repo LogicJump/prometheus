@@ -19,10 +19,33 @@ import { miFields, miList, parseMiLine, parseStackFrames, parseStopReason, parse
 import { findRegister, parseSvd, peripheralIndex, registerAddress } from "../src/embedded/svd.ts";
 import { parseClangTidyYaml, parseCppcheckXml, parseMemoryUsage, parseStackUsage } from "../src/embedded/analyze.ts";
 import type { FoundTool } from "../src/embedded/toolchain.ts";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
+
+/**
+ * Temporary project trees, removed when the file finishes.
+ *
+ * These used to be left behind. That is not only untidy: `detectProject` walks
+ * *up* from the starting directory, so a stale `app.uvprojx` sitting anywhere
+ * above a scratch directory made an unrelated test detect that project. One
+ * leftover in the shared temp root turned "an unrecognised tree reports
+ * unknown" into "iar", which is exactly the kind of cross-test coupling that
+ * makes a suite untrustworthy.
+ */
+const trees: string[] = [];
+test.after(() => {
+  for (const dir of trees) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* a tree the OS still holds open is not worth failing the run for */
+    }
+  }
+});
 
 function scratch(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix));
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  trees.push(dir);
+  return dir;
 }
 
 // ---- diagnostics -----------------------------------------------------------

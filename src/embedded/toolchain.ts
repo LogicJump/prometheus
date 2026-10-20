@@ -12,7 +12,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, delimiter } from "node:path";
 import { homedir } from "node:os";
 import { packBinDirs } from "../packs/registry.ts";
@@ -169,6 +169,23 @@ function windowsDirs(): string[] {
       join(root, "xPacks"),
       join(root, "Renesas"),
     );
+  }
+  // Keil and IAR install wherever the user said. Keil names its own root in
+  // TOOLS.INI; IAR's is under Program Files\IAR Systems.
+  for (const root of keilRoots()) candidates.push(join(root, "UV4"));
+  for (const root of roots) {
+    for (const product of ["IAR Systems", join("IAR Systems", "Embedded Workbench")]) {
+      const base = join(root, product);
+      if (!existsSync(base)) continue;
+      try {
+        for (const entry of readdirSync(base)) {
+          const bin = join(base, entry, "common", "bin");
+          if (existsSync(bin)) candidates.push(bin);
+        }
+      } catch {
+        /* unreadable install directory */
+      }
+    }
   }
   // The Arm toolchain installs into a versioned folder; take the newest.
   const out: string[] = [];
@@ -335,6 +352,46 @@ function locate(spec: Spec, context: SearchContext): { path: string; source: Fou
   }
 
   return tryDirs(context.installRoots, "install-root") ?? tryDirs(context.pathDirs, "path");
+}
+
+/**
+ * Keil roots found on this machine, beyond the fixed defaults.
+ *
+ * `C:\Keil_v5` is only the default. Keil writes its own install root into
+ * `TOOLS.INI` next to `UV4\`, and a user who installed to `D:\software\keil5`
+ * (which is a real layout, tested against) has nothing at the default path. The
+ * registry is read too, because a per-user install writes there and not always
+ * to the default INI location.
+ *
+ * Returns directories that contain `UV4\UV4.exe`, newest first is not needed:
+ * one install is the normal case and the first hit wins.
+ */
+function keilRoots(): string[] {
+  const roots: string[] = [];
+  const fromIni = (iniPath: string) => {
+    try {
+      if (!existsSync(iniPath)) return;
+      // The file is INI-shaped; `PATH="G:\software\keil5\ARM\"` names the ARM
+      // subdirectory, so the root is its parent.
+      const text = readFileSync(iniPath, "utf8");
+      const match = /^\s*PATH\s*=\s*"([^"]+)"/im.exec(text);
+      if (!match?.[1]) return;
+      const armDir = match[1].replace(/[\\/]+$/, "");
+      const root = join(armDir, "..");
+      if (existsSync(join(root, "UV4", "UV4.exe"))) roots.push(root);
+    } catch {
+      /* an unreadable INI is not a failure to report */
+    }
+  };
+  const programFiles = process.env["ProgramFiles"] ?? "C:\\Program Files";
+  for (const ini of [
+    join(programFiles, "Keil", "TOOLS.INI"),
+    join(programFiles, "Keil_v5", "TOOLS.INI"),
+    "C:\\Keil", "C:\\Keil_v5",
+  ].flatMap((entry) => (entry.endsWith(".INI") ? [entry] : [join(entry, "TOOLS.INI")]))) {
+    fromIni(ini);
+  }
+  return roots;
 }
 
 function firstLine(text: string): string {

@@ -148,3 +148,60 @@ to install:
   需要用户在参数里指定。
 - **许可证问题不诊断**：没有授权时 `UV4` 可能返回一个位掩码，目前的结论会是「构建失败」，
   而不是「这是许可证问题」。识别它需要更多真实样本。
+
+---
+
+## 八、真实工程实测（2026-10-20）
+
+工程：`G:\Develop\qianrushishiyan\实验3 触摸屏UI实验`（正点原子阿波罗 STM32F429，Keil MDK 5.43a，AC5）。
+Keil 装在 `G:\software\keil5`，**不在** `C:\Keil_v5`。
+
+这一轮把「跑一次真实工程」当作验收标准，而不是只跑单测。下面是实测中发现、并且已经修掉的：
+
+| # | 问题 | 怎么发现的 | 修法 |
+|---|---|---|---|
+| 1 | 只扫根目录，找不到 `USER\TOUCH.uvprojx` | 工程根下只有 CORE/HALLIB/OBJ，工程文件在 `USER\` | `detectProject` 与 `keilProjectFile` 都改为根目录优先、再下一层（排除 OBJ/build 等输出目录） |
+| 2 | 产物只扫根目录，`..\OBJ\TOUCH.axf` 找不到 | 工程把 `<OutputDirectory>` 设为 `..\OBJ\` | 从 `.uvprojx` 读 `OutputDirectory`，据此确定扫描目录 |
+| 3 | `-o` 用相对路径时**日志根本没生成** | 第一次构建 exit 0、无诊断、无占用 | `-o` 改绝对路径，并在构建前创建父目录 |
+| 4 | `fromelf` 找错位置 | 真机里它在 `ARM\ARMCLANG\bin` 与 `ARM\ARM_Compiler_5.06u7\bin`，不在 `UV4.exe` 旁边 | 按安装根下的 `ARM\` 两个位置查，再退化为扫描 `ARM_Compiler_*` |
+| 5 | `fromelf --text -c` 不输出尺寸 | 占用报 0 | 换 `--text -z`；且优先用链接器打印的 `Program Size:` |
+| 6 | 链接错误一条都没解析 | 故意写一个未定义符号，exit 2 但报告「0 error」 | 新增 armlink/armclang 格式 `file: Error: Lxxxx:` |
+| 7 | `build()` 里旧的拒绝分支在命令生成之前就返回 | 修好命令后仍然报「UV4.exe 未找到」 | 删掉该分支，是否装了 IDE 交给实际运行去回答 |
+
+还有一个**没有**修、但已经如实说明的：Keil 增量构建不必重新链接，日志里就没有 `Program Size:`，
+此时占用只能来自 `fromelf`，而它的 `ROM Totals` 把 ZI 记成 0。这种情况报告会附一句话说明
+「RAM 只含已初始化部分，全量重建才有精确值」，而不是把 108 字节当成 2 MB 镜像的 RAM。
+
+### 实测结果
+
+```
+UV4.exe -b ...\USER\TOUCH.uvprojx -j0 -o ...\build\keil-build.log → ok   (4.7 s)
+image: 50820 bytes flash, 2050472 bytes RAM
+artifacts: TOUCH.axf (669952 B), TOUCH.hex (143286 B)
+```
+
+故意注入一个未定义符号后：
+
+```
+exit 2 · 1 error(s)
+error: ../OBJ/TOUCH.axf:0 [L6218E] Undefined symbol undefined_symbol_x (referred from main.o).
+```
+
+### 非标准安装路径
+
+`G:\software\keil5` 不在默认探测列表里。两条路都可用：
+
+- 设 `PROMETHEUS_TOOLCHAINS=G:\software\keil5\UV4`（本次实测用这条验证）
+- 读取 `TOOLS.INI`（`[ARM] PATH="G:\software\keil5\ARM\"`），从中反推安装根
+
+第二个是从这份实测的 `TOOLS.INI` 里发现的真实格式，已加进 `keilRoots()`。
+**注意**：这条是照着真实文件写的，但本次实测是用环境变量跑的，没有单独验证「只靠 TOOLS.INI
+能否在默认位置之外找到」；如果 keil 装在别处，先用环境变量最稳。
+
+### 遗留
+
+- **需要全量重建才准确的 RAM**：见上。可以在构建前删除 `.axf` 强制重链接，但那会让每次
+  构建都变慢，目前选择如实标注。
+- **器件包路径**：Keil 的 pack 在 `TOOLS.INI` 的 `RTEPATH`（这里是 `G:\software\keil5pack`），
+  不在现有 CMSIS pack 搜索路径里，SVD/器件参数仍可能找不到。
+- **多 Target**：`TOUCH.uvprojx` 只有一个 Target，没测多 Target 情况。

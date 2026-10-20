@@ -103,6 +103,19 @@ async function toolMap(): Promise<Record<string, string>> {
  * by extension only for the formats that have a signature.
  */
 export function findArtifacts(root: string, patterns: string[] | undefined, hint?: string): BuildArtifact[] {
+  return findArtifactsIn([root], patterns, hint, root);
+}
+
+/**
+ * Find the image across one or more directories.
+ *
+ * A Keil build writes into the project's own `OutputDirectory`, which is
+ * usually a sibling of the project file rather than the workspace root. The
+ * scan therefore takes the directories the project named, and every artifact's
+ * `relative` path is still computed against the workspace so it reads the same
+ * everywhere else in the app.
+ */
+export function findArtifactsIn(roots: string[], patterns: string[] | undefined, hint?: string, relativeTo = roots[0]): BuildArtifact[] {
   const found: BuildArtifact[] = [];
   const seen = new Set<string>();
 
@@ -147,14 +160,14 @@ export function findArtifacts(root: string, patterns: string[] | undefined, hint
     seen.add(path);
     found.push({
       path,
-      relative: relative(root, path).replace(/\\/g, "/"),
+      relative: relative(relativeTo, path).replace(/\\/g, "/"),
       bytes: size,
       kind,
     });
   };
 
   if (hint) add(hint);
-  for (const pattern of patterns ?? []) {
+  for (const root of roots) for (const pattern of patterns ?? []) {
     const segments = pattern.split("/");
     let frontier = [root];
     for (const segment of segments) {
@@ -179,8 +192,7 @@ export function findArtifacts(root: string, patterns: string[] | undefined, hint
   // Patterns are conventions, and conventions get broken (an OUTPUT_NAME with no
   // suffix, a flavour directory). The scan always runs, so an ELF that a glob
   // missed is still found alongside the ones it caught.
-  const buildDir = join(root, "build");
-  for (const dir of [buildDir, root]) {
+  for (const root of roots) for (const dir of [join(root, "build"), root]) {
     if (!existsSync(dir)) continue;
     try {
       for (const entry of readdirSync(dir)) {
@@ -250,49 +262,95 @@ async function sizeOf(elf: string, keilPath?: string): Promise<MemoryUsage | und
 async function keilSize(elf: string, uv4Path?: string): Promise<MemoryUsage | undefined> {
   const fromelf = fromelfFor(uv4Path);
   if (!fromelf) return undefined;
-  const result = await run(fromelf, ["--text", "-c", elf], process.cwd(), 30_000);
+  // `-z` is the size summary. `-c` disassembles and never prints totals; the
+  // first version of this called `--text -c` and silently got nothing, which
+  // is why the build reported "0 bytes flash" on a real project.
+  const result = await run(fromelf, ["--text", "-z", elf], process.cwd(), 30_000);
   if (result.code !== 0) return undefined;
   return parseFromelf(result.out);
 }
 
 /**
- * Total image size from `fromelf --text -c`.
+ * Flash and RAM from `fromelf --text -z`.
  *
- * The summary is:
+ * The `ROM Totals` row is:
  *
- *   Total RO  Size (Code + RO Data)                 12345 (  12.06kB)
- *   Total RW  Size (RW Data + ZI Data)               2345 (   2.29kB)
- *   Total ROM Size (Code + RO Data + RW Data)       12500 (  12.21kB)
+ *      Code (inc. data)   RO Data    RW Data    ZI Data
+ *      31978       1164      18842        108    2050364   ROM Totals for app.axf
  *
- * The number before the parenthesis is bytes; the parenthesis is a human
- * reading. Older versions omit the parenthetical label but keep the totals, so
- * both spellings are accepted.
+ * Flash is Code + RO Data (the two things that live in ROM). RAM is RW Data +
+ * ZI Data: the initialised bytes are copied there, and ZI is reserved.
+ *
+ * The `Debug` column before the name is not part of the image and is ignored.
+ * Column positions are not used either — the numbers are parsed by order from
+ * the end, because Keil versions add and drop columns.
  */
 export function parseFromelf(output: string): MemoryUsage | undefined {
-  const total = (label: RegExp) => {
-    const match = label.exec(output);
-    return match ? Number(match[1]) : undefined;
-  };
-  // `Total RO  Size` — two spaces in the product's own output, one in some.
-  const ro = total(/Total\s+RO\s+Size(?:\s*\([^)]*\))?\s*:?\s+(\d+)/i);
-  const rw = total(/Total\s+RW\s+Size(?:\s*\([^)]*\))?\s*:?\s+(\d+)/i);
-  if (ro === undefined) return undefined;
-  return {
-    flash: ro,
-    // RAM is the initialised data plus the zero-initialised region; that is
-    // what the part has to reserve at run time.
-    ram: rw ?? 0,
-    // `fromelf` prints a per-section table, but its columns are not stable
-    // between Keil versions; the totals are what the caller acts on.
-    sections: [],
-  };
+  // The linker's own line is preferred when present: it carries all four
+  // numbers, and its ZI figure is what the linker placed rather than what an
+  // image reader infers.
+  const program = /Program\s+Size:\s*Code=(\d+)\s+RO-data=(\d+)\s+RW-data=(\d+)\s+ZI-data=(\d+)/i.exec(output);
+  if (program) {
+    const [, code, ro, rw, zi] = program.map(Number);
+    return { flash: code + ro, ram: rw + zi, sections: [] };
+  }
+  for (const line of output.split(/\r?\n/)) {
+    if (!/ROM\s+Totals/i.test(line)) continue;
+    const numbers = line
+      .replace(/ROM\s+Totals.*$/i, "")
+      .match(/[\d,]+/g)
+      ?.map((value) => Number(value.replace(/,/g, "")))
+      .filter((value) => Number.isFinite(value));
+    if (!numbers || numbers.length < 5) continue;
+    const [code, , roData, rwData, ziData] = numbers;
+    return {
+      flash: code + roData,
+      ram: rwData + ziData,
+      sections: [],
+    };
+  }
+  return undefined;
 }
 
-/** `UV4.exe`'s sibling `fromelf.exe`, or nothing when Keil is not installed. */
+/**
+ * `fromelf.exe` from the same Keil install as `UV4.exe`.
+ *
+ * It is not beside `UV4.exe`. In a real MDK install (v5.43a, `G:\software\keil5`)
+ * the layout is:
+ *
+ *   UV4\UV4.exe
+ *   ARM\ARMCLANG\bin\fromelf.exe        ← AC6
+ *   ARM\ARM_Compiler_5.06u7\bin\fromelf.exe  ← AC5
+ *
+ * so the sibling guess is the wrong one. The install root is two levels above
+ * `UV4\`, and both compiler toolchains are searched under `ARM\`.
+ */
 function fromelfFor(uv4Path?: string): string | null {
   if (!uv4Path) return null;
-  const candidate = uv4Path.replace(/UV4(\.exe)?$/i, uv4Path.endsWith(".exe") ? "fromelf.exe" : "fromelf");
-  return candidate !== uv4Path && existsSync(candidate) ? candidate : null;
+  const isExe = /\.exe$/i.test(uv4Path);
+  const sibling = uv4Path.replace(/UV4(\.exe)?$/i, isExe ? "fromelf.exe" : "fromelf");
+  if (sibling !== uv4Path && existsSync(sibling)) return sibling;
+
+  // <root>\UV4\UV4.exe → <root>
+  const root = join(uv4Path, "..", "..");
+  const candidates = [
+    join(root, "ARM", "ARMCLANG", "bin", isExe ? "fromelf.exe" : "fromelf"),
+    join(root, "ARM", "ARM_Compiler_5.06u7", "bin", isExe ? "fromelf.exe" : "fromelf"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  // A version we do not name: take any `ARM_Compiler_*\bin\fromelf.exe`.
+  try {
+    for (const entry of readdirSync(join(root, "ARM"))) {
+      if (!/^ARM_Compiler_/i.test(entry)) continue;
+      const candidate = join(root, "ARM", entry, "bin", isExe ? "fromelf.exe" : "fromelf");
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch {
+    /* no ARM directory: not a Keil install root */
+  }
+  return null;
 }
 
 /** Toolchain kinds to try for an ELF, most likely first. */
@@ -355,15 +413,11 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
         "*.uvprojx (Keil) and *.ewp (IAR).",
     );
   }
-  if (project.kind === "keil" || project.kind === "iar") {
-    const ide = project.kind === "keil" ? "Keil MDK" : "IAR EWARM";
-    const program = project.kind === "keil" ? "UV4.exe" : "IarBuild.exe";
-    return empty(
-      `This is a ${ide} project, and ${program} was not found. ` +
-        `${ide} is licensed and is never bundled with this app, so it has to be installed here first. ` +
-        `Install it, then build again; the project's own build is what this runs, not a replacement for it.`,
-    );
-  }
+  // Keil and IAR used to stop here with "go build it in the IDE". They no
+  // longer do: `buildCommand` produces the vendor's documented batch command,
+  // and whether the IDE is installed is answered by running it — a missing
+  // UV4.exe fails to spawn and the error names it. Refusing before trying was
+  // the whole gap this replaced.
 
   const command: BuildCommand | null = buildCommand(project, await toolMap(), {
     ...(options.release !== undefined ? { release: options.release } : {}),
@@ -398,9 +452,23 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
   const errors = collapsed.filter((entry) => entry.severity === "error").length;
   const ok = result.code === 0 && errors === 0;
 
-  const artifacts = ok ? findArtifacts(project.root, command.artifactPatterns, command.artifactHint) : [];
+  const artifacts = ok ? findArtifactsIn(command.artifactRoots ?? [project.root], command.artifactPatterns, command.artifactHint) : [];
   const elf = artifacts.find((artifact) => artifact.kind === "elf");
-  const usage = elf ? await sizeOf(elf.path, toolchains.tools.find((entry) => entry.kind === "keil")?.path) : undefined;
+  // Size comes from two places and they are not equivalent:
+  //
+  //  - the linker's `Program Size:` line is exact, but Keil only prints it
+  //    when it actually relinked. An incremental build that found everything
+  //    up to date has no such line.
+  //  - `fromelf --text -z` always reads the image, but its `ROM Totals` row
+  //    reports ZI as 0, so RAM comes out as the RW bytes only.
+  //
+  // So the linker line wins when present, and `fromelf` fills in otherwise —
+  // and `fromelf` on its own is marked as under-reporting RAM rather than
+  // being passed off as the exact figure.
+  const keilPath = toolchains.tools.find((entry) => entry.kind === "keil")?.path;
+  const linked = parseFromelf(output);
+  const image = elf ? await sizeOf(elf.path, keilPath) : undefined;
+  const usage = linked ?? (image ? { ...image, ramExact: false } : undefined);
 
   const tailLines = options.tailLines ?? 40;
   const allLines = output.split(/\r?\n/).filter((line) => line.trim());
@@ -411,6 +479,9 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
   else if (!ok) summary += `\n(the compiler printed no recognisable diagnostic; see the tail)`;
   if (usage) {
     summary += `\nimage: ${usage.flash} bytes flash, ${usage.ram} bytes RAM`;
+    if (usage.ramExact === false) {
+      summary += " (RAM is the initialised bytes only: this build did not relink, so no linker size line was printed; a full rebuild reports the exact figure)";
+    }
   }
   if (artifacts.length > 0) {
     summary += `\nartifacts: ${artifacts.map((artifact) => `${artifact.relative} (${artifact.bytes} B)`).join(", ")}`;

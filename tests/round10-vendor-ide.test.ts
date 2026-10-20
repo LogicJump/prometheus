@@ -16,12 +16,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { TOOLCHAIN_INFO, type ToolchainKind } from "../src/embedded/toolchain.ts";
 import { buildCommand, detectProject, iarProjectFile, keilProjectFile } from "../src/embedded/project.ts";
-import { parseFromelf, findArtifacts } from "../src/embedded/build.ts";
+import { parseFromelf, findArtifacts, findArtifactsIn } from "../src/embedded/build.ts";
 import { parseDiagnostics } from "../src/embedded/diagnostics.ts";
 
 function scratch(prefix: string): string {
@@ -133,31 +133,144 @@ test("a .axf is an ELF for the artifact scan", () => {
   }
 });
 
-/* ---------- size, from Keil's own tool ---------- */
+/* ---------- size, from Keil's own output ---------- */
 
-test("fromelf's totals become flash and RAM", () => {
+test("the linker's Program Size line becomes flash and RAM", () => {
+  // This is the line a real build writes into the log (Keil MDK 5.43, AC5):
+  // flash is Code + RO-data, RAM is RW-data + ZI-data.
+  const usage = parseFromelf("Program Size: Code=31978 RO-data=18842 RW-data=108 ZI-data=2050364  ");
+  assert.ok(usage);
+  assert.equal(usage.flash, 31978 + 18842);
+  assert.equal(usage.ram, 108 + 2050364);
+});
+
+test("fromelf -z ROM Totals is the fallback when the linker line is absent", () => {
+  // `fromelf --text -z` prints one row per object and a `ROM Totals` row. The
+  // ROM row counts only what lives in ROM, so its ZI column is 0; the image's
+  // own row is where ZI is reported. Flash is Code + RO Data either way.
   const output = [
-    "==============================================================================",
-    "Program Size:",
-    "  Total RO  Size (Code + RO Data)                12345 (  12.06kB)",
-    "  Total RW  Size (RW Data + ZI Data)              2345 (   2.29kB)",
-    "  Total ROM Size (Code + RO Data + RW Data)      12500 (  12.21kB)",
-    "==============================================================================",
+    "      Code (inc. data)   RO Data    RW Data    ZI Data      Debug   Object Name",
+    "     31978       1164      18842        108    2050364     534843   OBJ/TOUCH.axf",
+    "     31978       1164      18842        108          0          0   ROM Totals for OBJ/TOUCH.axf",
   ].join("\n");
   const usage = parseFromelf(output);
   assert.ok(usage);
-  assert.equal(usage.flash, 12345);
-  assert.equal(usage.ram, 2345);
-});
-
-test("an older fromelf without the parenthetical sums still parses", () => {
-  const usage = parseFromelf("Total RO  Size:  1000\nTotal RW  Size:  200\n");
-  assert.ok(usage);
-  assert.equal(usage.flash, 1000);
-  assert.equal(usage.ram, 200);
+  assert.equal(usage.flash, 31978 + 18842);
+  // The ROM Totals row is the one used, so ZI there is 0: RAM is the RW bytes
+  // only. This is a fallback because it under-reports, which is why the
+  // linker's own Program Size line is preferred when a build produced one.
+  assert.equal(usage.ram, 108);
 });
 
 test("output without totals yields no usage rather than zeros", () => {
   // A zero would be read as "the image is empty", which is worse than a blank.
+  // `--text -c` disassembles and prints no totals at all; that is the exact
+  // mistake the first version made on the real project.
   assert.equal(parseFromelf("Error: cannot open file"), undefined);
+  assert.equal(parseFromelf("** Section #1 '.text'\n    Size   : 31978 bytes"), undefined);
+});
+
+/* ---------- found on a real project ---------- */
+
+test("a project in USER\ is detected from the repository root", () => {
+  // The layout every Keil template uses, and the one the first version of this
+  // missed: CORE/HALLIB/OBJ at the root, the project one level down.
+  const root = scratch("prometheus-keil-user-");
+  try {
+    mkdirSync(join(root, "USER"));
+    mkdirSync(join(root, "OBJ"));
+    writeFileSync(join(root, "USER", "TOUCH.uvprojx"), "<Project/>");
+    assert.equal(detectProject(root).kind, "keil");
+    assert.equal(keilProjectFile(root), join(root, "USER", "TOUCH.uvprojx"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a stale .uvprojx in a sibling directory does not make this tree a Keil project", () => {
+  const root = scratch("prometheus-not-keil-");
+  try {
+    writeFileSync(join(root, "main.c"), "int main(void){return 0;}");
+    mkdirSync(join(root, "OBJ"));
+    writeFileSync(join(root, "OBJ", "old.uvprojx"), "<Project/>");
+    assert.equal(keilProjectFile(root), null, "the output directory is not searched");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("artifacts are found in the project's OutputDirectory, not just the root", () => {
+  // `..\OBJ\` relative to `USER\TOUCH.uvprojx` is the real project's layout.
+  const root = scratch("prometheus-keil-out-");
+  try {
+    mkdirSync(join(root, "USER"));
+    mkdirSync(join(root, "OBJ"));
+    writeFileSync(join(root, "USER", "TOUCH.uvprojx"), `<OutputDirectory>..${String.fromCharCode(92)}OBJ${String.fromCharCode(92)}</OutputDirectory>`);
+    writeFileSync(join(root, "OBJ", "TOUCH.axf"), "\x7fELF rest");
+    const project = detectProject(root);
+    const command = buildCommand(project, { keil: "UV4.exe" });
+    // Normalise separators before comparing: the path comes back with the
+    // platform's own, and a trailing one.
+    const normal = (dir: string) => dir.replace(/\\/g, "/").replace(/\/+$/, "");
+    assert.ok(command.artifactRoots?.some((dir) => normal(dir).endsWith("OBJ")), JSON.stringify(command.artifactRoots));
+    const found = findArtifactsIn(command.artifactRoots ?? [], command.artifactPatterns, undefined, root);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].kind, "elf");
+    // Reported against the workspace, so the rest of the app reads it the same.
+    assert.equal(found[0].relative, "OBJ/TOUCH.axf");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the log path is absolute and its directory is created", () => {
+  // UV4 resolves `-o` against the project file, and does not create the parent.
+  // A relative path silently produced no log at all on the real project.
+  const root = scratch("prometheus-keil-logpath-");
+  try {
+    mkdirSync(join(root, "USER"));
+    writeFileSync(join(root, "USER", "TOUCH.uvprojx"), "<Project/>");
+    const command = buildCommand(detectProject(root), { keil: "UV4.exe" });
+    const index = command.args.indexOf("-o");
+    const logPath = command.args[index + 1];
+    assert.ok(logPath === command.buildLog);
+    assert.ok(/^[A-Za-z]:/.test(logPath), "an absolute path");
+    assert.ok(existsSync(join(root, "build")), "the directory exists before the build runs");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an armlink error is a diagnostic, not an unparsed line", () => {
+  // The real failure: `..\OBJ\TOUCH.axf: Error: L6218E: Undefined symbol ...`
+  // was ignored, so a failed link reported "0 error(s)".
+  const log = [
+    "compiling main.c...",
+    "main.c(74): warning:  #223-D: function \"x\" declared implicitly",
+    "linking...",
+    `..${String.fromCharCode(92)}OBJ${String.fromCharCode(92)}TOUCH.axf: Error: L6218E: Undefined symbol undefined_symbol_x (referred from main.o).`,
+    "Target not created.",
+  ].join("\n");
+  const parsed = parseDiagnostics(log);
+  const link = parsed.diagnostics.find((entry) => entry.code === "L6218E");
+  assert.ok(link, "the linker error is present");
+  assert.equal(link.severity, "error");
+  assert.equal(link.file, "../OBJ/TOUCH.axf");
+  assert.equal(parsed.unparsed.filter((line) => /L6218E/.test(line)).length, 0, "not left unparsed");
+});
+
+test("an incremental build says its RAM figure is partial instead of quoting it", () => {
+  // Keil only prints `Program Size:` when it relinks. Everything up to date
+  // means the log has no size line, `fromelf` reports ZI as 0, and the honest
+  // answer is "these are the initialised bytes" — not "108 bytes of RAM" for
+  // an image that reserves two megabytes.
+  const fromelfOnly = parseFromelf("ROM Totals for x.axf");
+  assert.equal(fromelfOnly, undefined, "no totals at all rather than zeros");
+  const romRow = parseFromelf(
+    "     31978       1164      18842        108          0          0   ROM Totals for OBJ/TOUCH.axf",
+  );
+  assert.ok(romRow);
+  // The parser returns what the source says; the caller marks it partial. This
+  // asserts the number the partial path would carry.
+  assert.equal(romRow.ram, 108);
 });

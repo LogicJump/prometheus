@@ -13,8 +13,8 @@
  * matched, because every other ecosystem also ships one.
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 export type ProjectKind =
   | "zephyr"
@@ -47,6 +47,12 @@ export interface BuildCommand {
    * reports "#20: identifier undefined" and one that reports "exit 2".
    */
   buildLog?: string;
+  /**
+   * Directories to search for artifacts, when the project decides where they
+   * go. Keil names an `OutputDirectory` relative to its project file and the
+   * default is `..\OBJ\`; a scan of the repository root finds nothing there.
+   */
+  artifactRoots?: string[];
 }
 
 export interface DetectedProject {
@@ -121,26 +127,78 @@ function cargoEvidence(root: string): string[] {
 }
 
 /**
- * The `.uvprojx` to hand to `UV4 -b`, as a path relative to the project root.
+ * The `.uvprojx` to hand to `UV4 -b`.
  *
- * Relative on purpose: Keil resolves the project's own relative paths against
- * its working directory, and an absolute path works but reads as though the
- * project could be moved. The first one in directory order wins; a tree with
- * several is rare and the user can pass one explicitly.
+ * Keil's own convention puts the project in a subdirectory (`USER\`, `MDK-ARM\`,
+ * `Project\`), not at the repository root — this was found on a real project
+ * whose `.uvprojx` lives in `USER\` while the root only holds `CORE`,
+ * `HALLIB`, `OBJ` and friends. So the root is searched first and then one level
+ * down, which is where every Keil template puts it.
+ *
+ * Deterministic: same order every call, so a rebuild does not flip projects.
  */
 export function keilProjectFile(root: string): string | null {
-  const files = readdirSyncSafe(root)
-    .filter((name) => /\.uvprojx?$/i.test(name))
-    .sort((a, b) => a.localeCompare(b));
-  return files[0] ? join(root, files[0]) : null;
+  return findProjectFile(root, /\.uvprojx?$/i);
 }
 
 /** The `.ewp` for `IarBuild`, same convention as Keil's. */
 export function iarProjectFile(root: string): string | null {
-  const files = readdirSyncSafe(root)
-    .filter((name) => /\.ewp$/i.test(name))
+  return findProjectFile(root, /\.ewp$/i);
+}
+
+/**
+ * Where a Keil project writes its image.
+ *
+ * `OutputDirectory` is relative to the project file (`..\OBJ\` on the project
+ * this was tested against). Falls back to the project file's own directory,
+ * which is where an unmodified template puts it.
+ */
+export function keilOutputDirs(projectFile: string, root: string): string[] {
+  const dirs: string[] = [];
+  try {
+    const xml = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
+    const match = /<OutputDirectory>([^<]*)<\/OutputDirectory>/.exec(xml);
+    if (match?.[1]?.trim()) {
+      const output = match[1].trim().replace(/\\/g, "/");
+      // Relative output directories resolve against the project file, not
+      // against the workspace root — that is Keil's own rule.
+      dirs.push(join(projectFile, "..", output));
+    }
+  } catch {
+    /* an unreadable project is reported by the build itself */
+  }
+  dirs.push(join(projectFile, ".."));
+  dirs.push(root);
+  return dirs.filter((dir, index, all) => all.indexOf(dir) === index && existsSync(dir));
+}
+
+/** A project file, at the root or one directory below it, in a stable order. */
+function findProjectFile(root: string, pattern: RegExp): string | null {
+  const matches = (dir: string): string[] =>
+    readdirSyncSafe(dir)
+      .filter((name) => pattern.test(name))
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => join(dir, name));
+
+  const atRoot = matches(root);
+  if (atRoot.length > 0) return atRoot[0];
+
+  // One level down, but not into the output directory: `OBJ\` holds the
+  // generated files, and a stale copy there is not the project.
+  const subdirs = readdirSyncSafe(root)
+    .filter((name) => !/^(OBJ|obj|build|Build|DebugConfig|RTE|\.|node_modules)$/.test(name))
     .sort((a, b) => a.localeCompare(b));
-  return files[0] ? join(root, files[0]) : null;
+  for (const name of subdirs) {
+    const dir = join(root, name);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const found = matches(dir);
+    if (found.length > 0) return found[0];
+  }
+  return null;
 }
 
 function readdirSyncSafe(dir: string): string[] {
@@ -191,10 +249,16 @@ export function detectProject(start = process.cwd()): DetectedProject {
     if (has(join(dir, "Makefile")) || has(join(dir, "makefile"))) {
       return finish("make", dir, [dir === start ? "Makefile" : `Makefile (${dir})`]);
     }
-    const keil = readdirSyncSafe(dir).filter((name) => name.endsWith(".uvprojx") || name.endsWith(".uvproj"));
-    if (keil.length > 0) return finish("keil", dir, keil);
-    const iar = readdirSyncSafe(dir).filter((name) => name.endsWith(".ewp") || name.endsWith(".eww"));
-    if (iar.length > 0) return finish("iar", dir, iar);
+    // Keil and IAR templates put the project in a subdirectory (`USER\`,
+    // `MDK-ARM\`, `Project\`). Looking only at the directory itself found
+    // nothing on a real project whose root holds CORE/HALLIB/OBJ and whose
+    // `.uvprojx` lives one level down.
+    const vendor = findProjectFile(dir, /\.uvprojx?$|\.ewp$/i);
+    if (vendor) {
+      const name = vendor.slice(vendor.lastIndexOf("\\") + 1);
+      const kind = /\.ewp$/i.test(vendor) ? "iar" : "keil";
+      return finish(kind, dir, [dir === start ? name : `${name} (${dir})`]);
+    }
   }
   return { kind: "unknown", root: start, evidence: [] };
 }
@@ -352,14 +416,34 @@ export function buildCommand(
       // user's; this only drives what they installed.
       const project1 = keilProjectFile(root);
       if (!project1) return null;
-      const log = join(root, "build", "keil-build.log");
+      // `-o` is resolved against the project file's directory, not the
+      // process's working directory, and the parent must exist before UV4
+      // writes anything. Both were found the hard way on a real project: a
+      // relative log path produced no log at all and the build looked clean
+      // while carrying no diagnostics.
+      const logDir = join(root, "build");
+      try {
+        mkdirSync(logDir, { recursive: true });
+      } catch {
+        /* the build will report it */
+      }
+      const log = join(logDir, "keil-build.log");
       return {
         kind: "keil",
         program: toolchains.keil ?? "UV4.exe",
-        args: ["-b", project1, "-j0", "-o", log],
+        args: ["-b", resolve(project1), "-j0", "-o", resolve(log)],
         cwd: root,
-        artifactPatterns: ["*.axf", "*.hex", "*.bin", "**/*.axf", "**/*.hex", "**/*.bin"],
+        // The linker prints all four numbers in the log:
+        //   Program Size: Code=31978 RO-data=18842 RW-data=108 ZI-data=2050364
+        // which is more accurate than `fromelf` for a Keil image because the
+        // ZI region is exactly what the linker placed.
         buildLog: log,
+        // Where the image lands is the project's own `OutputDirectory`, which
+        // is relative to the project file and commonly `..\OBJ\`. Scanning the
+        // repository root finds nothing on a real Keil tree, so the directory
+        // is read out of the project and the scan runs there.
+        artifactPatterns: ["*.axf", "*.hex", "*.bin"],
+        artifactRoots: keilOutputDirs(project1, root),
       };
     }
     case "iar": {
