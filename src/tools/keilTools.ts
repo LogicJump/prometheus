@@ -40,6 +40,7 @@ import {
   evalInWindow,
   flashInIde,
   getOption,
+  getOutputName,
   halt,
   listBreakpoints,
   listKeilSessions,
@@ -464,8 +465,8 @@ const keilProjectTool: Tool = {
       const reply = await setTarget(session, target);
       lines.push(reply.ok ? `active target is now ${target}` : `could not switch: ${reply.message ?? reply.statusName}`);
     } else if (action === "output_name") {
-      const reply = await session.client.send(0x1014, Buffer.alloc(4), 10_000);
-      lines.push(reply.ok ? `output: ${reply.data.toString("latin1")}` : `could not read it: ${reply.message ?? reply.statusName}`);
+      const name = await getOutputName(session);
+      lines.push(name ? `output: ${name}` : "the project did not report an output name");
     } else {
       return { isError: true, content: `unknown action \`${action}\``, display: "unknown action" };
     }
