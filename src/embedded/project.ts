@@ -64,6 +64,14 @@ export interface DetectedProject {
   buildDir?: string;
   /** CMake presets or west boards discovered in the tree. */
   presets?: string[];
+  /**
+   * The project file itself (`.uvprojx`, `.ewp`), when the ecosystem has one.
+   *
+   * The Keil debugger is driven per project rather than per directory: its
+   * device, flash algorithm and probe configuration live in this file, so a
+   * caller that wants to open a debug session needs the path, not the root.
+   */
+  file?: string;
 }
 
 function readIfExists(file: string): string | null {
@@ -174,9 +182,12 @@ export function keilOutputDirs(projectFile: string, root: string): string[] {
 
 /** A project file, at the root or one directory below it, in a stable order. */
 function findProjectFile(root: string, pattern: RegExp): string | null {
+  // A backup must never be opened as the project: `TOUCH.uvprojx.orig` matches
+  // `*.uvprojx*` and sorts before the real file, so an edit would be written
+  // into a copy that nothing builds.
   const matches = (dir: string): string[] =>
     readdirSyncSafe(dir)
-      .filter((name) => pattern.test(name))
+      .filter((name) => pattern.test(name) && !/\.(bak|orig|backup|save|tmp)$/i.test(name))
       .sort((a, b) => a.localeCompare(b))
       .map((name) => join(dir, name));
 
@@ -257,7 +268,10 @@ export function detectProject(start = process.cwd()): DetectedProject {
     if (vendor) {
       const name = vendor.slice(vendor.lastIndexOf("\\") + 1);
       const kind = /\.ewp$/i.test(vendor) ? "iar" : "keil";
-      return finish(kind, dir, [dir === start ? name : `${name} (${dir})`]);
+      // The file path is carried on the result: a Keil debug session opens the
+      // project, not the directory, and the caller should not have to repeat
+      // the search to find what detection already found.
+      return { ...finish(kind, dir, [dir === start ? name : `${name} (${dir})`]), file: vendor };
     }
   }
   return { kind: "unknown", root: start, evidence: [] };

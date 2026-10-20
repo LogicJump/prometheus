@@ -27,6 +27,7 @@ import { recordFlash, readFlashHistory, formatFlashHistory } from "../embedded/f
 import { findFlasherArgs } from "../embedded/espIdf.ts";
 import { findDeviceInPacks, packRoots as packRootsFor } from "../embedded/cmsisPack.ts";
 import { runtimeTools } from "./embeddedRuntimeTools.ts";
+import { keilTools } from "./keilTools.ts";
 import { installHintLines } from "../embedded/installHints.ts";
 import { checkServerPort } from "../embedded/serverPort.ts";
 import { isPortOpen, recentPortLines } from "../embedded/serial.ts";
@@ -1405,6 +1406,7 @@ function worstStack(cwd: string): ReturnType<typeof parseStackUsage> {
 
 export const embeddedTools: Tool[] = [
   buildTool,
+  ...keilTools,
   flashTool,
   serialTool,
   portsTool,
