@@ -61,6 +61,11 @@ import {
   readVariables,
   readVtr,
   readNamedRegisters,
+  readScvdFiles,
+  readVtrValue,
+  registerItm,
+  removeWatch,
+  setEventRecorder,
   showCodeAt,
   debugCommand,
   disassemble,
@@ -80,6 +85,7 @@ import {
   removeGroup,
   run,
   setOption,
+  setOutputName,
   setTarget,
   step,
   writeRegister,
@@ -182,6 +188,7 @@ const keilDebugTool: Tool = {
           "breakpoint_add",
           "breakpoint_delete",
           "watch_add",
+          "watch_remove",
           "registers",
           "register_read",
           "register_set",
@@ -196,6 +203,10 @@ const keilDebugTool: Tool = {
           "tasks",
           "trace",
           "trace_set",
+          "trace_get",
+          "itm",
+          "event_recorder",
+          "show_code",
           "disassemble",
           "menus",
           "menu_exec",
@@ -348,6 +359,10 @@ const keilDebugTool: Tool = {
         const target = list.find((entry) => entry.number === requested);
         if (!target) return { isError: true, content: `there is no breakpoint ${requested}; the list has ${list.length}.`, display: "not found" };
         const changed = await changeBreakpoint(session, target.tickMark, 1);
+      } else if (action === "watch_remove") {
+        if (!location) return { isError: true, content: "watch_remove needs the `location` expression that was added.", display: "missing expression" };
+        const reply = await removeWatch(session, location);
+        lines.push(reply.ok ? `removed watch ${location}` : `could not remove it: ${reply.message ?? reply.statusName}`);
       } else if (action === "watch_add") {
         if (!location) return { isError: true, content: "watch_add needs a `location` expression.", display: "missing expression" };
         const watched = await addWatch(session, location);
@@ -530,7 +545,10 @@ const keilDebugTool: Tool = {
         const name = input.location ? String(input.location) : "";
         if (!name) return { isError: true, content: "trace_set needs a `location` naming the trace variable.", display: "missing name" };
         const reply = await setVtr(session, name, true);
-        lines.push(reply.ok ? `trace variable ${name} enabled` : `could not enable it: ${reply.message ?? reply.statusName}`);
+        if (!reply.ok) return { isError: true, content: `could not enable ${name}: ${reply.message ?? reply.statusName}`, display: "trace refused" };
+        // `SUCCESS` is not the claim being made — "enabled" is. Read it back.
+        const after = await readVtrValue(session, name);
+        lines.push(after.ok ? `trace variable ${name} = ${after.value}` : `the debugger accepted the change but would not read it back`);
       } else if (action === "tasks") {
         const tasks = await readTasks(session);
         lines.push(
@@ -541,6 +559,37 @@ const keilDebugTool: Tool = {
       } else if (action === "trace") {
         const items = await readVtr(session);
         lines.push(items.length ? items.map((item) => item.name).join(", ") : "no trace variables reported");
+      } else if (action === "trace_get") {
+        if (!location) return { isError: true, content: "trace_get needs a `location` naming the trace variable.", display: "missing name" };
+        const read = await readVtrValue(session, location);
+        lines.push(
+          read.ok
+            ? `${location} = ${read.value}`
+            : `could not read ${location}: ${read.message ?? "no reason given"}`,
+        );
+      } else if (action === "itm") {
+        // `count` carries the channel number; `value` 0 turns it off.
+        const channel = Number(input.count ?? -1);
+        if (!Number.isInteger(channel) || channel < 0) {
+          return { isError: true, content: "itm needs a channel number in `count` (0-31).", display: "missing channel" };
+        }
+        const enable = input.value === undefined ? true : Number(input.value) !== 0;
+        const reply = await registerItm(session, channel, enable);
+        lines.push(reply.ok ? `ITM stimulus port ${channel} ${enable ? "enabled" : "disabled"}` : `could not change it: ${reply.message ?? reply.statusName}`);
+      } else if (action === "event_recorder") {
+        const enable = input.value === undefined ? true : Number(input.value) !== 0;
+        const reply = await setEventRecorder(session, enable);
+        if (!reply.ok) return { isError: true, content: `the Event Recorder could not be ${enable ? "started" : "stopped"}: ${reply.message ?? reply.statusName}`, display: "event recorder refused" };
+        const files = enable ? await readScvdFiles(session) : [];
+        lines.push(`Event Recorder ${enable ? "started" : "stopped"}`);
+        if (enable) {
+          lines.push(files.length > 0 ? `SCVD files: ${files.join(", ")}` : "SCVD files: none — this image describes no events with a recorder description");
+        }
+      } else if (action === "show_code") {
+        const address = Number(input.address);
+        if (!Number.isFinite(address)) return { isError: true, content: "show_code needs an `address`.", display: "missing address" };
+        const reply = await showCodeAt(session, address, input.width !== "u8");
+        lines.push(reply.ok ? `the editor was asked to show ${hex(address)}` : `could not show it: ${reply.message ?? reply.statusName}`);
       } else if (action === "clean" || action === "clean_rebuild" || action === "export_cprj" || action === "symbols" || action === "convert") {
         // These are the rest of UV4's documented switches; each is one headless
         // run, so the build's log/exit-code reading applies unchanged.
@@ -629,7 +678,7 @@ const keilProjectTool: Tool = {
     properties: {
       action: {
         type: "string",
-        enum: ["info", "groups", "files", "add_group", "add_file", "remove_file", "remove_group", "get_option", "set_option", "set_target", "output_name", "close"],
+        enum: ["info", "targets", "groups", "files", "add_group", "add_file", "remove_file", "remove_group", "get_option", "set_option", "set_target", "set_output_name", "output_name", "close"],
         description: "What to do. `info` summarises the project.",
       },
       project: { type: "string", description: "The .uvprojx path; defaults to the detected project" },
@@ -667,13 +716,19 @@ const keilProjectTool: Tool = {
 
     if (action === "info") {
       lines.push(`project: ${session.project}`);
-      lines.push(`target: ${await currentTarget(session)}`);
+      const targets = await projectTargets(session);
+      const active = await currentTarget(session);
+      lines.push(`target: ${active}${targets.length > 1 ? ` (of ${targets.length}: ${targets.join(", ")})` : ""}`);
+      const output = await getOutputName(session);
+      if (output) lines.push(`output: ${output}`);
       const defines = await getOption(session, "CDEF");
       if (defines.ok) lines.push(`defines: ${defines.values.join(", ") || "(none)"}`);
-      // The group/file tree is only readable from an entered debugger. It is
-      // therefore a separate, explicit ask rather than part of `info`: asking
-      // for it here would start a flash download the caller never requested.
-      lines.push("for the group and file tree, run `groups` (it enters the debugger, which needs the target to answer)");
+      const groups = await projectGroups(session);
+      lines.push(`groups: ${groups.join(", ") || "(none)"}`, "run `files` with a group to list its sources");
+    } else if (action === "targets") {
+      const targets = await projectTargets(session);
+      const active = await currentTarget(session);
+      lines.push(targets.length > 0 ? targets.map((name) => `${name === active ? "*" : " "} ${name}`).join(String.fromCharCode(10)) : "(no targets)");
     } else if (action === "groups") {
       const groups = await projectGroups(session);
       lines.push(groups.length > 0 ? groups.join("\n") : "(no groups)");
@@ -736,6 +791,24 @@ const keilProjectTool: Tool = {
       if (!target) return { isError: true, content: "set_target needs a `target`.", display: "missing target" };
       const reply = await setTarget(session, target);
       lines.push(reply.ok ? `active target is now ${target}` : `could not switch: ${reply.message ?? reply.statusName}`);
+    } else if (action === "set_output_name") {
+      const name = input.value ? String(input.value) : input.file ? String(input.file) : "";
+      if (!name) return { isError: true, content: "set_output_name needs a `value`: the file name only, e.g. `app.axf` (the output directory is a separate option).", display: "missing name" };
+      const reply = await setOutputName(session, name);
+      if (!reply.ok) return { isError: true, content: `could not set it: ${reply.message ?? reply.statusName}`, display: "output name refused" };
+      // Settling for the reply is how this went wrong once: the project kept
+      // the old name while the call reported success, and the next build and
+      // debug session pointed at a file that did not exist. The debugger's own
+      // answer is the check.
+      const stored = await getOutputName(session);
+      if (stored && stored !== name) {
+        return {
+          isError: true,
+          content: `the debugger accepted the request but still reports ${JSON.stringify(stored)}, not ${JSON.stringify(name)}; nothing was changed.`,
+          display: "output name unchanged",
+        };
+      }
+      lines.push(`output name set to ${stored || name}`);
     } else if (action === "output_name") {
       const name = await getOutputName(session);
       lines.push(name ? `output: ${name}` : "the project did not report an output name");

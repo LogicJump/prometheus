@@ -206,6 +206,49 @@ flash check: flash at 0x8000000 matches …\OBJ\TOUCH.hex for 64 byte(s)
 顺带一提：这台机器上**接了一块 ST-Link**（设备列表里的 `STM32 STLink`，COM7），
 所以这里的烧写结论是在真实板子上得到的，不是模拟器。
 
+## 四之四、第四轮：查「用户能不能走到」
+
+前三轮查的是「代码对不对」，这一轮查的是「**有没有入口**」。我写了一个可达性审计:
+把 Keil 层导出的每个函数拿去全仓库找调用点,结果 **16 个导出函数没有任何调用**——
+写好了、测过了、也贴着「已接通」,但没有任何工具动作能触发它们。
+
+逐个在真实会话上验过之后,分三类处理:
+
+**确实可用、只是缺入口的,补成动作:**
+
+| 新动作 | 实测 |
+|---|---|
+| `keil_project targets` | `* TOUCH`(列出全部目标并标出当前) |
+| `keil_project set_output_name` | 写入后回读核对 |
+| `keil_debug watch_remove` | 实测**要表达式本身**,不是 `watch_add` 给的 id |
+| `keil_debug trace_get` | `TRAPS = 0x1` |
+| `keil_debug itm` | 通道模式字必须是 0;之前发的 1 被拒(`16Bit Mode not supported`) |
+| `keil_debug event_recorder` | 启动后列出 SCVD;没有就是「这个镜像不描述事件」 |
+| `keil_debug show_code` | 在 IDE 里定位到地址 |
+
+`set_target`/`output_name` 等原本就有,但 `info` 里只说「去跑 groups」,没有把目标列表、
+输出名、组列表放在一处——现在 `info` 一次给全。
+
+**实现本身就是错的:**
+
+- `debugTargetKind` 读 `PRJ_GET_DEBUG_TARGET` 的首字,实测**硬件和仿真器都回 1**,
+  按它判断会给出看似合理的错答案。改成用会话自己记录的 target。
+- `removeWatch` 按 id 删,实测 `NOT_FOUND`;按表达式删才是 `SUCCESS`。
+- `sendRegisterSet` 对非数字静默发 0——现在报错而不是写一个猜测值。
+
+**真的没法接的,在代码里写明原因而不是留着:**
+
+- `cancelBuild`:`PRJ_BUILD_CANCEL` 无构建时回 `FAILED`;而构建在单次调用里跑完,
+  没有第二个调用能插进去的窗口,取消就是超时。
+- `closeProject`/`PRJ_CLOSE`:只在非调试会话可用,而这时关掉 uVision 就是关闭会话本身。
+- `ideVersion`/`buildProject`/`getKeilSession`/`closeAllKeilSessions`/`filesInGroupFromProject`/
+  `sendRegisterSet`:辅助函数,没有独立能力。
+
+**顺带修掉一个我自己造成的破坏**:测 `set_output_name` 时把 `..\OBJ\TOUCH.axf`
+整个写进了 `OutputName`,工程变成 `..\OBJ\..\OBJ\TOUCH.axf` 而无法加载。
+`OutputName` 只收文件名,`OutputDirectory` 是另一个选项;现在输入会被截成文件名,
+并且写入后**回读核对**,不一致就报失败。这个 bug 是被新加的核对当场抓到的。
+
 ## 五、其余已接通的能力
 ### 调试（`keil_debug`，47 个动作）
 

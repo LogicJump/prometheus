@@ -1287,7 +1287,16 @@ export async function readRegisterGroups(session: KeilSession): Promise<string[]
 
 /** Set a register by name. Kept for callers that only want the raw request. */
 export async function sendRegisterSet(session: KeilSession, name: string, value: string): Promise<Reply> {
-  const wanted = numericValue(value) ?? 0;
+  const wanted = numericValue(value);
+  if (wanted === null) {
+    return {
+      ok: false,
+      status: 13,
+      statusName: "PARSE_ERROR",
+      data: Buffer.alloc(0),
+      message: `${JSON.stringify(value)} is not a number`,
+    };
+  }
   return session.client.send(OP.DBG_REGISTER_SET, vsetWithValue(name, 5, BigInt(wanted)), 10_000);
 }
 
@@ -1334,7 +1343,14 @@ export async function buildProject(session: KeilSession, mode: "build" | "rebuil
   return session.client.send(command, Buffer.alloc(0), 15_000);
 }
 
-/** Cancel a build in progress. */
+/**
+ * Cancel a build in progress.
+ *
+ * Measured on MDK 5.43a with no build running: `FAILED` with a 12-byte body,
+ * so the answer is passed through rather than assumed. Not wired to an action
+ * because a build runs inside one call and there is no window in which a
+ * second call could reach it — cancelling is what the timeout does.
+ */
 export async function cancelBuild(session: KeilSession): Promise<Reply> {
   return session.client.send(OP.PRJ_BUILD_CANCEL, Buffer.alloc(0), 8_000);
 }
@@ -1384,6 +1400,7 @@ export {
   NEEDS_EXTENDED_STACK,
   readMenus,
   readScvdFiles,
+  readVtrValue,
   closeProject,
   readNamedRegisters,
   registerItm,

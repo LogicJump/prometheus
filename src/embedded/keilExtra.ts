@@ -171,9 +171,12 @@ export async function addWatch(session: KeilSession, expression: string): Promis
   return { ok: true, id, value, ...(type ? { type } : {}) };
 }
 
-/** Remove a watch expression by the id `addWatch` reported. */
-export async function removeWatch(session: KeilSession, id: number): Promise<Reply> {
-  return session.client.send(OP.DBG_REMOVE_WATCH_EXPRESSION, vset(String(id)), 8_000);
+/** Remove a watch expression by the expression itself. */
+export async function removeWatch(session: KeilSession, expression: string): Promise<Reply> {
+  // Measured: the id that `addWatch` reports is answered `NOT_FOUND: Item not
+  // found`; the **expression** removes it. Sending the id was a request that
+  // could never succeed.
+  return session.client.send(OP.DBG_REMOVE_WATCH_EXPRESSION, vset(expression), 8_000);
 }
 
 /* ---------- run control beyond the basics ---------- */
@@ -286,9 +289,13 @@ export async function execMenu(session: KeilSession, id: number, group = 0): Pro
 
 /** Turn an ITM channel on or off. */
 export async function registerItm(session: KeilSession, channel: number, enable = true): Promise<Reply> {
+  // `UV_ITM_REGISTER` takes `{ u16 nChan, u16 nMode }` where the mode selects
+  // 8- or 16-bit stimulus ports. Measured, sending `{ channel, 1 }` is refused
+  // with "16Bit Mode not supported", so the mode word is 0 (the 8-bit form)
+  // and the channel alone carries the request.
   const payload = Buffer.alloc(16);
   payload.writeUInt16LE(channel, 0);
-  payload.writeUInt16LE(enable ? 1 : 0, 2);
+  payload.writeUInt16LE(0, 2);
   return session.client.send(enable ? OP.DBG_ITM_REGISTER : OP.DBG_ITM_UNREGISTER, payload, 10_000);
 }
 
@@ -297,12 +304,22 @@ export async function setEventRecorder(session: KeilSession, enable: boolean): P
   return session.client.send(enable ? OP.DBG_EVTR_REGISTER : OP.DBG_EVTR_UNREGISTER, Buffer.alloc(0), 10_000);
 }
 
-/** The SCVD description files the recorder knows. */
+/**
+ * The SCVD description files the recorder knows.
+ *
+ * An empty answer is the normal one on a target with no Event Recorder
+ * configured: measured, the enumeration sends its start and end frames with
+ * nothing between them. That is "this image describes no events", not a failed
+ * request, and the caller is told which.
+ */
 export async function readScvdFiles(session: KeilSession): Promise<string[]> {
   const mark = session.client.mark;
   await session.client.send(OP.DBG_EVTR_ENUMSCVDFILES, Buffer.alloc(0), 10_000);
   const frames = await session.client.collect(1200, 0x5066, mark);
-  return frames.map((frame) => readSstr(frame.data, 0)).filter(Boolean);
+  return frames
+    .filter((frame) => frame.type === 0x5065)
+    .map((frame) => readSstr(frame.data, 0))
+    .filter(Boolean);
 }
 
 /**
@@ -327,6 +344,25 @@ export async function setVtr(session: KeilSession, name: string, on: boolean): P
   return session.client.send(OP.DBG_VTR_SET, vsetWithValue(name, 5, on ? 1n : 0n), 8_000);
 }
 
+/**
+ * Read one trace variable's value.
+ *
+ * `VTR_GET` takes the same `VSET` as `VTR_SET` and answers with one: the
+ * numeric field and the debugger's rendering. Measured: while the extended
+ * stack option is on, `STCLK` comes back with a type word, a zero value and
+ * the name, rather than the `Unknown VTR-name` this build returned before —
+ * so the answer is passed through as the debugger gave it instead of being
+ * dressed up as a number it did not provide.
+ */
+export async function readVtrValue(session: KeilSession, name: string): Promise<{ ok: boolean; value: string; message?: string }> {
+  const reply = await session.client.send(OP.DBG_VTR_GET, vsetWithValue(name, 0, 0n), 8_000);
+  if (!reply.ok) return { ok: false, value: "", message: reply.message ?? reply.statusName };
+  const decoded = readVset(reply.data);
+  if (!decoded) return { ok: false, value: "", message: "the reply carried no value" };
+  const text = decoded.text && decoded.text !== name ? decoded.text : `0x${decoded.value.toString(16)}`;
+  return { ok: true, value: text };
+}
+
 /** Simulator clock: cycles and the timestamp the debugger reports. */
 export async function timeInfo(session: KeilSession): Promise<{ cycles: bigint; seconds: number } | null> {
   const reply = await session.client.send(OP.DBG_TIME_INFO, Buffer.alloc(0), 8_000);
@@ -336,16 +372,31 @@ export async function timeInfo(session: KeilSession): Promise<{ cycles: bigint; 
 
 /* ---------- project and IDE ---------- */
 
-/** Which target a debug session uses. */
+/**
+ * Which target a debug session is attached to.
+ *
+ * `PRJ_GET_DEBUG_TARGET` answers a 44-byte record whose first word was
+ * measured as 1 on both a hardware and a simulator session, so it does not
+ * say which one is live. The session records the choice it opened with, and
+ * that is the answer that cannot be wrong — reading the register would be the
+ * plausible-but-false value this interface keeps producing.
+ */
 export async function debugTargetKind(session: KeilSession): Promise<"hardware" | "simulator" | null> {
-  const reply = await session.client.send(OP.PRJ_GET_DEBUG_TARGET, Buffer.alloc(0), 8_000);
-  if (!reply.ok || reply.data.length < 4) return null;
-  return reply.data.readUInt32LE(0) === 0 ? "hardware" : "simulator";
+  return session.target;
 }
 
 /** Rename the target's output file; uVision writes it into the project. */
+/**
+ * Set the target's output name.
+ *
+ * The name is a **stem plus an extension**, not a path: `OutputDirectory` is a
+ * separate target option and the debugger prepends it. Measured — sending
+ * `..\OBJ\TOUCH.axf` produced `..\OBJ\..\OBJ\TOUCH.axf`, so the value is
+ * reduced to its file name before it is sent.
+ */
 export async function setOutputName(session: KeilSession, name: string): Promise<Reply> {
-  return session.client.send(OP.PRJ_SET_OUTPUTNAME, prjData(name), 10_000);
+  const file = name.split(/[\\/]/).pop() ?? name;
+  return session.client.send(OP.PRJ_SET_OUTPUTNAME, prjData(file), 10_000);
 }
 
 /** Show, hide or minimise the uVision window. */
