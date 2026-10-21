@@ -817,8 +817,36 @@ const keilProjectTool: Tool = {
     } else if (action === "set_target") {
       const target = input.target ? String(input.target) : "";
       if (!target) return { isError: true, content: "set_target needs a `target`.", display: "missing target" };
+      const known = await projectTargets(session);
+      if (known.length > 0 && !known.includes(target)) {
+        return {
+          isError: true,
+          content: `there is no target ${JSON.stringify(target)}; the project has ${known.map((name) => JSON.stringify(name)).join(", ")}.`,
+          display: "unknown target",
+        };
+      }
       const reply = await setTarget(session, target);
-      lines.push(reply.ok ? `active target is now ${target}` : `could not switch: ${reply.message ?? reply.statusName}`);
+      if (!reply.ok) return { isError: true, content: `could not switch: ${reply.message ?? reply.statusName}`, display: "switch refused" };
+      // The reply is not the state: read it back, the same way register and
+      // memory writes are checked.
+      const active = await currentTarget(session);
+      if (active !== target) {
+        return {
+          isError: true,
+          content: `the switch was accepted but the project still reports ${JSON.stringify(active || "(none)")}, not ${JSON.stringify(target)}.`,
+          display: "switch did not take",
+        };
+      }
+      lines.push(`active target is now ${target}`);
+      // Which target the debugger loads is a property of this switch, measured:
+      // with `TOUCH` current a debug session logged `Load "..\OBJ\TOUCH.axf"`,
+      // and after switching to `TOUCH_SIM` it logged
+      // `Load "..\OBJ_SIM\TOUCH_SIM.axf"`. So a hardware/simulator debug
+      // session always uses whichever target is current — the debug tool has
+      // no target of its own to choose, and the image it would load is worth
+      // naming before someone debugs the wrong one.
+      const image = await imageLocation(session);
+      if (!("error" in image)) lines.push(`a new keil_debug session will load ${image.elf}`);
     } else if (action === "set_output_name") {
       const name = input.value ? String(input.value) : input.file ? String(input.file) : "";
       if (!name) return { isError: true, content: "set_output_name needs a `value`: the file name only, e.g. `app.axf` (the output directory is a separate option).", display: "missing name" };

@@ -686,3 +686,55 @@ test("`**` in an artifact pattern walks nested output directories", async () => 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a multi-target project's image is read from the active target's block", async () => {
+  const { imageLocation } = await import("../src/embedded/keilSession.ts");
+  const { fromelfFor } = await import("../src/embedded/build.ts");
+  const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const B = String.fromCharCode(92);
+  const uv4 = ["G:", "software", "keil5", "UV4", "UV4.exe"].join(B);
+  const fromelf = fromelfFor(uv4);
+  if (!fromelf) return; // no Keil on this machine: nothing to resolve with
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-mt-"));
+  try {
+    const block = (name: string, out: string) =>
+      "<Target><TargetName>" + name + "</TargetName>" +
+      "<OutputDirectory>." + B + out + B + "</OutputDirectory>" +
+      "<OutputName>" + name + "</OutputName></Target>";
+    const project = join(dir, "P.uvprojx");
+    writeFileSync(project, "<Project><Targets>" + block("A", "OBJ") + block("B", "OBJ_SIM") + "</Targets></Project>");
+    mkdirSync(join(dir, "OBJ"));
+    mkdirSync(join(dir, "OBJ_SIM"));
+    // `imageLocation` asks the live session for its active target through
+    // `PRJ_GET_TARGET`; a stand-in client answers that one request.
+    const { encodeMessage } = await import("../src/embedded/uvsock.ts");
+    const { MessageReader } = await import("../src/embedded/uvsock.ts");
+    const session = (active: string) =>
+      ({
+        project,
+        client: {
+          programPath: uv4,
+          send: async () => {
+            // `{ u32 echoed, u32 status, u32 len, char text[] }` inside a
+            // CMD_RESPONSE envelope, which is what the real client returns.
+            // `currentTarget` reads the name from offset 4 of the reply data,
+            // so the first word is the option slot, not the echoed command.
+            const body = Buffer.alloc(8 + 64);
+            body.writeUInt32LE(0, 0);
+            Buffer.from(active, "latin1").copy(body, 4);
+            return { ok: true, status: 0, statusName: "SUCCESS", data: body };
+          },
+        },
+      }) as unknown as Parameters<typeof imageLocation>[0];
+    void encodeMessage;
+    void MessageReader;
+    const a = await imageLocation(session("A"));
+    const b = await imageLocation(session("B"));
+    assert.ok("elf" in a && a.elf.endsWith("OBJ" + B + "A.axf"), JSON.stringify(a));
+    assert.ok("elf" in b && b.elf.endsWith("OBJ_SIM" + B + "B.axf"), JSON.stringify(b));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

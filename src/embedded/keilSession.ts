@@ -1562,8 +1562,19 @@ export async function imageLocation(session: KeilSession): Promise<ImageLocation
   } catch {
     return { error: `could not read ${projectFile} to find the output image` };
   }
-  const outputName = /<OutputName>([^<]*)<\/OutputName>/.exec(xml)?.[1]?.trim() || (projectFile.split(/[\\/]/).pop() ?? "project").replace(/\.uvprojx?$/i, "");
-  const outputDir = /<OutputDirectory>([^<]*)<\/OutputDirectory>/.exec(xml)?.[1]?.trim() || ".";
+  // A multi-target project has one `<Target>` block per target, each with its
+  // own `<OutputDirectory>` and `<OutputName>`. Reading the first one in the
+  // file would resolve a `file:line` against the wrong image after
+  // `set_target`; measured on a two-target project, the targets write to
+  // `..\OBJ\` and `..\OBJ_SIM\`.
+  const active = await currentTarget(session).catch(() => "");
+  const blocks = [...xml.matchAll(/<Target>([\s\S]*?)<\/Target>/g)].map((match) => match[1]);
+  const block = blocks.find((body) => {
+    const name = /<TargetName>([^<]*)<\/TargetName>/.exec(body)?.[1]?.trim();
+    return name !== undefined && name === active;
+  }) ?? blocks[0] ?? xml;
+  const outputName = /<OutputName>([^<]*)<\/OutputName>/.exec(block)?.[1]?.trim() || (projectFile.split(/[\\/]/).pop() ?? "project").replace(/\.uvprojx?$/i, "");
+  const outputDir = /<OutputDirectory>([^<]*)<\/OutputDirectory>/.exec(block)?.[1]?.trim() || ".";
   const elf = join(projectFile, "..", outputDir.replace(/\\/g, "/"), `${outputName}.axf`);
   const fromelf = fromelfFor(session.client.programPath);
   if (!fromelf) return { error: "fromelf was not found in this Keil install, so the image's line table cannot be read" };

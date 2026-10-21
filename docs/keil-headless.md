@@ -451,18 +451,37 @@ run()            → 停在 0x08006BF8，正好是 main.c:38
 同一行为在第二轮复现（`PROOF_TWO`）。`closeAndReport` 现在会把「已写盘」与
 「文件没变（本来就没有编辑，或已经在盘上）」分开说，不再让两者看起来一样。
 
+### 6. 多 Target 工程里的**调试** —— 又查出一条没验证的路
+
+上一轮只验证了「切换 Target 的选项」，没验证「调试哪一个 Target」。补测：
+
+- 调试器加载的镜像跟着**当前 Target** 走。实测日志：
+  当前是 `TOUCH` 时 `Load "..\OBJ\TOUCH.axf"`；`set_target TOUCH_SIM` 之后
+  变成 `Load "..\OBJ_SIM\TOUCH_SIM.axf"`。
+- 也就是说 `keil_debug open` 没有自己的 target 参数，它用的一定是当前那个。
+  原实现在这里什么也没说——切完 Target 直接调试，很容易以为自己调的是另一个。
+  现在 `set_target` 会回读确认（回 `SUCCESS` 但没切过去就判失败），
+  并明确说「下一次调试会加载 `<路径>`」。
+- 顺带修掉一个会读错镜像的 bug：`imageLocation` 原来读工程文件里**第一个**
+  `<OutputDirectory>`，双 Target 工程里就固定指向第一个 Target 的产物。
+  `file:line` 断点是靠它解析地址的，切到第二个 Target 之后会拿错误的镜像去
+  解析行号。现在按当前 Target 的 `<Target>` 块取。实测切换后分别得到
+  `..\OBJ\TOUCH.axf` 与 `..\OBJ_SIM\TOUCH_SIM.axf`。
+
 ### 这一轮补的测试
 
-`tests/round12-uvsock.test.ts` 从 41 条增到 47 条，新增覆盖：`file:line` 解析、
+`tests/round12-uvsock.test.ts` 从 41 条增到 48 条，新增覆盖：`file:line` 解析、
 `fromelf` 行号表解析（含 `00000000:` 头行被丢弃）、行号/文件不存在时的错误文案、
 缺少镜像与缺少 `fromelf` 的失败路径、编译器注册（含「不覆盖用户变量」）、
-`**` 递归产物发现。
+`**` 递归产物发现、多 Target 工程按当前 Target 取镜像。
+
+全量 791 条，789 通过，2 条原有条件跳过，0 失败。
 
 ---
 
 ## 八、验证
 
-`tests/round12-uvsock.test.ts`（47 条）把每个实测到的字节形状固定成断言：pack(1) 的
+`tests/round12-uvsock.test.ts`（48 条）把每个实测到的字节形状固定成断言：pack(1) 的
 `REGENUM`/`VSET`/`VARINFO`/`STACKENUM` 偏移、`AMEM` 反汇编是文本、`IVARENUM` 的 count、
 `PRJDATA` 的长度、`ALREADY_PRESENT` 的组归属、栈的顺序、寄存器别名查找、
 `file:line` → 地址的解析、`cbuild` 的编译器注册、`**` 产物发现。
