@@ -738,3 +738,19 @@ test("a multi-target project's image is read from the active target's block", as
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("the capability report is reachable and does not claim a working op is refused", async () => {
+  const { toolByName } = await import("../src/tools/index.ts");
+  const { UNSUPPORTED_ON_MDK_5_43 } = await import("../src/embedded/keilExtra.ts");
+  const tool = toolByName("keil_debug");
+  assert.ok(tool, "keil_debug is registered");
+  const actions = ((tool!.parameters as { properties: { action: { enum: string[] } } }).properties.action.enum);
+  assert.ok(actions.includes("capabilities"), "the action is declared");
+  // Measured on MDK 5.43a: `DBG_VTR_GET TRAPS` answers SUCCESS. The table used
+  // to list it as refused, which made `trace_get` look broken.
+  assert.equal(UNSUPPORTED_ON_MDK_5_43["DBG_VTR_GET"], undefined, "VTR_GET works and must not be listed");
+  // Every remaining entry says why, not just that it is unsupported.
+  for (const [name, why] of Object.entries(UNSUPPORTED_ON_MDK_5_43)) {
+    assert.ok(why.length > 15, `${name} explains itself`);
+  }
+});

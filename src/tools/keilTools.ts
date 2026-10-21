@@ -95,6 +95,7 @@ import {
   type OptionName,
 } from "../embedded/keilSession.ts";
 import { keilCli } from "../embedded/keilCli.ts";
+import { NEEDS_EXTENDED_STACK, UNSUPPORTED_ON_MDK_5_43 } from "../embedded/keilExtra.ts";
 import { stopReasonName } from "../embedded/uvsock.ts";
 
 const hex = (value: number) => `0x${value.toString(16)}`;
@@ -227,6 +228,7 @@ const keilDebugTool: Tool = {
           "time",
           "license",
           "version",
+          "capabilities",
           "window",
           "build",
           "rebuild",
@@ -565,6 +567,22 @@ const keilDebugTool: Tool = {
       } else if (action === "version") {
         const info = await ideVersionText(session);
         lines.push(info ? `uVision V${info.uv}, socket interface V${info.socket}` : "the IDE did not report its version");
+      } else if (action === "capabilities") {
+        // The list of what this build refuses is only useful where a caller
+        // will see it. It used to sit in a table nothing read.
+        lines.push("supported here: open / run / halt / step* / breakpoint_* / registers / variables / stack / read / write / evaluate / watch_* / tasks / trace* / itm / event_recorder / disassemble / show_code / build / flash");
+        lines.push("needs the debugger entered first: anything answered NOT_DEBUGGING outside a session");
+        lines.push("needs extended stack mode (enabled automatically before entering): variables, tasks, watches");
+        const unsupported = Object.entries(UNSUPPORTED_ON_MDK_5_43);
+        if (unsupported.length > 0) {
+          lines.push(`refused by this build (${unsupported.length}):`);
+          for (const [name, why] of unsupported) lines.push(`  ${name}: ${why}`);
+        }
+        const extended = Object.entries(NEEDS_EXTENDED_STACK);
+        if (extended.length > 0) {
+          lines.push(`available only after entering the debugger (${extended.length}):`);
+          for (const [name, why] of extended) lines.push(`  ${name}: ${why}`);
+        }
       } else if (action === "window") {
         const state = (input.window as "show" | "hide" | "minimize" | undefined) ?? "hide";
         const reply = await windowState(session, state);

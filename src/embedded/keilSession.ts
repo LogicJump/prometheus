@@ -81,9 +81,6 @@ export function sessionKey(project: string, port: number): string {
   return `${project.toLowerCase()}|${port}`;
 }
 
-export function getKeilSession(key: string): KeilSession | undefined {
-  return sessions.get(key);
-}
 
 /**
  * Close the session, and with it the uVision that made the edits.
@@ -110,6 +107,16 @@ export async function closeKeilSession(key: string): Promise<boolean> {
   return true;
 }
 
+
+/**
+ * Close every session, in the order they were opened.
+ *
+ * Used by callers that have no session handle of their own — a probe script,
+ * a test, or shutdown — and by nothing in the tool layer, which closes the
+ * sessions it looks up. It stays exported because closing is how project
+ * edits reach the file: a caller that forgets one leaves an edit in uVision's
+ * memory and out of the `.uvprojx`.
+ */
 export async function closeAllKeilSessions(): Promise<void> {
   for (const key of [...sessions.keys()]) await closeKeilSession(key);
 }
@@ -939,19 +946,6 @@ export function groupsInProject(projectFile: string): string[] {
   return [...text.matchAll(/<GroupName>([^<]*)<\/GroupName>/g)].map((match) => match[1]).filter(Boolean);
 }
 
-/**
- * One group's file list, read from the project file itself.
- *
- * `PRJ_ENUM_FILES` only answers inside an entered debugger (measured:
- * `NOT_DEBUGGING` on a plain session, and entering one starts a flash
- * download), while every *edit* is refused inside one. That made "list, then
- * remove" impossible through the interface alone. The `.uvprojx` is the same
- * truth uVision writes, so the list is read from it and the edits still go
- * through uVision.
- */
-export function filesInGroupFromProject(projectFile: string, group: string): string[] {
-  return filePathsInGroup(projectFile, group).map((entry) => entry.path || entry.name);
-}
 
 /** One group's files from the `.uvprojx`, as `{ name, path }`. */
 export function filePathsInGroup(projectFile: string, group: string): { name: string; path: string }[] {
@@ -1442,20 +1436,6 @@ export async function readRegisterGroups(session: KeilSession): Promise<string[]
     .filter(Boolean);
 }
 
-/** Set a register by name. Kept for callers that only want the raw request. */
-export async function sendRegisterSet(session: KeilSession, name: string, value: string): Promise<Reply> {
-  const wanted = numericValue(value);
-  if (wanted === null) {
-    return {
-      ok: false,
-      status: 13,
-      statusName: "PARSE_ERROR",
-      data: Buffer.alloc(0),
-      message: `${JSON.stringify(value)} is not a number`,
-    };
-  }
-  return session.client.send(OP.DBG_REGISTER_SET, vsetWithValue(name, 5, BigInt(wanted)), 10_000);
-}
 
 /**
  * Resolve an address to `file:line`.
@@ -1494,11 +1474,6 @@ export async function addAccessBreakpoint(
 
 /* ---------- project management ---------- */
 
-/** Build, rebuild or clean through the running uVision. */
-export async function buildProject(session: KeilSession, mode: "build" | "rebuild" | "clean" = "build"): Promise<Reply> {
-  const command = mode === "rebuild" ? OP.PRJ_REBUILD : mode === "clean" ? OP.PRJ_CLEAN : OP.PRJ_BUILD;
-  return session.client.send(command, Buffer.alloc(0), 15_000);
-}
 
 /**
  * Cancel a build in progress.

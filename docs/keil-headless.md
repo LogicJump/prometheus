@@ -241,8 +241,11 @@ flash check: flash at 0x8000000 matches …\OBJ\TOUCH.hex for 64 byte(s)
 - `cancelBuild`:`PRJ_BUILD_CANCEL` 无构建时回 `FAILED`;而构建在单次调用里跑完,
   没有第二个调用能插进去的窗口,取消就是超时。
 - `closeProject`/`PRJ_CLOSE`:只在非调试会话可用,而这时关掉 uVision 就是关闭会话本身。
-- `ideVersion`/`buildProject`/`getKeilSession`/`closeAllKeilSessions`/`filesInGroupFromProject`/
-  `sendRegisterSet`:辅助函数,没有独立能力。
+- `ideVersion`:只回一串版本号,`version` 动作已经覆盖。
+- `buildProject`/`sendRegisterSet`/`getKeilSession`/`filesInGroupFromProject`:已删除。
+  它们没有任何调用者,而且各自的能力在别处已经有了(构建走 `-b`/`-r` 的 CLI 路径,
+  写寄存器走 `writeRegister` 并回读核对,会话按 key 查是内部细节)。
+  留着它们只会让「实现了」看起来比「能被用到」多。
 
 **顺带修掉一个我自己造成的破坏**:测 `set_output_name` 时把 `..\OBJ\TOUCH.axf`
 整个写进了 `OutputName`,工程变成 `..\OBJ\..\OBJ\TOUCH.axf` 而无法加载。
@@ -468,20 +471,41 @@ run()            → 停在 0x08006BF8，正好是 main.c:38
   解析行号。现在按当前 Target 的 `<Target>` 块取。实测切换后分别得到
   `..\OBJ\TOUCH.axf` 与 `..\OBJ_SIM\TOUCH_SIM.axf`。
 
+### 7. 再确认一遍：又找到三处
+
+- **五个导出函数没有任何调用者。** `getKeilSession`、`buildProject`、`sendRegisterSet`、
+  `filesInGroupFromProject` 全部删掉——能力在别处已有（构建走 CLI 路径、写寄存器走
+  `writeRegister` 并回读核对）。`closeAllKeilSessions` 保留：它给没有会话句柄的
+  调用方（探测脚本、测试、退出）用，而「忘了关会话」正是编辑丢在内存里的原因。
+  文档之前把它们写成「辅助函数，没有独立能力」，那是敷衍——它们是死代码。
+- **那张「本版本不支持」的表没有任何读者。** 记录了 13 条，但没有任何代码路径会
+  把它呈现给用户。现在 `keil_debug action: capabilities` 会列出：能用的、要先进调试
+  的、明确被拒的（带原因）、以及要先开 extended stack 的。动作数 53 → 54。
+- **表里有一条是错的。** `DBG_VTR_GET` 被写成「对接口自己枚举出来的名字也回
+  FAILED」。实测：`TRAPS` 回 `SUCCESS`，只有不存在的名字才回
+  `Unknown VTR-name`。也就是说按名字读 trace 变量一直是好的，是这张表让
+  `trace_get` 看起来不能用。已删除该条目。
+
+另外核对了 `DBG_READ_REGISTERS` 那条：「对 R0 / PC / SP 都回同一个
+`0x00000000`」——解码原始字节确认属实，结论保留。
+
+动作可达性也重新交叉检查了一遍：`keil_debug` 54 个动作、`keil_project` 14 个，
+每个都有分支，也没有「有分支但没声明」的动作；两个工具确实在 `ALL_TOOLS` 里。
+
 ### 这一轮补的测试
 
-`tests/round12-uvsock.test.ts` 从 41 条增到 48 条，新增覆盖：`file:line` 解析、
+`tests/round12-uvsock.test.ts` 从 41 条增到 49 条，新增覆盖：`file:line` 解析、
 `fromelf` 行号表解析（含 `00000000:` 头行被丢弃）、行号/文件不存在时的错误文案、
 缺少镜像与缺少 `fromelf` 的失败路径、编译器注册（含「不覆盖用户变量」）、
-`**` 递归产物发现、多 Target 工程按当前 Target 取镜像。
+`**` 递归产物发现、多 Target 工程按当前 Target 取镜像、能力报告可读且不误列可用操作。
 
-全量 791 条，789 通过，2 条原有条件跳过，0 失败。
+全量 792 条，790 通过，2 条原有条件跳过，0 失败。
 
 ---
 
 ## 八、验证
 
-`tests/round12-uvsock.test.ts`（48 条）把每个实测到的字节形状固定成断言：pack(1) 的
+`tests/round12-uvsock.test.ts`（49 条）把每个实测到的字节形状固定成断言：pack(1) 的
 `REGENUM`/`VSET`/`VARINFO`/`STACKENUM` 偏移、`AMEM` 反汇编是文本、`IVARENUM` 的 count、
 `PRJDATA` 的长度、`ALREADY_PRESENT` 的组归属、栈的顺序、寄存器别名查找、
 `file:line` → 地址的解析、`cbuild` 的编译器注册、`**` 产物发现。

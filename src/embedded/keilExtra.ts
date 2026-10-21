@@ -460,7 +460,9 @@ export const UNSUPPORTED_ON_MDK_5_43: Record<string, string> = {
   "DBG_EVAL_EXPRESSION_TO_STR": "never replies; DBG_CALC_EXPRESSION answers the same question",
   "DBG_EVTR_GETSTATUS": "never replies on this build",
   "DBG_ENUM_SYMTP": "needs a symbol-table id the build does not expose; answers PARSE_ERROR",
-  "DBG_VTR_GET": "answers FAILED 'Unknown VTR-name' for names the interface itself enumerates",
+  // Re-tested on MDK 5.43a: `TRAPS` answers SUCCESS; only a name that does
+  // not exist answers FAILED 'Unknown VTR-name'. Reading a trace variable by
+  // name works, so this entry was wrong and is gone. (`trace_get` uses it.)
   "DBG_VERIFY_CODE": "answers FAILED on a simulator target (no flash to verify against)",
   "DBG_FILELINE_TO_ADR": "answers NO_ADRMAP 'Address mapping failed' for both relative and absolute paths",
   "DBG_STEP_INTO_N": "documented as taking no count; the _HLL_N and _INSTRUCTION_N forms work",
