@@ -393,6 +393,47 @@ async function elfMachine(path: string): Promise<number | null> {
   }
 }
 
+/**
+ * What a build's return code means.
+ *
+ * Executables do not agree. GCC-family tools exit 0 whenever they produced
+ * output; UV4 uses its own documented scale, where **1 means the build
+ * succeeded with warnings** and 2 means errors. Treating only 0 as success
+ * marked a Keil project that compiles and links with one warning as failed and
+ * discarded the fresh `.axf` — measured: an unused local gives exit 1 with
+ * `0 Error(s), 1 Warning(s)` and a new image.
+ */
+export function buildSucceeded(kind: DetectedProject["kind"], exitCode: number | null, errors: number): boolean {
+  if (errors > 0) return false;
+  if (exitCode === 0) return true;
+  return kind === "keil" && exitCode === 1;
+}
+
+/**
+ * Read a build log without mangling the source lines the compiler quotes.
+ *
+ * Keil's log is written in the machine's ANSI code page (GBK on a Chinese
+ * Windows), and it is **not** uniformly so: the ASCII around a diagnostic
+ * decodes the same either way, but a quoted source line is a mix of ASCII and
+ * GBK bytes, and reading it as UTF-8 turns every Chinese character into a
+ * replacement mark. The diagnostics themselves are ASCII, so a wrong guess
+ * never loses the error — only the context. The guess is made per file, by
+ * checking whether the bytes are valid UTF-8, and GB18030 is used as the
+ * fallback because it is a superset of GBK and of ASCII.
+ */
+export function readBuildLog(path: string): string {
+  const bytes = readFileSync(path);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    try {
+      return new TextDecoder("gb18030").decode(bytes);
+    } catch {
+      return bytes.toString("latin1");
+    }
+  }
+}
+
 export async function build(options: BuildOptions = {}): Promise<BuildResult> {
   const started = Date.now();
   const root = options.cwd ?? process.cwd();
@@ -447,7 +488,7 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
   let output = result.out;
   if (command.buildLog) {
     try {
-      if (existsSync(command.buildLog)) output = readFileSync(command.buildLog, "utf8");
+      if (existsSync(command.buildLog)) output = readBuildLog(command.buildLog);
     } catch {
       /* an unreadable log leaves the console output, which is still better */
     }
@@ -455,9 +496,20 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
   const parsed = parseDiagnostics(output);
   const collapsed = collapseCascades(parsed.diagnostics);
   const errors = collapsed.filter((entry) => entry.severity === "error").length;
-  const ok = result.code === 0 && errors === 0;
+  // UV4's documented return codes: 0 = no errors or warnings, **1 = the build
+  // succeeded with warnings**, 2 = errors. See `buildSucceeded`.
+  const ok = buildSucceeded(command.kind, result.code, errors);
 
   const artifacts = ok ? findArtifactsIn(command.artifactRoots ?? [project.root], command.artifactPatterns, command.artifactHint) : [];
+  // A Keil build that exits 2 can still leave the last good `.axf` in place,
+  // and reporting it as the artifact of a failed build invites flashing a
+  // stale image. Say whether the file predates this run instead of implying
+  // the failed build produced it.
+  let staleNote = "";
+  if (!ok && command.kind === "keil") {
+    const stale = findArtifactsIn(command.artifactRoots ?? [project.root], command.artifactPatterns, command.artifactHint);
+    if (stale.length > 0) staleNote = `\n(the last successful image is still at ${stale[0].relative}; this build did not replace it)`;
+  }
   const elf = artifacts.find((artifact) => artifact.kind === "elf");
   // Size comes from two places and they are not equivalent:
   //
@@ -479,7 +531,8 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
   const allLines = output.split(/\r?\n/).filter((line) => line.trim());
   const tail = allLines.slice(-tailLines).join("\n");
 
-  let summary = `${command.program} ${command.args.join(" ")} → ${ok ? "ok" : `failed (exit ${result.code})`}`;
+  let summary = `${command.program} ${command.args.join(" ")} → ${ok ? (result.code === 1 ? "ok (with warnings)" : "ok") : `failed (exit ${result.code})`}`;
+  summary += staleNote;
   if (collapsed.length > 0) summary += `\n${summarizeDiagnostics({ diagnostics: collapsed, unparsed: parsed.unparsed })}`;
   else if (!ok) summary += `\n(the compiler printed no recognisable diagnostic; see the tail)`;
   if (usage) {

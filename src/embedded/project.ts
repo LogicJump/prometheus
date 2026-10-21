@@ -160,6 +160,81 @@ export function iarProjectFile(root: string): string | null {
 }
 
 /**
+ * A static check of a Keil project, before anything is built.
+ *
+ * The build is the real test, but it costs a full compile to learn that a file
+ * listed in the `.uvprojx` is not on disk — and on this project that happened
+ * for real: a `remove_file` call deleted the startup assembly, and the next
+ * build failed in the linker with `no section to be FIRST/LAST`, which names
+ * the scatter file rather than the missing source. Reading the project takes
+ * milliseconds and points at the actual entry.
+ *
+ * Only what the project states is checked: the files it lists, the include
+ * directories it names, deleted or missing output directory, and groups with
+ * no files. Nothing is guessed, and paths are reported as the project writes
+ * them.
+ */
+export interface KeilProjectIssue {
+  kind: "file" | "include" | "output";
+  /** The path exactly as the project writes it. */
+  path: string;
+  /** What is wrong, in one line. */
+  detail: string;
+}
+
+export function validateKeilProject(projectFile: string): KeilProjectIssue[] {
+  const issues: KeilProjectIssue[] = [];
+  let xml = "";
+  try {
+    xml = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
+  } catch {
+    return [{ kind: "file", path: projectFile, detail: "the project file could not be read" }];
+  }
+  const dir = resolve(projectFile, "..");
+  const resolveFromProject = (raw: string) => resolve(dir, raw.trim().replace(/\\/g, "/"));
+
+  const files = [...xml.matchAll(/<FilePath>([^<]*)<\/FilePath>/g)].map((match) => match[1]);
+  for (const raw of files) {
+    if (!raw.trim()) continue;
+    if (!existsSync(resolveFromProject(raw))) {
+      issues.push({ kind: "file", path: raw, detail: "listed in the project, but not on disk" });
+    }
+  }
+
+  // Include paths are per target and separated by semicolons.
+  const includes = [...xml.matchAll(/<IncludePath>([^<]*)<\/IncludePath>/g)].flatMap((match) => match[1].split(";"));
+  for (const raw of includes) {
+    if (!raw.trim()) continue;
+    if (!existsSync(resolveFromProject(raw))) {
+      issues.push({ kind: "include", path: raw.trim(), detail: "an include directory that is not on disk" });
+    }
+  }
+
+  const output = /<OutputDirectory>([^<]*)<\/OutputDirectory>/.exec(xml)?.[1]?.trim();
+  if (output && !existsSync(resolveFromProject(output))) {
+    issues.push({
+      kind: "output",
+      path: output,
+      detail: "the output directory does not exist; uVision creates it on a build, but flashing before one will not find an image",
+    });
+  }
+
+  // An empty group is legal, but one the user meant to fill is worth saying
+  // out loud. Only checked when the project has files at all: an empty project
+  // is a different problem.
+  if (files.length > 0) {
+    for (const match of xml.matchAll(/<Group>([\s\S]*?)<\/Group>/g)) {
+      const body = match[1];
+      const name = /<GroupName>([^<]*)<\/GroupName>/.exec(body)?.[1];
+      if (name && !/<File>/.test(body)) {
+        issues.push({ kind: "file", path: name, detail: "a group with no files" });
+      }
+    }
+  }
+  return issues;
+}
+
+/**
  * Where a Keil project writes its image.
  *
  * `OutputDirectory` is relative to the project file (`..\OBJ\` on the project

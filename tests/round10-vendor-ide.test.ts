@@ -102,6 +102,88 @@ test("Keil's log parses through the same diagnostic reader as a compiler", () =>
   assert.equal(parsed.diagnostics[1].severity, "warning");
 });
 
+test("UV4's exit code 1 means warnings, not a failed build", async () => {
+  // Documented UV4 return codes, measured: 0 clean, 1 built with warnings,
+  // 2 errors. A project that links with one warning has a fresh image and was
+  // being reported as failed, with its artifacts thrown away.
+  const { buildSucceeded } = await import("../src/embedded/build.ts");
+  assert.equal(buildSucceeded("keil", 0, 0), true);
+  assert.equal(buildSucceeded("keil", 1, 0), true, "warnings still produce the image");
+  assert.equal(buildSucceeded("keil", 2, 0), false);
+  assert.equal(buildSucceeded("keil", 1, 1), false, "an error inside the log wins");
+  assert.equal(buildSucceeded("cmake", 1, 0), false, "the same code means failure elsewhere");
+  assert.equal(buildSucceeded("keil", null, 0), false, "a timeout is not a build");
+});
+
+test("a Keil log is decoded by what its bytes are, not by assuming UTF-8", async () => {
+  // Measured: UV4 writes its log in the ANSI code page (GBK here) and mixes
+  // ASCII with GBK inside one quoted source line. Reading that as UTF-8 turned
+  // every Chinese character in the context into a replacement mark.
+  const { readBuildLog } = await import("../src/embedded/build.ts");
+  const dir = scratch("prometheus-keil-encoding-");
+  const path = join(dir, "build.log");
+  try {
+    writeFileSync(
+      path,
+      Buffer.concat([
+        Buffer.from("main.c(76): error:  #29: expected an expression\r\n      int ", "latin1"),
+        Buffer.from([0xe5, 0x8f, 0x98, 0xe9, 0x87, 0x8f]),
+        Buffer.from(" = ;\r\n", "latin1"),
+      ]),
+    );
+    const text = readBuildLog(path);
+    assert.match(text, /expected an expression/);
+    assert.ok(text.includes("变量"), "the GBK source line survives");
+    assert.ok(!text.includes("�"), "nothing is replaced with a marker");
+
+    // A log that really is UTF-8 must not be re-decoded as GBK.
+    writeFileSync(path, "hello 变量\r\n", "utf8");
+    assert.equal(readBuildLog(path), "hello 变量\r\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a Keil project is checked on disk before it is built", async () => {
+  // A `remove_file` deleted the startup assembly on this project once, and the
+  // build failed in the linker naming the scatter file. Reading the project
+  // finds the entry itself.
+  const { validateKeilProject } = await import("../src/embedded/project.ts");
+  const dir = scratch("prometheus-keil-validate-");
+  try {
+    mkdirSync(join(dir, "Src"), { recursive: true });
+    writeFileSync(join(dir, "Src", "main.c"), "int main(void){return 0;}\n");
+    mkdirSync(join(dir, "Inc"), { recursive: true });
+    const project = join(dir, "app.uvprojx");
+    writeFileSync(
+      project,
+      [
+        "<Project><Targets><Target><TargetName>App</TargetName>",
+        "<TargetOption><TargetArmAds><Cads><VariousControls>",
+        "<IncludePath>..\\Inc;..\\Missing</IncludePath>",
+        "</VariousControls></Cads></TargetArmAds></TargetOption>",
+        "<Groups>",
+        "<Group><GroupName>Source</GroupName><Files>",
+        "<File><FileName>main.c</FileName><FilePath>.\\Src\\main.c</FilePath></File>",
+        "<File><FileName>gone.c</FileName><FilePath>.\\Src\\gone.c</FilePath></File>",
+        "</Files></Group>",
+        "<Group><GroupName>Empty</GroupName></Group>",
+        "</Groups></Target></Targets></Project>",
+      ].join(""),
+    );
+    const issues = validateKeilProject(project);
+    const byPath = (path: string) => issues.find((issue) => issue.path.includes(path));
+    assert.ok(byPath("gone.c"), "a missing source is reported");
+    assert.equal(byPath("main.c"), undefined, "a present source is not");
+    assert.ok(byPath("Missing"), "a missing include directory is reported");
+    assert.ok(issues.some((issue) => issue.path === "Empty"), "an empty group is reported by name");
+    // Paths come back as the project writes them, so the caller can act on them.
+    assert.equal(byPath("gone.c")?.path, ".\\Src\\gone.c");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the command names the log the diagnostics come from", () => {
   const dir = scratch("prometheus-keil-log-");
   try {

@@ -44,7 +44,7 @@ import {
 import { capture, listSerialPorts, openPort } from "../embedded/serial.ts";
 import { listProbes, listTargets, matchTarget } from "../embedded/probe.ts";
 import { detectToolchains } from "../embedded/toolchain.ts";
-import { detectProject, buildCommand } from "../embedded/project.ts";
+import { detectProject, buildCommand, validateKeilProject } from "../embedded/project.ts";
 import { findRegister, parseSvd, peripheralDetail } from "../embedded/svd.ts";
 import { analyze, parseStackUsage } from "../embedded/analyze.ts";
 import {
@@ -624,6 +624,18 @@ const projectTool: Tool = {
     if (project.evidence.length) lines.push(`evidence: ${project.evidence.join(", ")}`);
     if (project.buildDir) lines.push(`build dir: ${project.buildDir}`);
     if (project.presets?.length) lines.push(`presets: ${project.presets.join(", ")}`);
+    // A Keil project names every file and include directory it uses. Checking
+    // that they exist costs milliseconds and catches the case a build reports
+    // as a linker error about the scatter file.
+    if (project.kind === "keil" && project.file) {
+      const issues = validateKeilProject(project.file);
+      if (issues.length === 0) lines.push("", "project check: all listed files and include directories exist");
+      else {
+        lines.push("", `project check: ${issues.length} problem(s)`);
+        for (const issue of issues.slice(0, 30)) lines.push(`  ${issue.kind}: ${issue.path} — ${issue.detail}`);
+        if (issues.length > 30) lines.push(`  … and ${issues.length - 30} more`);
+      }
+    }
     if (command) {
       lines.push("", `build: ${command.program} ${command.args.join(" ")}`, `in: ${command.cwd}`);
       if (command.artifactPatterns?.length) lines.push(`expects: ${command.artifactPatterns.join(", ")}`);
