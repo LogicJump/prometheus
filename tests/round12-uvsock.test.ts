@@ -338,6 +338,18 @@ test("a Keil build names its target instead of inheriting the last one", async (
   }
 });
 
+/* ---------- a session that "entered" without loading anything ---------- */
+
+test("a debug session that could not load the image is not reported as open", async () => {
+  // Measured: with the .axf deleted, uVision prints `*** error 56: cannot open
+  // file` and enters debug mode anyway. Every later action then answers
+  // NOT_DEBUGGING, so treating the entry as success hid the real cause.
+  const { default: fs } = await import("node:fs");
+  const source = fs.readFileSync("src/embedded/keilSession.ts", "utf8");
+  assert.match(source, /cannot open file/, "the load failure is recognised");
+  assert.match(source, /session\.debugging = false/, "and the session is not left claiming to be debugging");
+});
+
 /* ---------- status names ---------- */
 
 test("status codes are named, and an unknown one is still honest", () => {

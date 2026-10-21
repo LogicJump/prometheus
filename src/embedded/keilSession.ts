@@ -228,7 +228,8 @@ export async function enterDebug(
 
   // Entering is asynchronous: poll the status and read the stream for the
   // failure frames uVision sends instead of a bad reply.
-  const deadline = Date.now() + timeoutMs;
+  const started = Date.now();
+  const deadline = started + timeoutMs;
   let lastLines = 0;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 400));
@@ -247,17 +248,40 @@ export async function enterDebug(
 
     const status = await client.send(OP.DBG_STATUS, Buffer.alloc(0), 5_000);
     if (status.ok && status.data.length >= 4 && status.data.readUInt32LE(0) === 0) {
+      // A missing or unreadable image does **not** stop uVision: measured, it
+      // prints `*** error 56: cannot open file` and enters debug mode anyway,
+      // with nothing loaded. Reporting that as a working session made every
+      // later breakpoint, register read and step answer `NOT_DEBUGGING`.
+      const loadFailure = frames.map((frame) => commandWindowText(frame)).find((line) => /\*\*\* error \d+: cannot open file/i.test(line));
+      if (loadFailure) {
+        session.debugging = false;
+        return {
+          ok: false,
+          log,
+          reason: `the debugger entered but could not load the image: ${loadFailure.trim()}. Build first, and check that the project's output name matches a file that exists.`,
+        };
+      }
       session.debugging = true;
       log.push(`entered ${target} debug mode`);
       return { ok: true, log };
     }
-    if (status.status === 6 /* NOT_DEBUGGING */ && Date.now() - mark > 8_000 && frames.length === 0) {
+    if (status.status === 6 /* NOT_DEBUGGING */ && Date.now() - started > 8_000 && frames.length === 0) {
       const detail = status.message ?? "the debugger reports it is not in a debug session";
       return { ok: false, log, reason: detail };
     }
   }
   if (session.debugging) return { ok: true, log };
-  return { ok: false, log, reason: `uVision did not enter debug mode within ${Math.round(timeoutMs / 1000)} s` };
+  // Nothing said what went wrong but the debugger is not in a session. uVision
+  // ends up here when the image it was told to load is missing or unreadable:
+  // measured with the `.axf` deleted, it prints `*** error` in the command
+  // window and never enters. Reporting only "no session" would send the user
+  // looking for a probe problem that does not exist.
+  const tail = log.slice(-3).join(" | ");
+  return {
+    ok: false,
+    log,
+    reason: `uVision did not enter debug mode within ${Math.round(timeoutMs / 1000)} s${tail ? `; last output: ${tail}` : ""}. A missing or unreadable image is the usual cause — build first, and check the project's output name.`,
+  };
 }
 
 /* ---------- execution control ---------- */
