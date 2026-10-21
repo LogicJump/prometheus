@@ -157,6 +157,11 @@ export function findArtifactsIn(roots: string[], patterns: string[] | undefined,
     }
     const kind = kindOf(path);
     if (!kind) return;
+    // A directory can hold a debugger's memory dump next to the image. A
+    // flash of a few megabytes is already enormous; anything past 64 MiB is
+    // not firmware, and listing a 377 MB `SAVE` dump as an artifact is worse
+    // than missing it because the next step would try to flash it.
+    if ((kind === "hex" || kind === "bin") && size > 64 * 1024 * 1024) return;
     seen.add(path);
     found.push({
       path,

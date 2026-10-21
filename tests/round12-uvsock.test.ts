@@ -306,6 +306,38 @@ test("a .axf is only accepted by the Keil downloader", async () => {
   }
 });
 
+/* ---------- the UV4 command line ---------- */
+
+test("a Keil build names its target instead of inheriting the last one", async () => {
+  const { buildCommand, detectProject } = await import("../src/embedded/project.ts");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-keil-cmd-"));
+  try {
+    mkdirSync(join(dir, "USER"), { recursive: true });
+    writeFileSync(join(dir, "USER", "app.uvprojx"), "<Project/>");
+    const project = detectProject(dir);
+    assert.equal(project.kind, "keil");
+    const plain = buildCommand(project, { keil: "UV4.exe" }, {});
+    assert.ok(plain);
+    assert.equal(plain.args[0], "-b", "a build is -b");
+    // Without `-t` uVision builds whichever target was last current, which is
+    // not something a build command should decide on a multi-target project.
+    assert.ok(!plain.args.includes("-t"), "no target means no -t");
+    const chosen = buildCommand(project, { keil: "UV4.exe" }, { target: "Release" });
+    assert.ok(chosen);
+    const at = chosen.args.indexOf("-t");
+    assert.ok(at > 0, "-t is passed when a target is named");
+    assert.equal(chosen.args[at + 1], "Release");
+    // A rebuild is `-r`, not a build with a flag.
+    const rebuilt = buildCommand(project, { keil: "UV4.exe" }, { release: true });
+    assert.equal(rebuilt?.args[0], "-r");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 /* ---------- status names ---------- */
 
 test("status codes are named, and an unknown one is still honest", () => {

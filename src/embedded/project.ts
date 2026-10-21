@@ -424,10 +424,16 @@ export function buildCommand(
       };
     }
     case "keil": {
-      // `UV4 -b` is the documented headless build: it writes the IDE's own
-      // build log and exits with a bitmask (0 clean, 1 warnings, 2 errors,
-      // 11/13/15 for the "could not open project" family). The licence is the
-      // user's; this only drives what they installed.
+      // The documented headless commands, each with its own switch:
+      //
+      //   -b  build the current target      -r  re-translate (rebuild)
+      //   -c  clean                          -cr clean and re-translate
+      //   -f  download to flash              -t  select the target
+      //   -o  write the log here             -j0 no GUI, no dialogs
+      //
+      // `-t` matters on a multi-target project: without it uVision builds
+      // whichever target was last current, which is whatever the user happened
+      // to leave open — not something a build command should decide.
       const project1 = keilProjectFile(root);
       if (!project1) return null;
       // `-o` is resolved against the project file's directory, not the
@@ -442,10 +448,13 @@ export function buildCommand(
         /* the build will report it */
       }
       const log = join(logDir, "keil-build.log");
+      const action = options.release ? "-r" : "-b";
+      const args = [action, resolve(project1), "-j0", "-o", resolve(log)];
+      if (options.target) args.push("-t", options.target);
       return {
         kind: "keil",
         program: toolchains.keil ?? "UV4.exe",
-        args: ["-b", resolve(project1), "-j0", "-o", resolve(log)],
+        args,
         cwd: root,
         // The linker prints all four numbers in the log:
         //   Program Size: Code=31978 RO-data=18842 RW-data=108 ZI-data=2050364
@@ -456,6 +465,9 @@ export function buildCommand(
         // is relative to the project file and commonly `..\OBJ\`. Scanning the
         // repository root finds nothing on a real Keil tree, so the directory
         // is read out of the project and the scan runs there.
+        // The image formats the target can produce. A stray `.hex` from a
+        // debugger `SAVE` is excluded by size in `findArtifactsIn`: a 377 MB
+        // memory dump was being listed as a build artifact.
         artifactPatterns: ["*.axf", "*.hex", "*.bin"],
         artifactRoots: keilOutputDirs(project1, root),
       };

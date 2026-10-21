@@ -704,12 +704,15 @@ export class UvSocketClient {
   private frames: AsyncFrame[] = [];
   private frameWaiters: (() => void)[] = [];
   closed = false;
+  /** The executable this conversation is with, for CLI operations beside it. */
+  readonly programPath: string;
   private readonly socket: Socket;
   readonly port: number;
   private readonly process?: ChildProcess;
 
-  constructor(socket: Socket, port: number, process?: ChildProcess) {
+  constructor(socket: Socket, port: number, process?: ChildProcess, programPath = "") {
     this.socket = socket;
+    this.programPath = programPath;
     this.port = port;
     this.process = process;
     socket.on("data", (chunk: Buffer) => this.onData(chunk));
@@ -960,7 +963,7 @@ async function connectOnce(port: number, options: ConnectOptions): Promise<Conne
         // looks like "uVision died" rather than "the port belongs to someone
         // else". Probing the version before returning the client turns that
         // into a retry, so a fresh process gets the next port instead.
-        const probe = new UvSocketClient(socket, port, child);
+        const probe = new UvSocketClient(socket, port, child, options.uv4);
         const version = await probe.send(OP.GEN_GET_VERSION, Buffer.alloc(0), 4_000);
         if (version.ok) return probe;
         probe.close();

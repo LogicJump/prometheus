@@ -82,6 +82,7 @@ import {
   type KeilSession,
   type OptionName,
 } from "../embedded/keilSession.ts";
+import { keilCli } from "../embedded/keilCli.ts";
 import { stopReasonName } from "../embedded/uvsock.ts";
 
 const hex = (value: number) => `0x${value.toString(16)}`;
@@ -182,6 +183,11 @@ const keilDebugTool: Tool = {
           "window",
           "build",
           "rebuild",
+          "clean",
+          "clean_rebuild",
+          "export_cprj",
+          "symbols",
+          "convert",
           "flash",
           "erase",
           "sessions",
@@ -476,6 +482,30 @@ const keilDebugTool: Tool = {
       } else if (action === "trace") {
         const items = await readVtr(session);
         lines.push(items.length ? items.map((item) => item.name).join(", ") : "no trace variables reported");
+      } else if (action === "clean" || action === "clean_rebuild" || action === "export_cprj" || action === "symbols" || action === "convert") {
+        // These are the rest of UV4's documented switches; each is one headless
+        // run, so the build's log/exit-code reading applies unchanged.
+        const operation =
+          action === "clean"
+            ? "clean"
+            : action === "clean_rebuild"
+              ? "clean-rebuild"
+              : action === "export_cprj"
+                ? "export-cprj"
+                : action === "symbols"
+                  ? "symbols"
+                  : "convert";
+        const result = await keilCli({
+          cwd: ctx.cwd,
+          operation,
+          uv4: session.client.programPath,
+          ...(session.project ? { project: session.project } : {}),
+          ...(input.target ? { target: String(input.target) } : {}),
+        });
+        lines.push(`${operation}: ${result.ok ? "done" : "failed"} (exit ${result.exitCode}, ${result.durationMs} ms)`);
+        if (result.reason) lines.push(`reason: ${result.reason}`);
+        if (result.produced.length > 0) lines.push(`wrote: ${result.produced.join(", ")}`);
+        if (result.log) lines.push(...result.log.split(String.fromCharCode(10)).slice(-12));
       } else if (action === "build" || action === "rebuild") {
         const started = await buildInIde(session, action === "rebuild");
         const wanted = started.lines.filter((line) => /error|warning|Program Size|Build target|Rebuild target/i.test(line));
