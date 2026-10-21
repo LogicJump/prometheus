@@ -578,7 +578,7 @@ export function buildCommand(
         program: toolchains.cbuild ?? "cbuild",
         args: [solution, ...(options.release ? ["--configuration", "Release"] : [])],
         cwd: root,
-        artifactPatterns: ["out/**/*.elf", "out/**/*.hex", "out/**/*.bin", "*.elf"],
+        artifactPatterns: ["out/**/*.elf", "out/**/*.axf", "out/**/*.hex", "out/**/*.bin", "*.elf"],
       };
     }
     case "iar": {

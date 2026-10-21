@@ -559,3 +559,130 @@ test("status codes are named, and an unknown one is still honest", () => {
   assert.equal(statusName(10), "DEBUGGING");
   assert.equal(statusName(1234), "status 1234");
 });
+
+/* ---------- source-location breakpoints ---------- */
+
+test("`file:line` and `file(line)` are recognised; a symbol is not one", async () => {
+  const { parseFileLine } = await import("../src/embedded/keilSession.ts");
+  const B = String.fromCharCode(92);
+  assert.deepEqual(parseFileLine("main.c:36"), { file: "main.c", line: 36 });
+  assert.deepEqual(parseFileLine(["..", "USER", "main.c"].join(B) + ":36"), { file: "../USER/main.c", line: 36 });
+  assert.deepEqual(parseFileLine("main.c(36)"), { file: "main.c", line: 36 });
+  assert.deepEqual(parseFileLine("./ui.c: 497"), { file: "ui.c", line: 497 });
+  // Symbols and addresses are passed through untouched by the caller.
+  assert.equal(parseFileLine("UI_Update"), null);
+  assert.equal(parseFileLine("0x08006994"), null);
+  assert.equal(parseFileLine("main.c:0"), null);
+});
+
+test("fromelf's line table is read, with the zero-address headers dropped", async () => {
+  // Verbatim shape from `fromelf --text -g TOUCH.axf` on MDK 5.43a.
+  const B = String.fromCharCode(92);
+  const text = [
+    "  007fe7:  DW_LNS_copy                  : 01                08006be0: main.c:35.5 [",
+    "  007fe9:  SPECIAL(0, 1)                : 13                08006be2: main.c:35.5",
+    "  007feb:  SPECIAL(1, 1)                : 14                08006be4: main.c:36.5 [",
+    "00000000: .." + B + "HARDWARE" + B + "LCD" + B + "ltdc.c:1.0",
+    "08000c42: .." + B + "HARDWARE" + B + "LCD" + B + "ltdc.c:488.5",
+  ].join(String.fromCharCode(10));
+  const { parseFromelfLines } = await import("../src/embedded/keilSession.ts");
+  const entries = parseFromelfLines(text);
+  assert.deepEqual(entries, [
+    { address: 0x08006be0, file: "main.c", line: 35 },
+    { address: 0x08006be2, file: "main.c", line: 35 },
+    { address: 0x08006be4, file: "main.c", line: 36 },
+    { address: 0x08000c42, file: "../HARDWARE/LCD/ltdc.c", line: 488 },
+  ]);
+});
+
+test("a source location that needs an image fails clearly without one", async () => {
+  const { sourceLineAddress, parseFromelfLines } = await import("../src/embedded/keilSession.ts");
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-dwarf-"));
+  try {
+    const noImage = await sourceLineAddress(join(dir, "missing.axf"), "does-not-matter", "main.c", 1);
+    assert.ok("error" in noImage && /build first/.test(noImage.error), "error" in noImage ? noImage.error : "no error");
+    // A reader that is not there is a failure, not an empty table.
+    const elf = join(dir, "image.axf");
+    writeFileSync(elf, "not really an elf");
+    const noReader = await sourceLineAddress(elf, join(dir, "no-fromelf.exe"), "main.c", 35);
+    assert.ok("error" in noReader && /fromelf exited/.test(noReader.error), "error" in noReader ? noReader.error : "no error");
+    assert.equal(parseFromelfLines("").length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a line that is not in the image is reported with that file's real lines", async () => {
+  const { parseFromelfLines } = await import("../src/embedded/keilSession.ts");
+  const B = String.fromCharCode(92);
+  const table = [
+    "08006be0: main.c:35.5",
+    "08006bf8: main.c:38.5",
+    "08000c42: .." + B + "HARDWARE" + B + "LCD" + B + "ltdc.c:488.5",
+  ].join(String.fromCharCode(10));
+  const entries = parseFromelfLines(table);
+  assert.deepEqual(entries.map((entry) => [entry.address, entry.file, entry.line]), [
+    [0x08006be0, "main.c", 35],
+    [0x08006bf8, "main.c", 38],
+    [0x08000c42, "../HARDWARE/LCD/ltdc.c", 488],
+  ]);
+  // The resolution rules the failure message depends on: a bare file name and
+  // a path suffix both find the image's own, longer path.
+  const fileMatches = (candidate: string, wanted: string) => candidate === wanted || candidate.endsWith("/" + wanted);
+  assert.ok(fileMatches("../HARDWARE/LCD/ltdc.c", "ltdc.c"), "a bare file name finds it");
+  assert.ok(fileMatches("../HARDWARE/LCD/ltdc.c", "LCD/ltdc.c"), "a path suffix finds it");
+  assert.ok(!fileMatches("../HARDWARE/LCD/ltdc.c", "UI/ltdc.c"), "another directory does not");
+});
+
+/* ---------- csolution (CMSIS-Toolbox) ---------- */
+
+test("a detected Arm compiler is registered the way cbuild expects", async () => {
+  const { compilerRegistration, compilerFromDetection } = await import("../src/embedded/toolEnv.ts");
+  // `armclang --version` prints the IDE's version first; the compiler's own
+  // version is the one CMSIS-Toolbox keys on.
+  const ac6 = compilerFromDetection([
+    { kind: "keil", path: "G:" + String.fromCharCode(92) + "software" + String.fromCharCode(92) + "keil5" + String.fromCharCode(92) + "UV4" + String.fromCharCode(92) + "UV4.exe", version: "5.43.1.0" },
+  ]);
+  // The Keil entry is resolved from the install root on this machine; on a
+  // machine without Keil there is nothing to add, which is also correct.
+  if (ac6.length === 0) return;
+  const ac6Entry = ac6.find((entry) => entry.kind === "AC6");
+  assert.ok(ac6Entry, "AC6 is registered from the Keil install");
+  assert.match(ac6Entry!.bin, /ARMCLANG/i);
+  // The compiler's version, not the IDE's.
+  assert.match(ac6Entry!.version, /^6\./);
+  const env = compilerRegistration(ac6.map((entry) => ({ name: entry.kind, bin: entry.bin, version: entry.version })));
+  const key = Object.keys(env).find((name) => /^AC6_TOOLCHAIN_\d+_\d+_\d+$/.test(name));
+  assert.ok(key, `an AC6_TOOLCHAIN_<major>_<minor>_<patch> variable is produced, got ${JSON.stringify(env)}`);
+  assert.equal(env[key!], ac6Entry!.bin);
+});
+
+test("a user's own compiler registration is not overwritten", async () => {
+  const { compilerRegistration } = await import("../src/embedded/toolEnv.ts");
+  const env = compilerRegistration([{ name: "AC6", bin: "/detected/bin", version: "6.24" }], { AC6_TOOLCHAIN_6_24_0: "/user/bin" });
+  assert.deepEqual(env, {}, "the explicitly set variable wins");
+});
+
+test("`**` in an artifact pattern walks nested output directories", async () => {
+  const { findArtifactsIn } = await import("../src/embedded/build.ts");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-out-"));
+  try {
+    // csolution's layout: out/<project>/<target>/<build>/<name>.axf
+    const outDir = join(dir, "out", "Demo", "MyBoard", "Debug");
+    mkdirSync(outDir, { recursive: true });
+    const elf = Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(64)]);
+    writeFileSync(join(outDir, "Demo.axf"), elf);
+    writeFileSync(join(outDir, "Demo.hex"), Buffer.from(":00000001FF" + String.fromCharCode(10)));
+    const found = findArtifactsIn([dir], ["out/**/*.axf", "out/**/*.hex"], undefined, dir);
+    const kinds = found.map((entry) => entry.kind).sort();
+    assert.deepEqual(kinds, ["elf", "hex"], `found ${JSON.stringify(found.map((entry) => entry.relative))}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

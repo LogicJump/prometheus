@@ -47,6 +47,7 @@ import {
   getOption,
   getOutputName,
   halt,
+  imageLocation,
   listBreakpoints,
   listKeilSessions,
   enterDebug,
@@ -135,6 +136,12 @@ async function closeAndReport(cwd: string): Promise<ToolResult> {
   // Closing is how project edits reach the file: uVision writes the
   // `.uvprojx` on its way out. Comparing the file around the close is what
   // turns "closed" into "saved".
+  //
+  // Measured on this bench: with the session open, adding a group answers
+  // SUCCESS and the `.uvprojx` is byte-identical, same mtime, same group
+  // list. Only after uVision exits does the group appear. So an edit that is
+  // reported as made is not on disk until this runs, and a close that changed
+  // nothing is reported as such rather than assumed to have saved.
   const projectFile = detectProject(cwd).file;
   const before = projectFile && existsSync(projectFile) ? readFileSync(projectFile) : null;
   let closed = 0;
@@ -142,7 +149,14 @@ async function closeAndReport(cwd: string): Promise<ToolResult> {
   const after = projectFile && existsSync(projectFile) ? readFileSync(projectFile) : null;
   const saved = Boolean(before && after && !before.equals(after));
   return {
-    content: [`closed ${closed} Keil session(s)`, ...(saved ? [`wrote ${projectFile}`] : [])].join("\n"),
+    content: [
+      `closed ${closed} Keil session(s)`,
+      saved
+        ? `wrote ${projectFile}`
+        : projectFile
+          ? `${projectFile} is unchanged; there were no edits to write, or they were already on disk`
+          : "no .uvprojx was found, so there was nothing to write",
+    ].join("\n"),
     display: "closed",
   };
 }
@@ -341,11 +355,25 @@ const keilDebugTool: Tool = {
       } else if (action === "breakpoint_add") {
         if (!location) return { isError: true, content: "breakpoint_add needs a `location`.", display: "missing location" };
         const kind = String(input.kind ?? "exec");
-        const reply =
-          kind === "exec"
-            ? (await addBreakpoint(session, location)).reply
-            : await addAccessBreakpoint(session, location, kind as "read" | "write" | "readwrite", Number(input.width === "u8" ? 1 : input.width === "u16" ? 2 : 4));
-        lines.push(reply.ok ? `breakpoint set on ${location}` : `could not set it: ${reply.message ?? reply.statusName}`);
+        if (kind === "exec") {
+          // A `file:line` is not an expression uVision parses: it answers
+          // SUCCESS, prints an error and creates nothing. Resolve it against
+          // the image's line table first so the breakpoint is a real one.
+          const image = await imageLocation(session);
+          const added = await addBreakpoint(session, location, "error" in image ? undefined : image);
+          if (!added.ok) {
+            lines.push(`could not set a breakpoint on ${location}: ${added.reason ?? added.reply.message ?? added.reply.statusName}`);
+            return { isError: true, content: lines.join("\n"), display: "breakpoint refused" };
+          }
+          lines.push(
+            added.resolved
+              ? `breakpoint set on ${location} (${hex(added.resolved.address)})`
+              : `breakpoint set on ${location}`,
+          );
+        } else {
+          const reply = await addAccessBreakpoint(session, location, kind as "read" | "write" | "readwrite", Number(input.width === "u8" ? 1 : input.width === "u16" ? 2 : 4));
+          lines.push(reply.ok ? `breakpoint set on ${location}` : `could not set it: ${reply.message ?? reply.statusName}`);
+        }
       } else if (action === "breakpoint_delete") {
         // `location` carries the breakpoint number (`#2` or `2`), which is
         // what `breakpoints` prints. The list is 1-based; an off-by-one here

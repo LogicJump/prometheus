@@ -316,21 +316,156 @@ flash check: flash at 0x8000000 matches …\OBJ\TOUCH.hex for 64 byte(s)
 ## 七、仍然做不到的
 
 - **编辑源文件**：uVision 的编辑器没有 API；源码改动走本产品自己的文件工具。
-- **可靠保存工程编辑**：见第四节。接口能改，落盘时机不受控制。
+- **工程编辑立即落盘**：见第四节。接口能改，落盘时机不受接口控制——只在 uVision
+  退出时写 `.uvprojx`。这一点已经用字节比对证实（见第五节之五），不是推断。
 - **一个文件挂到两个组**：uVision 不允许。
 - **`PRJ_FLASH_ERASE`**：接口不回复；下载本身会擦除它写的扇区。
 - **寄存器写入**：`REGISTER_SET` 对 R0 一路回 SUCCESS 却不改变值（`R0 = 0x42` 走命令
   窗口可以）；工具会明确报「接受了但读回没变」，命令通道是可行替代。
 - **局部变量**：该目标上调试器对任何帧都只报全局（`nVars` 恒为 0），接口层无从列出。
-- **多 Target 工程**：`set_target` 已接，只在单 target 工程上实测过。
+- **`-et` / `-ep` 导出 cprj**：MDK 5.43a 上退 0、零输出、不写文件；带不带 `-j0`/`-o`、
+  相对或绝对路径、指定或不指定 `-t` 都一样。调试会话里的菜单模型也没有这一项。
+  工具按失败报，不会当成成功。
+
+---
+
+## 五之五、第六轮：把「没验证的」逐条验证掉
+
+这一轮只做一件事：之前列了四项「尚未验证」，逐条拿真机证据坐实或推翻。
+
+### 1. 多 Target 工程 —— 已实测通过
+
+造了一个双 Target 工程（`TOUCH` / `TOUCH_SIM`，各自的 `OutputDirectory`），
+在 MDK 5.43a 上跑：
+
+```
+projectTargets            → ["TOUCH","TOUCH_SIM"]
+currentTarget             → "TOUCH"
+getOption CINCL TOUCH     → 16 个 include 路径
+getOption CINCL TOUCH_SIM → 独立的一套
+setTarget("TOUCH_SIM")    → SUCCESS，currentTarget 随之变成 TOUCH_SIM
+setOption COPTIMIZE=2 @TOUCH_SIM
+  → TOUCH_SIM 读回 "2,0 [Optimize, OptTime]"
+  → TOUCH     读回 "0,0 [Optimize, OptTime]"（未被污染）
+关闭后 .uvprojx → <Optim>1</Optim> / <Optim>3</Optim>（各 Target 分别落盘）
+```
+
+顺带发现并排除一个假象：手工拼出来的第二个 `<Target>` 块如果丢了 BOM 或字段顺序，
+uVision 会静默拒绝打开，接口只会回 `NO_PROJECT`。这不是代码缺陷，但值得知道——
+`projectTargets` 返回空数组时，`info` 现在会显示「没有 Target」而不是假装工程正常。
+
+### 2. `csolution` / CMSIS-Toolbox —— 已实测通过，并修掉两个真缺陷
+
+先用 `cpackget` 把包装进它自己的 store（`ARM.CMSIS`、`ARM.CMSIS-Compiler`、
+`Keil::STM32F4xx_DFP`），再用一个最小 csolution 工程走产品自己的 `build()` 路径。
+过程中暴露两个**此前完全没被测到的缺陷**：
+
+1. **`cbuild` 找不到编译器。** 它不打任何路径猜测，要求
+   `<name>_TOOLCHAIN_<major>_<minor>_<patch>` 环境变量。之前没有任何代码设它，
+   所以任何 csolution 工程都必然 `error cbuild2cmake: compiler registration
+   environment variable missing` —— 而 `armclang --version` 明明是好的。
+   现在 `toolEnv.ts` 从 Keil 安装目录识别 AC6/AC5，用**编译器自己的版本号**
+   （`Component: Arm Compiler for Embedded 6.24`）注册，用户已显式设过的变量不覆盖。
+
+   > 踩到的坑：`armclang --version` 第一行是 `Product: MDK Plus 5.43`，
+   > 那是 IDE 版本。第一版抓到 5.43，注册成 `AC6_TOOLCHAIN_5_43_0`，
+   > `cbuild` 照样说「没有注册 AC6」。
+
+2. **产物发现不到。** `out/**/*.elf` 里的 `**` 被当成普通通配（只能匹配一层），
+   而 csolution 的输出是 `out/<project>/<target>/<build>/`。构建报成功、`artifacts`
+   却是空数组。现在 `**` 会递归（限 6 层），并且 csolution 的 pattern 补上了
+   `.axf`（Arm 的链接器默认就产出 `.axf`，不是 `.elf`）。
+
+修完后清掉 `out/` 与 `tmp/` 重跑：
+
+```
+ok: true  exit: 0
+artifacts: out/Demo/MyBoard/Debug/Demo.axf, out/Demo/MyBoard/Debug/Demo.hex
+Build summary: 1 succeeded, 0 failed
+```
+
+### 3. `-et` / `-ep` 导出 cprj —— 确认**不可用**，如实报失败
+
+在真工程上把能想到的组合都试了：`-et` / `-ep`；带 `-j0` / 不带；带 `-o` / 不带；
+相对路径 / 绝对路径；指定 `-t <target>` / 不指定。**全部退 0、零输出、不产生任何
+`.cprj`。** 菜单模型里也没有 `Project → Export → Save Project to CPRJ` 这一项
+（`readMenus` 只回了 12 个条目，过滤 `cprj|export` 为空）。
+
+`keilCli` 本来就把「该产文件却一个都没产」判为失败，所以工具层是诚实的；
+这一轮补的是文档和一条测试，把结论固定下来。
+
+### 4. 硬件调试链路 —— 已用真芯片验证，并修掉一个**假完成**
+
+先用独立于 Keil 的证据确认板子真在线：
+`STM32_Programmer_CLI -c port=SWD` → `Device name: STM32F42xxx/F43xxx`、
+`Flash size: 1 MBytes`、`Voltage 3.26V`。然后走 uVision 自己的 ST-Link 驱动。
+
+实测通过的：
+
+```
+enterDebug(hardware)        → debugging: true
+addBreakpoint("UI_Update")  → SUCCESS
+run()                       → stopped, reasonCode=1 (breakpoint), PC=0x08006994
+currentLocation             → ui.c:497
+step over / instruction     → 0x08006996 → 0x0800699E → 0x080069A0，行号同步
+readStack                   → #0 0x08006994 … #1 0x0800699E
+readVariables               → LTDC_Handler / DMA2D_Handler / lcdltdc / ltdc_lcd_framebuf …
+addressToSource(0x08006994) → ../HARDWARE/UI/ui.c:497 UI_Update
+readMemory(0x08000000)      → a8 09 00 20 55 02 00 08 …（正确的向量表）
+```
+
+**修掉的那个假完成**：`breakpoint_add main.c:38`。uVision 不把 `file:line` 当位置，
+它当 C 表达式求值，回 `SUCCESS`，然后在命令窗口打
+`*** error 52: left side of '.' requires struct/union`，什么都没有创建。
+旧实现只看 `DBG_CREATE_BP` 的状态码，于是报告「断点已设」——用户去跑，永远不会停。
+
+现在：
+
+- `file:line` / `file(line)` 先经 `fromelf --text -g` 的 DWARF 行号表解析成地址
+  （`DBG_FILELINE_TO_ADR` 对任何路径都回 `NO_ADRMAP`，这是唯一可用的映射源）。
+- 文件按**路径后缀**匹配，`main.c` 和 `USER/main.c` 都能找到镜像里的
+  `../USER/main.c`，不同目录的同名文件不会串。
+- 行号不存在时，把该文件真实的可执行行列出来；文件不存在时，把镜像里有哪些文件
+  列出来。
+- 创建后仍会读 `*** error N:` 与断点列表交叉验证，两者都不支持「已创建」时判失败。
+
+实测：
+
+```
+add "main.c:38"  → true  → 0x08006bf8
+add "ui.c:497"   → true  → 0x08006994
+add "main.c:9999"→ false → main.c has no line 9999; its executable lines are 35, 36, 37, …
+add "nosuch.c:10"→ false → no source file matching "nosuch.c" is in the image; it knows …
+run()            → 停在 0x08006BF8，正好是 main.c:38
+```
+
+### 5. 工程编辑落盘 —— 拿到字节级证据
+
+```
+打开会话 → addGroup("PROOF_GROUP") → SUCCESS
+  此刻 .uvprojx：25271 字节，mtime 不变，组列表里没有 PROOF_GROUP
+关闭会话 → 等 3 秒
+  .uvprojx：24669 字节，组列表末尾出现 PROOF_GROUP
+```
+
+同一行为在第二轮复现（`PROOF_TWO`）。`closeAndReport` 现在会把「已写盘」与
+「文件没变（本来就没有编辑，或已经在盘上）」分开说，不再让两者看起来一样。
+
+### 这一轮补的测试
+
+`tests/round12-uvsock.test.ts` 从 41 条增到 47 条，新增覆盖：`file:line` 解析、
+`fromelf` 行号表解析（含 `00000000:` 头行被丢弃）、行号/文件不存在时的错误文案、
+缺少镜像与缺少 `fromelf` 的失败路径、编译器注册（含「不覆盖用户变量」）、
+`**` 递归产物发现。
 
 ---
 
 ## 八、验证
 
-`tests/round12-uvsock.test.ts`（41 条）把每个实测到的字节形状固定成断言：pack(1) 的
+`tests/round12-uvsock.test.ts`（47 条）把每个实测到的字节形状固定成断言：pack(1) 的
 `REGENUM`/`VSET`/`VARINFO`/`STACKENUM` 偏移、`AMEM` 反汇编是文本、`IVARENUM` 的 count、
-`PRJDATA` 的长度、`ALREADY_PRESENT` 的组归属、栈的顺序、寄存器别名查找。
+`PRJDATA` 的长度、`ALREADY_PRESENT` 的组归属、栈的顺序、寄存器别名查找、
+`file:line` → 地址的解析、`cbuild` 的编译器注册、`**` 产物发现。
 
 全量测试 781 条、779 通过、2 条原有条件跳过、0 失败。
 

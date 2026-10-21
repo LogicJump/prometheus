@@ -17,8 +17,10 @@
  * read twice and the difference matters to whoever asked.
  */
 
+import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fromelfFor } from "./build.ts";
 import { detectToolchains } from "./toolchain.ts";
 import { detectProject } from "./project.ts";
 import {
@@ -455,16 +457,171 @@ export function parseBreakpoints(frames: AsyncFrame[]): Breakpoint[] {
   return out;
 }
 
-/** Add a breakpoint at a function, `file:line`, or `*address`. */
-export async function addBreakpoint(session: KeilSession, expression: string): Promise<{ ok: boolean; reply: Reply; breakpoints: Breakpoint[] }> {
+/**
+ * A `file:line` location, split and normalised to forward slashes.
+ *
+ * The forms the debugger's own interfaces accept are `file:line` and
+ * `file(12)`. Neither is an expression uVision parses: measured on this bench,
+ * `DBG_CREATE_BP` with `main.c:38` answers `SUCCESS`, then prints
+ * `*** error 52: left side of '.' requires struct/union` into the command
+ * window and creates nothing — the breakpoint silently does not exist.
+ */
+export function parseFileLine(location: string): { file: string; line: number } | null {
+  const paren = /^\s*(.+?)\(\s*(\d+)\s*\)\s*$/.exec(location);
+  const colon = paren ? null : /^\s*(.+?):\s*(\d+)\s*$/.exec(location);
+  const match = paren ?? colon;
+  if (!match) return null;
+  const line = Number(match[2]);
+  if (!Number.isInteger(line) || line <= 0) return null;
+  return { file: match[1].trim().replace(/\\/g, "/").replace(/^\.\//, ""), line };
+}
+
+/**
+ * `fromelf --text -g` line entries, as `{ address, file, line }`.
+ *
+ * The debug table prints one line per addressable statement:
+ *
+ *   `08006be0: main.c:35.5`
+ *   `08000c42: ..\HARDWARE\LCD\ltdc.c:488.5`
+ *
+ * and a compile unit whose code was not laid down prints `00000000:` for its
+ * header lines, which are dropped. This is the only mapping from source lines
+ * to addresses that this build offers: `DBG_FILELINE_TO_ADR` answers
+ * `NO_ADRMAP` for every path form tried, and the command window's `BS` takes
+ * addresses and expressions, not file/line pairs.
+ */
+export function parseFromelfLines(text: string): { address: number; file: string; line: number }[] {
+  const out: { address: number; file: string; line: number }[] = [];
+  for (const match of text.matchAll(/([0-9a-f]{8}):\s+(\S[^:\r\n]*?):(\d+)\.\d+/g)) {
+    const address = Number.parseInt(match[1], 16);
+    if (!address) continue;
+    out.push({ address, file: match[2].replace(/\\/g, "/"), line: Number(match[3]) });
+  }
+  return out;
+}
+
+/**
+ * What to look for when a `file:line` is asked for.
+ *
+ * The paths in the image's debug info are the ones the compiler was given
+ * (`..\USER\main.c`, `../HARDWARE/UI/ui.c`), not the absolute path a caller
+ * types, and the same file name can sit in several directories. A suffix
+ * match on whole segments resolves both: `main.c` finds `..\USER\main.c`, and
+ * `USER/main.c` finds it without colliding with another directory's copy.
+ */
+function fileMatches(candidate: string, wanted: string): boolean {
+  return candidate === wanted || candidate.endsWith(`/${wanted}`);
+}
+
+/**
+ * The executable address of a source line, from the image's debug tables.
+ *
+ * `elf` is the built image; `fromelf` is the one from the same Keil install.
+ */
+export async function sourceLineAddress(
+  elf: string,
+  fromelf: string,
+  file: string,
+  line: number,
+): Promise<{ address: number; file: string; line: number } | { error: string }> {
+  if (!existsSync(elf)) return { error: `there is no built image at ${elf} to read the line table from; build first` };
+  const run = await new Promise<{ code: number | null; out: string; err: string }>((resolve) => {
+    execFile(
+      fromelf,
+      ["--text", "-g", elf],
+      { windowsHide: true, timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
+      (error, stdout, stderr) => resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, out: stdout ?? "", err: stderr ?? "" }),
+    );
+  });
+  if (run.code !== 0) {
+    const detail = run.err.split(String.fromCharCode(10)).find((line) => line.trim()) ?? "";
+    return { error: `fromelf exited ${run.code} reading the line table of ${elf}${detail ? `: ${detail.trim()}` : ""}` };
+  }
+  const entries = parseFromelfLines(run.out);
+  if (entries.length === 0) {
+    return { error: `${elf} carries no line table; build it with debug information on ("Debug Information" ticked in the target's output options)` };
+  }
+  const wanted = file.replace(/\\/g, "/").replace(/^\.\//, "");
+  // The same line is listed once per instruction it covers; the first is the
+  // one a breakpoint belongs on.
+  const hit = entries.find((entry) => entry.line === line && fileMatches(entry.file, wanted));
+  if (hit) return hit;
+  const files = [...new Set(entries.map((entry) => entry.file))];
+  const sameFile = entries.filter((entry) => fileMatches(entry.file, wanted));
+  if (sameFile.length === 0) {
+    return { error: `no source file matching "${file}" is in the image; it knows ${files.slice(0, 6).join(", ")}${files.length > 6 ? ", …" : ""}` };
+  }
+  const lines = sameFile.map((entry) => entry.line).filter((value, index, all) => all.indexOf(value) === index).sort((a, b) => a - b);
+  const near = lines.slice(0, 8).join(", ");
+  return { error: `${sameFile[0].file} has no line ${line}; its executable lines are ${near}${lines.length > 8 ? ", …" : ""}` };
+}
+
+/** Context this session needs to resolve `file:line`: where the image is, and how to read it. */
+export interface BreakpointContext {
+  elf: string;
+  fromelf: string;
+}
+
+/**
+ * Add a breakpoint at a function, `file:line`, `file(line)`, or `*address`.
+ *
+ * A `file:line` is resolved to an address first, because passing it through
+ * unchanged reports success for a breakpoint that does not exist. When the
+ * resolution fails, or when uVision prints an error while creating it, the
+ * result is a failure carrying the debugger's own words.
+ */
+export async function addBreakpoint(
+  session: KeilSession,
+  expression: string,
+  context?: BreakpointContext,
+): Promise<{ ok: boolean; reply: Reply; breakpoints: Breakpoint[]; reason?: string; resolved?: { address: number; expression: string } }> {
+  let target = expression;
+  let resolved: { address: number; expression: string } | undefined;
+  // `0x08001234` is a constant, and `*0x08001234` the dereference form; both
+  // are addresses already and must not be read as `file:line`.
+  const addressLike = /^\s*\*?\s*(0x[0-9a-f]+|\d+)\s*$/i.test(expression);
+  const fileLine = addressLike ? null : parseFileLine(expression);
+  if (fileLine) {
+    if (!context) {
+      return {
+        ok: false,
+        reply: { status: 1, statusName: "FAILED", ok: false, data: Buffer.alloc(0) },
+        breakpoints: [],
+        reason: `"${expression}" is a source location; resolving it needs the built image and fromelf`,
+      };
+    }
+    const found = await sourceLineAddress(context.elf, context.fromelf, fileLine.file, fileLine.line);
+    if ("error" in found) {
+      return {
+        ok: false,
+        reply: { status: 1, statusName: "FAILED", ok: false, data: Buffer.alloc(0) },
+        breakpoints: [],
+        reason: found.error,
+      };
+    }
+    target = `0x${found.address.toString(16)}`;
+    resolved = { address: found.address, expression: `${found.file}:${found.line}` };
+  }
+
   const mark = session.client.mark;
-  const reply = await session.client.send(OP.DBG_CREATE_BP, breakpointParam(expression), 12_000);
+  const reply = await session.client.send(OP.DBG_CREATE_BP, breakpointParam(target), 12_000);
   // `BP_REDEFINED` (19) is success with a caveat: the same location already
   // had a breakpoint, and uVision kept it. Treating it as failure made a
   // re-add after a delete look like the delete did not work.
-  const ok = reply.ok || reply.status === 19 || reply.status === 22 /* BP_CREATED */;
+  let ok = reply.ok || reply.status === 19 || reply.status === 22 /* BP_CREATED */;
+  // A bad expression is not a failed command: uVision answers `SUCCESS` and
+  // says `*** error 34: undefined identifier` on the stream. The breakpoint
+  // list is the authority on whether anything was created.
   const frames = await session.client.collect(1500, 0x5006, mark);
-  return { ok, reply, breakpoints: parseBreakpoints(frames) };
+  const error = frames
+    .map((frame) => commandWindowText(frame))
+    .find((line) => /\*\*\* error \d+:/.test(line));
+  const listed = parseBreakpoints(frames);
+  if (ok && error && listed.length === 0) {
+    ok = false;
+    return { ok, reply, breakpoints: listed, reason: `uVision refused the breakpoint: ${error.trim()}`, ...(resolved ? { resolved } : {}) };
+  }
+  return { ok, reply, breakpoints: listed, ...(resolved ? { resolved } : {}) };
 }
 
 /** List the current breakpoints. */
@@ -1382,6 +1539,35 @@ export async function eraseFlash(session: KeilSession): Promise<Reply> {
 export async function getOutputName(session: KeilSession): Promise<string> {
   const reply = await session.client.send(OP.PRJ_GET_OUTPUTNAME, Buffer.alloc(4), 8_000);
   return reply.ok ? readSstr(reply.data, 0) : "";
+}
+
+/**
+ * The built image a `file:line` breakpoint is resolved against, and the
+ * `fromelf` that reads its line table.
+ *
+ * The path comes from the project's own `OutputName` and `OutputDirectory`,
+ * the same two fields the build writes through — not from a guess at the
+ * traditional `OBJ\` layout, which an edited project does not have.
+ */
+export interface ImageLocation {
+  elf: string;
+  fromelf: string;
+}
+
+export async function imageLocation(session: KeilSession): Promise<ImageLocation | { error: string }> {
+  const projectFile = session.project;
+  let xml = "";
+  try {
+    xml = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
+  } catch {
+    return { error: `could not read ${projectFile} to find the output image` };
+  }
+  const outputName = /<OutputName>([^<]*)<\/OutputName>/.exec(xml)?.[1]?.trim() || (projectFile.split(/[\\/]/).pop() ?? "project").replace(/\.uvprojx?$/i, "");
+  const outputDir = /<OutputDirectory>([^<]*)<\/OutputDirectory>/.exec(xml)?.[1]?.trim() || ".";
+  const elf = join(projectFile, "..", outputDir.replace(/\\/g, "/"), `${outputName}.axf`);
+  const fromelf = fromelfFor(session.client.programPath);
+  if (!fromelf) return { error: "fromelf was not found in this Keil install, so the image's line table cannot be read" };
+  return { elf, fromelf };
 }
 
 /* ---------- operations beyond the core loop ---------- */

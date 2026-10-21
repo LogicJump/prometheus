@@ -23,7 +23,7 @@ import { detectToolchains, tool } from "./toolchain.ts";
 import { buildCommand, type BuildCommand, type DetectedProject, detectProject } from "./project.ts";
 import { collapseCascades, parseDiagnostics, summarizeDiagnostics, type Diagnostic } from "./diagnostics.ts";
 import { parseSize, type MemoryUsage } from "./flash.ts";
-import { toolEnv } from "./toolEnv.ts";
+import { compilerFromDetection, compilerRegistration, toolEnv } from "./toolEnv.ts";
 
 export interface BuildOptions {
   /** Build in the target's release configuration when the ecosystem has one. */
@@ -67,12 +67,12 @@ export interface BuildResult {
   error?: string;
 }
 
-function run(program: string, args: string[], cwd: string, timeout: number): Promise<{ code: number | null; out: string }> {
+function run(program: string, args: string[], cwd: string, timeout: number, env?: NodeJS.ProcessEnv): Promise<{ code: number | null; out: string }> {
   return new Promise((resolve) => {
     execFile(
       program,
       args,
-      { cwd, timeout, windowsHide: true, maxBuffer: 32 * 1024 * 1024, env: toolEnv() },
+      { cwd, timeout, windowsHide: true, maxBuffer: 32 * 1024 * 1024, env: env ?? toolEnv() },
       (error, stdout, stderr) => {
         const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
         resolve({ code, out: `${stdout ?? ""}\n${stderr ?? ""}` });
@@ -115,8 +115,36 @@ export function findArtifacts(root: string, patterns: string[] | undefined, hint
  * `relative` path is still computed against the workspace so it reads the same
  * everywhere else in the app.
  */
-export function findArtifactsIn(roots: string[], patterns: string[] | undefined, hint?: string, relativeTo = roots[0]): BuildArtifact[] {
-  const found: BuildArtifact[] = [];
+/**
+ * Every directory below `root`, to `depth` levels, in a stable order.
+ *
+ * Used by the `**` pattern segment. Bounded rather than unlimited: a build
+ * tree that a caller points at could be an entire home directory, and the
+ * point is to find an image a few levels down, not to walk everything.
+ */
+function subdirectories(root: string, depth: number): string[] {
+  const out: string[] = [];
+  if (depth <= 0) return out;
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    const path = join(root, entry);
+    try {
+      if (!statSync(path).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    out.push(path);
+    out.push(...subdirectories(path, depth - 1));
+  }
+  return out;
+}
+
+export function findArtifactsIn(roots: string[], patterns: string[] | undefined, hint?: string, relativeTo = roots[0]): BuildArtifact[] {  const found: BuildArtifact[] = [];
   const seen = new Set<string>();
 
   const kindOf = (path: string): BuildArtifact["kind"] | null => {
@@ -178,7 +206,14 @@ export function findArtifactsIn(roots: string[], patterns: string[] | undefined,
     for (const segment of segments) {
       const next: string[] = [];
       for (const dir of frontier) {
-        if (segment.includes("*")) {
+        if (segment === "**") {
+          // A recursive segment, walked with a depth limit. csolution's
+          // output is `out/<project>/<target>/<build>/<name>.axf`, so a
+          // fixed-depth pattern would have to know every level; measured,
+          // `out/**/*.elf` matched nothing and the build reported success
+          // with no artifact.
+          next.push(dir, ...subdirectories(dir, 6));
+        } else if (segment.includes("*")) {
           const regex = new RegExp(`^${segment.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
           try {
             for (const entry of readdirSync(dir)) if (regex.test(entry)) next.push(join(dir, entry));
@@ -330,7 +365,7 @@ export function parseFromelf(output: string): MemoryUsage | undefined {
  * so the sibling guess is the wrong one. The install root is two levels above
  * `UV4\`, and both compiler toolchains are searched under `ARM\`.
  */
-function fromelfFor(uv4Path?: string): string | null {
+export function fromelfFor(uv4Path?: string): string | null {
   if (!uv4Path) return null;
   const isExe = /\.exe$/i.test(uv4Path);
   const sibling = uv4Path.replace(/UV4(\.exe)?$/i, isExe ? "fromelf.exe" : "fromelf");
@@ -481,7 +516,21 @@ export async function build(options: BuildOptions = {}): Promise<BuildResult> {
   }
 
   const timeout = options.timeoutMs ?? 10 * 60_000;
-  const result = await run(command.program, command.args, command.cwd, timeout);
+  // `cbuild` refuses to start unless the compiler is registered in its
+  // environment: `error cbuild2cmake: compiler registration environment
+  // variable missing`. CMSIS-Toolbox deliberately does not guess where a
+  // compiler is installed, so the detected one is handed to it. Without this
+  // every csolution build failed on this machine even though `armclang
+  // --version` worked.
+  const buildEnv = command.kind === "csolution"
+    ? {
+        ...toolEnv(),
+        ...compilerRegistration(
+          compilerFromDetection(toolchains.tools).map((entry) => ({ name: entry.kind, bin: entry.bin, version: entry.version })),
+        ),
+      }
+    : undefined;
+  const result = await run(command.program, command.args, command.cwd, timeout, buildEnv);
   // Keil prints nothing useful on the console: its diagnostics go to the file
   // `-o` names. Read it and treat it as the output, so the same parser handles
   // both kinds of build.
