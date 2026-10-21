@@ -43,6 +43,7 @@ import {
   halt,
   listBreakpoints,
   listKeilSessions,
+  enterDebug,
   openKeilSession,
   projectFiles,
   projectGroups,
@@ -56,6 +57,7 @@ import {
   readVtr,
   readNamedRegisters,
   showCodeAt,
+  debugCommand,
   disassemble,
   execMenu,
   ideVersionText,
@@ -166,6 +168,7 @@ const keilDebugTool: Tool = {
           "read",
           "write",
           "evaluate",
+          "command",
           "variable_set",
           "tasks",
           "trace",
@@ -196,6 +199,11 @@ const keilDebugTool: Tool = {
       count: { type: "integer", description: "For read: how many values; for step_many: how many steps (default 1)" },
       value: { type: "integer", description: "For write: the value to store" },
       expression: { type: "string", description: "For evaluate: a debugger expression, e.g. `uwTick` or `&g_state`" },
+      command: {
+        type: "string",
+        description:
+          "For action `command`: a uVision Command-window command, e.g. `BS main`, `BA read 0x20000000,4`, `LOG c:\trace.txt`, `SAVE c:\dump.hex 0x08000000,0x1000`, `LOGICAnalyze add ...`. This is the escape hatch for the parts of the debugger that are a command language rather than separate operations.",
+      },
       name: { type: "string", description: "For a register write: the register name" },
       register_value: { type: "string", description: "For a register write: the new value" },
       window: { type: "string", enum: ["show", "hide", "minimize"], description: "For action `window`: what to do to the uVision window" },
@@ -231,6 +239,15 @@ const keilDebugTool: Tool = {
       const location = input.location ? String(input.location) : "";
 
       if (action === "open") {
+        // Re-entering after `EXIT` from the command window: the session was
+        // kept but the debugger had left, so it is entered again rather than
+        // reporting a PC that no longer exists.
+        if (!session.debugging) {
+          const reentered = await enterDebug(session, session.target, 40_000);
+          lines.push(...reentered.log);
+          if (!reentered.ok) return { isError: true, content: reentered.reason ?? "could not re-enter debug mode", display: "not debugging" };
+        }
+        // `open` also re-establishes state that a command-window `EXIT` clears.
         lines.push(...opened.log);
         const where = await currentLocation(session);
         lines.push(`project: ${session.project}`);
@@ -381,6 +398,33 @@ const keilDebugTool: Tool = {
           const viaWindow = await evalInWindow(session, expression);
           lines.push(viaWindow.ok ? `${expression} = ${viaWindow.value}` : `the debugger could not evaluate ${expression}: ${direct.message ?? viaWindow.lines.join(" ")}`);
         }
+      } else if (action === "command") {
+        const typed = input.command ? String(input.command) : "";
+        if (!typed) return { isError: true, content: "command needs a `command` string.", display: "missing command" };
+        const ran = await debugCommand(session, typed);
+        // The channel echoes the command, then prints its answer on the same
+        // stream; the echo is dropped so a silent success reads as silent.
+        const said = typed.trim();
+        const output = ran.lines.filter((line) => line.trim() !== said && line.trim() !== "");
+        // `EXIT` ends the debug session from inside the command language, and
+        // nothing else would notice: the session would keep claiming it was
+        // in debug mode and answer NOT_DEBUGGING to everything.
+        const left = /^EXIT$/i.test(typed.trim());
+        if (left) {
+          session.debugging = false;
+          // Breakpoints live in the debugger, so leaving takes them with it.
+          // Saying so is the difference between "add it again" and believing
+          // the next `run` will stop where the last one did.
+          lines.push("left debug mode; the debugger's breakpoints were cleared with it");
+          return { content: lines.join(String.fromCharCode(10)), display: "keil: command" };
+        }
+        const note: string[] = [];
+        // The note is appended in both branches: `EXIT` prints nothing, and
+        // "ran, no output" was the one message that most needed it.
+        if (output.length > 0) lines.push(...output);
+        else if (!ran.ok) lines.push(`refused: ${ran.message ?? "no reason given"}`);
+        else if (note.length === 0) lines.push(`ran \`${typed}\` (no output)`);
+        lines.push(...note);
       } else if (action === "variable_set") {
         const name = input.expression ? String(input.expression) : "";
         const value = input.value !== undefined ? String(input.value) : "";

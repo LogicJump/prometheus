@@ -19,7 +19,7 @@
 import type { BoardSelection, Tool, ToolContext, ToolResult } from "../types.ts";
 import { toolEnv } from "../embedded/toolEnv.ts";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { build } from "../embedded/build.ts";
 import { flash, type FlasherKind } from "../embedded/flash.ts";
@@ -71,13 +71,16 @@ async function flasherPaths(): Promise<{ paths: Partial<Record<FlasherKind, stri
       "st-flash": byKind.get("st-flash"),
       "dfu-util": byKind.get("dfu-util"),
       avrdude: byKind.get("avrdude"),
+      // The Keil downloader is UV4.exe itself, which detection already found
+      // through the registry / TOOLS.INI.
+      keil: byKind.get("keil"),
     } as Partial<Record<FlasherKind, string>>,
     report,
   };
 }
 
 /** Pick a flasher: the requested one, else the first installed in preference order. */
-const FLASHER_PREFERENCE: FlasherKind[] = ["pyocd", "probe-rs", "openocd", "esptool", "st-flash", "dfu-util", "avrdude", "jlink"];
+const FLASHER_PREFERENCE: FlasherKind[] = ["pyocd", "probe-rs", "openocd", "esptool", "st-flash", "dfu-util", "avrdude", "jlink", "keil"];
 
 function chooseFlasher(requested: string | undefined, paths: Partial<Record<FlasherKind, string>>): FlasherKind | null {
   if (requested) {
@@ -274,7 +277,11 @@ const flashTool: Tool = {
     properties: {
       firmware: { type: "string", description: "Path to the .elf, .hex, .bin or .uf2 to write, relative to the workspace root" },
       target: { type: "string", description: "Target chip name, e.g. `stm32f412xe`. Required by pyOCD and probe-rs; for OpenOCD pass a .cfg path in target_config instead" },
-      flasher: { type: "string", enum: ["pyocd", "probe-rs", "openocd", "esptool", "st-flash", "dfu-util", "avrdude", "jlink"], description: "Which tool to use; defaults to the first installed" },
+      flasher: {
+        type: "string",
+        enum: ["pyocd", "probe-rs", "openocd", "esptool", "st-flash", "dfu-util", "avrdude", "jlink", "keil"],
+        description: "Which tool to use; defaults to the first installed. `keil` drives UV4 -f with the project's own device, probe and flash algorithm, and is the only one that takes a .axf",
+      },
       address: { type: "integer", description: "Load address for a raw .bin (0x08000000 on STM32, 0x0 on ESP32 boot images)" },
       probe: { type: "string", description: "Probe serial/uid, when several are attached" },
       interface_config: { type: "string", description: "OpenOCD interface config, e.g. `interface/stlink.cfg`" },
@@ -343,10 +350,24 @@ const flashTool: Tool = {
       }
     }
 
+    // The Keil downloader reads the project, not the image: that is where its
+    // device, probe and flash algorithm live. The .uvprojx is found the same
+    // way the build finds it.
+    const keilProject = kind === "keil" ? detectProject(ctx.cwd).file : undefined;
+    const keilLog = keilProject ? join(ctx.cwd, "build", "keil-flash.log") : undefined;
+    if (keilLog) {
+      try {
+        mkdirSync(join(ctx.cwd, "build"), { recursive: true });
+      } catch {
+        /* the downloader reports it */
+      }
+    }
     const result = await flash({
       kind,
       program,
       firmware: String(input.firmware),
+      ...(keilProject ? { project: keilProject } : {}),
+      ...(keilLog ? { logFile: keilLog } : {}),
       ...(espImages ? { images: espImages } : {}),
       ...(target ? { target } : {}),
       ...(input.address !== undefined ? { address: Number(input.address) } : {}),

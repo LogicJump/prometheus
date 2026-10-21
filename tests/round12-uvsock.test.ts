@@ -211,7 +211,7 @@ test("a memory reply is the address, the bytes, and the error address", () => {
 /* ---------- the operations added after the first audit ---------- */
 
 test("a VSET reply carries a 64-bit value and the debugger's rendering", () => {
-  // Measured for `main`: 05 00 00 00 | e0 6b 00 08 00 00 00 00 | 05 00 00 00 "main "
+  // Measured for `main`: 05 00 00 00 | e0 6b 00 08 00 00 00 00 | 05 00 00 00 "main\0"
   const reply = Buffer.from("05000000e06b000800000000050000006d61696e00", "hex");
   const decoded = readVset(reply);
   assert.equal(decoded?.type, 5);
@@ -223,11 +223,11 @@ test("a VSET request puts no literal value and the expression as an SSTR", () =>
   const request = vset("main");
   assert.equal(request.readInt32LE(0), 0, "no literal value");
   assert.equal(request.readInt32LE(12), 5, "length including the terminator");
-  assert.equal(request.toString("latin1", 16, 21), "main ");
+  assert.equal(request.toString("latin1", 16, 21), "main\0");
 });
 
 test("a menu entry's label runs to the length, not one short of it", () => {
-  // Measured: 00 00 00 00 | 00 00 00 00 | 01 00 00 00 | 01 00 00 00 | 0a 00 00 00 "Trace Data "
+  // Measured: 00 00 00 00 | 00 00 00 00 | 01 00 00 00 | 01 00 00 00 | 0a 00 00 00 "Trace Data\0"
   const frame: AsyncFrame = { type: 0x5061, echoed: 0, data: Buffer.from("000000000000000001000000010000000a0000005472616365204461746100", "hex"), raw: Buffer.alloc(0) };
   const entry = readMenu(frame);
   assert.equal(entry?.label, "Trace Data", "reading length - 1 cut the last letter");
@@ -235,11 +235,11 @@ test("a menu entry's label runs to the length, not one short of it", () => {
 });
 
 test("a trace-variable name is counted without its terminator", () => {
-  // Measured AVTR: 12 00 00 00 | 7 zero words | 09 00 00 00 | 2 zero words | "CURR_TID "
+  // Measured AVTR: 12 00 00 00 | 7 zero words | 09 00 00 00 | 2 zero words | "CURR_TID\0"
   const body = Buffer.alloc(53);
   body.writeUInt32LE(0x12, 0);
   body.writeUInt32LE(9, 32);
-  body.write("CURR_TID ", 44, "latin1");
+  body.write("CURR_TID\0", 44, "latin1");
   const frame: AsyncFrame = { type: 0x5018, echoed: 0, data: body, raw: Buffer.alloc(0) };
   assert.equal(readVtrFrame(frame)?.name, "CURR_TID");
 });
@@ -260,6 +260,50 @@ test("the unsupported list names why, never a bare flag", () => {
   }
   // The one that would quietly return a wrong number is named explicitly.
   assert.match(UNSUPPORTED_ON_MDK_5_43.DBG_READ_REGISTERS ?? "", /0x00000000/);
+});
+
+/* ---------- the Keil downloader ---------- */
+
+test("UV4 -f is the download command, and its log is where the verdict lives", async () => {
+  const { commandFor, validate, classifyOutput } = await import("../src/embedded/flash.ts");
+  const args = commandFor({ kind: "keil", program: "UV4.exe", firmware: "app.axf", project: "P.uvprojx", logFile: "L.log" });
+  assert.deepEqual(args, ["-f", "P.uvprojx", "-j0", "-o", "L.log"]);
+
+  // Measured real log: steps joined without line breaks.
+  const log = ["Load app.axf", "Erase Done.Programming Done.Verify OK.Flash Load finished at 11:39:30"].join(String.fromCharCode(10));
+  const verdict = classifyOutput("keil", log, 0);
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.verified, true);
+});
+
+test("a failed download is not read as success", async () => {
+  const { classifyOutput } = await import("../src/embedded/flash.ts");
+  const log = ["Load app.axf", "Error: Flash Download failed  -  Target DLL has been cancelled"].join(String.fromCharCode(10));
+  const verdict = classifyOutput("keil", log, 0);
+  assert.equal(verdict.ok, false, "a failure phrase wins over a zero exit code");
+});
+
+test("a .axf is only accepted by the Keil downloader", async () => {
+  const { validate } = await import("../src/embedded/flash.ts");
+  const { writeFileSync, mkdtempSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-axf-"));
+  const image = join(dir, "app.axf");
+  writeFileSync(image, "ELF");
+  try {
+    // Refused with a reason, not a generic "not a firmware format".
+    const other = validate({ kind: "openocd", program: "openocd", firmware: image });
+    assert.match(other ?? "", /Keil's name for an ELF/);
+    // Accepted, but the Keil downloader needs the project it draws from.
+    const keil = validate({ kind: "keil", program: "UV4.exe", firmware: image });
+    assert.match(keil ?? "", /needs the \.uvprojx/);
+    const ok = validate({ kind: "keil", program: "UV4.exe", firmware: image, project: join(dir, "P.uvprojx") });
+    assert.equal(ok, null);
+  } finally {
+    const { rmSync } = await import("node:fs");
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 /* ---------- status names ---------- */

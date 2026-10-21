@@ -20,11 +20,28 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { extname } from "node:path";
 import { toolEnv } from "./toolEnv.ts";
 
-export type FlasherKind = "pyocd" | "openocd" | "probe-rs" | "jlink" | "esptool" | "st-flash" | "dfu-util" | "avrdude";
+export type FlasherKind =
+  | "pyocd"
+  | "openocd"
+  | "probe-rs"
+  | "jlink"
+  | "esptool"
+  | "st-flash"
+  | "dfu-util"
+  | "avrdude"
+  /**
+   * Keil's own downloader, `UV4 -f`.
+   *
+   * A Keil project's probe, device and flash algorithm live in its
+   * `.uvprojx`/`.uvoptx`; none of the other flashers knows about them, and on
+   * an MDK-only machine nothing else is installed. Without this, a build that
+   * succeeded could not be put on the board.
+   */
+  | "keil";
 
 export interface FlashRequest {
   kind: FlasherKind;
@@ -54,6 +71,10 @@ export interface FlashRequest {
   part?: string;
   /** Extra arguments, passed through unchanged. */
   extraArgs?: string[];
+  /** The `.uvprojx` for `kind: "keil"`; its target names the flash algorithm. */
+  project?: string;
+  /** Log file UV4 writes its download report to (`-o`). */
+  logFile?: string;
   /**
    * Additional images written at their own offsets in the same esptool call.
    *
@@ -111,6 +132,10 @@ const SUCCESS_MARKERS: Record<FlasherKind, RegExp[]> = {
   jlink: [/Verify successful\.?/i, /Programming successful\.?/i, /(?:Downloading|Comparing).*\n(?:.*\n)?.*O\.K\./i, /Comparing flash contents[\s\S]{0,200}O\.K\./i],
   esptool: [/Hash of data verified/i, /Wrote \d+ bytes .* at .*/i, /Leaving\.\.\./i],
   "st-flash": [/Flash written and verified/i, /OK/i],
+  // The `-f` report, measured: the log joins its steps without line breaks —
+  // `Erase Done.Programming Done.Verify OK.Flash Load finished at 11:39:30`
+  // — so the phrases are matched anywhere in the text, not at a line start.
+  keil: [/Verify OK/i, /Flash Load finished/i, /Programming Done/i],
   "dfu-util": [/File downloaded successfully/i],
   avrdude: [/avrdude done\.  Thank you\./i],
 };
@@ -123,6 +148,7 @@ const FAILURE_MARKERS: Record<FlasherKind, RegExp[]> = {
   jlink: [/Failed/i, /Error \(/i, /Cannot connect/i],
   esptool: [/FAILED/i, /A fatal error occurred/i, /Timed out/i],
   "st-flash": [/error/i, /failed/i],
+  keil: [/Flash Download failed/i, /Cannot access target/i, /Error: /i, /\*\*\* error \d+/i, /No ULINK/i, /Target DLL has been cancelled/i],
   "dfu-util": [/error/i, /No DFU capable USB device/i],
   avrdude: [/error/i, /failed/i, /can't open device/i],
 };
@@ -134,7 +160,7 @@ const FAILURE_MARKERS: Record<FlasherKind, RegExp[]> = {
 export function classifyOutput(kind: FlasherKind, output: string, exitCode: number | null): { ok: boolean; verified?: boolean; reason?: string } {
   const failed = FAILURE_MARKERS[kind].find((pattern) => pattern.test(output));
   const succeeded = SUCCESS_MARKERS[kind].find((pattern) => pattern.test(output));
-  const verified = /\*\* Verified OK \*\*|Hash of data verified|Verify successful|Flash written and verified|verify.*ok/i.test(output);
+  const verified = /\*\* Verified OK \*\*|Hash of data verified|Verify successful|Flash written and verified|Verify OK|verify.*ok/i.test(output);
 
   if (failed) {
     // A failure phrase wins over a success phrase: pyOCD prints "loaded" then
@@ -270,6 +296,15 @@ export function commandFor(request: FlashRequest): string[] {
       const args = ["-a", "0", "-D", request.firmware, "-R"];
       return [...args, ...extra];
     }
+    case "keil": {
+      // `UV4 -f <project> -o <log> -j0` is the documented headless download:
+      // the project carries the device, the probe and the flash algorithm, so
+      // there is nothing else to pass. The report goes to the log file, which
+      // is where the success and failure phrases actually appear.
+      const args = ["-f", request.project ?? request.firmware, "-j0"];
+      if (request.logFile) args.push("-o", request.logFile);
+      return [...args, ...extra];
+    }
     case "avrdude": {
       // -c and -p have no sensible defaults; a wrong part id silently writes
       // to the wrong flash layout, so the caller must supply both.
@@ -306,8 +341,14 @@ export function validate(request: FlashRequest): string | null {
   if (size === 0) return `${request.firmware} is empty`;
 
   const ext = extname(request.firmware).toLowerCase();
-  if (![".elf", ".hex", ".bin", ".uf2"].includes(ext)) {
-    return `${ext || "no extension"} is not a firmware format (expected .elf, .hex, .bin or .uf2)`;
+  // Keil's ELF is spelled `.axf`. Every other flasher here reads ELF by its
+  // content, but the file is only passed to them by name, so `.axf` is
+  // accepted for the Keil downloader and refused elsewhere with a reason.
+  if (ext === ".axf" && request.kind !== "keil") {
+    return "a .axf is Keil's name for an ELF; the Keil downloader takes it, other flashers need .elf/.hex — rename the image or use flasher `keil`";
+  }
+  if (![".elf", ".hex", ".bin", ".uf2", ".axf"].includes(ext)) {
+    return `${ext || "no extension"} is not a firmware format (expected .elf, .hex, .bin, .uf2 or Keil's .axf)`;
   }
   // A .uf2 is written by copying it onto a mass-storage volume that the chip's
   // ROM bootloader exposes. None of these tools does that, so accepting the
@@ -323,6 +364,9 @@ export function validate(request: FlashRequest): string | null {
   }
   if (request.kind === "jlink" && !request.target) {
     return "J-Link needs a device name (the probe's -device id, e.g. STM32F429ZI)";
+  }
+  if (request.kind === "keil" && !request.project) {
+    return "the Keil downloader needs the .uvprojx: it names the device, probe and flash algorithm (pass `project`)";
   }
   if (request.kind === "avrdude" && !request.programmer) {
     return "avrdude needs a programmer id (pass `programmer`, e.g. arduino or usbasp)";
@@ -357,7 +401,19 @@ export async function flash(request: FlashRequest, options: { timeoutMs?: number
   // A flash is seconds of work, not minutes; a hang means the probe is wedged.
   const timeout = options.timeoutMs ?? 120_000;
   const result = await run(request.program, args, timeout);
-  const output = clip(`${result.out}${result.err ? `\n${result.err}` : ""}`);
+  let raw = `${result.out}${result.err ? `
+${result.err}` : ""}`;
+  // UV4 prints nothing useful on the console: the `-f` report goes to the file
+  // `-o` names, exactly like the build log. Without reading it the download
+  // looks like "no status, exit 0" and a real failure would pass.
+  if (request.kind === "keil" && request.logFile) {
+    try {
+      if (existsSync(request.logFile)) raw = readFileSync(request.logFile, "utf8");
+    } catch {
+      /* an unreadable log leaves the console output */
+    }
+  }
+  const output = clip(raw);
   const verdict = classifyOutput(request.kind, output, result.code);
 
   return {

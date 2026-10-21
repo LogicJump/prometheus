@@ -140,6 +140,47 @@ Error: Flash Download failed  -  Target DLL has been cancelled
 
 ---
 
+## 四之二、上一版真正漏掉的：烧写
+
+这一条不是接口清单的问题，是**整条产品链路断了**：`embed_flash` 拒绝 `.axf`，
+而 `.axf` 就是 Keil 构建出的 ELF。也就是说 Keil 工程能构建、能调试，**不能烧到板上**。
+
+现在 `flasher: "keil"` 走文档里的无头下载：
+
+```
+UV4.exe -f <project.uvprojx> -j0 -o <project>uild\keil-flash.log
+```
+
+两个只有实测才会发现的细节：
+
+1. **判定必须读日志，不能看退出码。** `UV4 -f` 的控制台什么都不打印。不读 `-o` 文件时
+   结果是「无状态、退出码 0」，一个**真实的失败会被当成成功**。第一版就是这样。
+2. **日志把各步骤挤在一行、用单空格**，不是文档里那种分行排版：
+   `Erase Done.Programming Done.Verify OK.Flash Load finished at 11:39:30`。
+   按行首匹配失败，所以匹配器改成在全文里找。现在这条日志报 `verified: yes`。
+
+`.axf` 只对 Keil 下载器放行；给别的 flasher 时说明「这是 Keil 的 ELF 后缀，请改名或用
+`flasher: keil`」，而不是一句笼统的「不是固件格式」。
+
+## 四之三、调试命令通道
+
+uVision 的调试器有一整套命令语言（`BS`/`BA`/`BL`/`SAVE`/`LOG`/`COVERAGE`/
+`PerformanceAnalyze`/`LOGICAnalyze`…），它们不是一个个独立操作，而是走
+`UV_DBG_EXEC_CMD` 一个通道。上一版只把它当成「求值的备选路径」，等于漏了大半个
+调试器。现在 `keil_debug action: "command"` 直接执行任意命令并回显输出：
+
+```
+> command BL
+ 0: (E 0x08006BE0) 'main', CNT=1, enabled
+> command BS main
+（静默成功）
+> command EXIT
+left debug mode; the debugger's breakpoints were cleared with it
+```
+
+`EXIT` 是其中一个真实的坑：它让 uVision 自己退出调试，而会话对象不知道，之后每个
+命令都会回 `Target is not in debug mode`。现在会同步状态，并在下一次 `open` 时重新进入。
+
 ## 五、接口清单与覆盖情况
 
 公开接口共 **88 个操作**，当前：**71 个已接通并实测**，**17 个在该版本上不可用**（逐个列在下面，

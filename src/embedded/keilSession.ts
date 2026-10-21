@@ -902,6 +902,7 @@ export async function getOutputName(session: KeilSession): Promise<string> {
 /* ---------- operations beyond the core loop ---------- */
 
 export {
+  debugCommand,
   debugTargetKind,
   disassemble,
   evalInWindow,

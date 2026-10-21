@@ -66,6 +66,33 @@ export async function evalInWindow(session: KeilSession, expression: string): Pr
   return { ok: reply.ok && text.length > 0 && !/^\*\*\* error/i.test(text), ...(text ? { value: text } : {}), lines };
 }
 
+/**
+ * Run a debugger command exactly as typed into uVision's Command window.
+ *
+ * This is the escape hatch for the whole command language: breakpoints with
+ * conditions, tracepoints, `SAVE`, `LOG`, `PerformanceAnalyze`, `LOGIC`,
+ * `COVERAGE`, and every system variable — the interface exposes them through
+ * one command channel rather than one operation each. The reply comes back on
+ * the `0x5020` stream, not in the response, so it is read from there.
+ */
+export async function debugCommand(session: KeilSession, command: string): Promise<{ ok: boolean; lines: string[]; message?: string }> {
+  const payload = Buffer.alloc(4 + 28 + 260);
+  payload.writeUInt32LE(1, 0); // echo the command and its output
+  sstr(command).copy(payload, 32);
+  const reply = await session.client.send(OP.DBG_EXEC_CMD, payload, 12_000);
+  // `EXIT` makes uVision leave debug mode and answer on the stream after a
+  // delay; a short wait reported it as a silent success and the session kept
+  // claiming it was still debugging.
+  const leaving = /^EXIT$/i.test(command.trim());
+  const frames = await session.client.collect(leaving ? 2500 : 600);
+  const lines = frames.map((frame) => commandWindowText(frame)).filter(Boolean);
+  return {
+    ok: reply.ok,
+    lines,
+    ...(reply.ok ? {} : { message: reply.message ?? reply.statusName }),
+  };
+}
+
 /** Set a variable, by name, to a new value. */
 export async function setVariable(session: KeilSession, name: string, value: string): Promise<Reply> {
   // `UV_DBG_VARIABLE_SET` takes a `VARINFO` whose `value` is the new value and

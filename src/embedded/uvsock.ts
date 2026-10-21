@@ -424,7 +424,7 @@ export function readVtrFrame(frame: AsyncFrame): { name: string; type: number } 
   // way kept the NUL of one name as a trailing space.
   const length = frame.data.readUInt32LE(32);
   if (length === 0) return null;
-  const name = frame.data.subarray(44, 44 + length).toString("latin1").replace(/ +$/, "").trim();
+  const name = frame.data.subarray(44, 44 + length).toString("latin1").replace(/\0+$/, "").trim();
   if (!name) return null;
   return { name, type: frame.data.readUInt32LE(0) };
 }
