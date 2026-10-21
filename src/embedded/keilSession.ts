@@ -19,7 +19,7 @@
 
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fromelfFor } from "./build.ts";
 import { detectToolchains } from "./toolchain.ts";
 import { detectProject } from "./project.ts";
@@ -131,6 +131,37 @@ export function listKeilSessions(): { key: string; project: string; target: stri
   }));
 }
 
+/**
+ * The plain sessions for one project, which must be closed before a debugger
+ * is entered on it.
+ *
+ * Project edits live in the uVision that made them and reach the `.uvprojx`
+ * only when that process exits. The debugger, meanwhile, loads the project
+ * **from disk** — so with an edit session still open, `keil_project add_group`
+ * followed by `keil_debug open` gives a debugger that does not have the group.
+ * Measured on this bench: the edit session read back its new define while a
+ * fresh uVision on the debug port read the old one from the file.
+ *
+ * A session already in debug mode is not in this list: it is the live one, and
+ * exiting it would drop its breakpoints.
+ */
+export function projectSessionsToFlush(
+  open: { key: string; project: string; debugging: boolean }[],
+  project: string,
+): { key: string }[] {
+  const wanted = project.toLowerCase();
+  return open.filter((entry) => !entry.debugging && entry.project.toLowerCase() === wanted);
+}
+
+/** Close the edit sessions for a project so the next uVision loads its edits. */
+export async function flushProjectSessions(project: string): Promise<number> {
+  let closed = 0;
+  for (const entry of projectSessionsToFlush(listKeilSessions(), project)) {
+    if (await closeKeilSession(entry.key)) closed++;
+  }
+  return closed;
+}
+
 /** Where UV4.exe is, if Keil is installed. */
 export async function uv4Path(): Promise<string | null> {
   const report = await detectToolchains();
@@ -200,6 +231,16 @@ export async function openKeilSession(options: OpenOptions): Promise<OpenResult>
   if (existing && !existing.client.closed) {
     log.push(`reused the open uVision session on port ${port}`);
     return { ok: true, session: existing, key, log };
+  }
+
+  // Entering the debugger loads the project from disk. Any *plain* session for
+  // this project is still holding edits in its own memory (that is how
+  // `keil_project` saves — see `closeKeilSession`), so it is closed first and
+  // its edits written out. Without this, `keil_project add_group` followed by
+  // `keil_debug open` debugs a project without the group.
+  if (!options.connectOnly) {
+    const flushed = await flushProjectSessions(project);
+    if (flushed > 0) log.push(`closed ${flushed} project edit session(s) so their edits reach the file first`);
   }
 
   log.push(`${uv4} ${project} -s ${port} -j0`);
@@ -349,9 +390,54 @@ export interface StopInfo {
   output: string[];
 }
 
+/**
+ * Which execution path `run` takes on this attempt.
+ *
+ * Measured on MDK 5.43a + STM32F429: with the core halted **on** a hardware
+ * breakpoint at `main`, `DBG_START_EXECUTION` answers SUCCESS, the core keeps
+ * running, and no stop notification arrives — three attempts in a row timed
+ * out. The debugger's own command channel (`G`) stops at the same breakpoint
+ * in under a second. So the API is tried first and the command channel is the
+ * second path; there is no third.
+ */
+export function goChannelFor(attempt: "api" | "api-timed-out" | "api-failed" | "command-timed-out"): "api" | "command" | null {
+  if (attempt === "api") return "api";
+  if (attempt === "command-timed-out") return null;
+  return "command";
+}
+
 /** Start execution and wait until the target stops or times out. */
 export async function run(session: KeilSession, timeoutMs = 30_000): Promise<StopInfo> {
+  const first = await runOnce(session, "api", timeoutMs);
+  if (first.stopped) return first;
+  // The API path produced no stop. Measured, that is what happens when the
+  // core is halted on a breakpoint it is already sitting at; the command
+  // channel stops it. Trying the second path is cheaper than making the caller
+  // guess, and a genuine "it really is running" from the command channel is
+  // reported unchanged.
+  // A *refused* start is worth one retry on the other channel; a **timeout**
+  // is not. The timeout means the core did not stop, and starting it again on
+  // a second channel only doubles how long the caller waits to hear the same
+  // answer — measured at 20 s of waiting to be told "it did not stop".
+  const refused = first.reason !== undefined && /refused|not in debug|FAILED|not supported/i.test(first.reason);
+  if (!refused) return first;
+  const second = await runOnce(session, "command", timeoutMs);
+  if (second.stopped) return second;
+  return { ...first, reason: `${first.reason}; the command channel did not stop it either: ${second.reason ?? "no stop"}` };
+}
+
+/** One start attempt: through the socket API, or through the command channel. */
+async function runOnce(session: KeilSession, channel: "api" | "command", timeoutMs: number): Promise<StopInfo> {
   const mark = session.client.mark;
+  if (channel === "command") {
+    // `G` is the Command window's "go". The module that owns the command
+    // channel imports this one, so it is loaded on demand rather than at the
+    // top — a static import would close the cycle.
+    const { debugCommand } = await import("./keilExtra.ts");
+    const ran = await debugCommand(session, "G");
+    if (!ran.ok) return { stopped: false, reason: ran.message ?? "the debugger refused the go command", output: ran.lines };
+    return waitForStop(session, mark, timeoutMs);
+  }
   const started = await session.client.send(OP.DBG_START_EXECUTION, Buffer.alloc(0), 8_000);
   // `TARGET_EXECUTING` means it is already running — which is what `run` was
   // asked to do, not a failure. Waiting for the next stop is the right answer.
@@ -377,14 +463,18 @@ export async function waitForStop(session: KeilSession, mark: number, timeoutMs 
     const stop = frames.find((frame) => isStopNotification(frame));
     if (stop) {
       const decoded = stopReason(stop);
-      const reasons = frames.map((frame) => asyncText(frame)).filter(Boolean);
+      // Only text from the stop frame itself describes the stop. The stream
+      // also carries "Execution started" from the start of this very run, and
+      // taking the last text frame made every breakpoint report
+      // `reason: "Execution started"`.
+      const own = asyncText(stop).trim();
       return {
         stopped: true,
         ...(decoded ? { reasonCode: decoded.reason } : {}),
         ...(decoded?.pc ? { pc: decoded.pc } : {}),
         // `0xffffffff` is "no slot"; it must not be reported as a negative one.
         ...(decoded?.slot !== undefined && decoded.slot >= 0 ? { slot: decoded.slot } : {}),
-        ...(reasons.length > 0 ? { reason: reasons[reasons.length - 1].trim() } : {}),
+        ...(own ? { reasonText: own } : {}),
         output,
       };
     }
@@ -653,8 +743,8 @@ export interface StackFrame {
   level: number;
   address: number;
   returnAddress?: number;
-  /** How many variables the debugger associates with this frame. */
-  variables?: number;
+  /** The source line the debugger attached to this frame, when it sent one. */
+  source?: string;
   function?: string;
   file?: string;
   line?: number;
@@ -667,6 +757,16 @@ export interface StackFrame {
  * is appended by the debugger when it has the ELF loaded, so it is kept raw
  * and split rather than assumed to be at a fixed offset.
  */
+/** True when the text is ordinary source characters (not a binary record). */
+function isPrintableText(text: string): boolean {
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code === 9 || code === 10 || code === 13) continue;
+    if (code < 0x20 || code > 0x7e) return false;
+  }
+  return true;
+}
+
 export function parseStackFrames(frames: AsyncFrame[]): StackFrame[] {
   const out: StackFrame[] = [];
   for (const frame of frames) {
@@ -675,16 +775,17 @@ export function parseStackFrames(frames: AsyncFrame[]): StackFrame[] {
     if (data.length < 12) continue;
     const address = Number(data.readBigUInt64LE(4));
     const returnAddress = data.length >= 20 ? Number(data.readBigUInt64LE(12)) : undefined;
-    // There is no text in this record: measured, a 48-byte frame is
-    // `nItem(4) nAdr(8) nRetAdr(8) nVars(4) nEqual(4) nTotal(4) nTask(4)
-    // nRes[3]` and nothing else. Reading a symbol from here put `nEqual` — a
-    // small integer — into the function name.
-    const vars = data.length >= 24 ? data.readUInt32LE(20) : undefined;
+    // Measured, byte for byte, on a 48-byte frame:
+    //   nItem(4)=1  nAdr(8)  nRetAdr(8)  then the source line as text:
+    //   "   dot = ui_tick % 24;…"
+    // Reading offset 20 as a count produced 840967456 — the first four
+    // characters of that text. There is no count field in this record.
+    const source = data.subarray(20).toString("latin1").replace(/\0.*$/s, "").trim();
     out.push({
       level: out.length,
       address,
       ...(returnAddress !== undefined ? { returnAddress } : {}),
-      ...(vars !== undefined ? { variables: vars } : {}),
+      ...(source && isPrintableText(source) ? { source } : {}),
     });
   }
   return out;
@@ -867,37 +968,93 @@ export async function readMemory(session: KeilSession, address: number, bytes: n
  * register with masked bits), and calling that "wrote" is the failure mode
  * this interface produces most often: `SUCCESS` with no effect.
  */
+/**
+ * Whether a read-back can be trusted as evidence about the chip.
+ *
+ * The debugger keeps its own view of memory and answers a read from it, so a
+ * write followed by a read in the **same session** proves only that the write
+ * reached that view. Measured on STM32F429: writing `de ad be ef` to
+ * `0x08000000` answered "wrote 4 byte(s) and read them back" with the new bytes
+ * in the same session, the next session read the original vector table, and
+ * STM32CubeProgrammer read the original from the chip. A read-back therefore
+ * confirms RAM-like regions and does **not** confirm flash.
+ */
+export function readBackConfirmsChip(address: number): boolean {
+  // The Arm private peripheral bus and RAM are read straight from the core;
+  // the code region at 0x00000000-0x1fffffff includes aliased flash.
+  if (address >= 0xe0000000 && address <= 0xe00fffff) return true;
+  if (address >= 0x20000000 && address <= 0x3fffffff) return true;
+  return false;
+}
+
+/**
+ * Write memory through the debugger, then read it back.
+ *
+ * The write is only reported as done when the read-back matches. A mismatch
+ * means the region refused the bytes (read-only, write-protected, or a
+ * register with masked bits), and calling that "wrote" is the failure mode
+ * this interface produces most often: `SUCCESS` with no effect.
+ *
+ * A match is **not** the same as "the chip holds these bytes": for flash the
+ * debugger answers from its own view (see `readBackConfirmsChip`), so the
+ * detail says which of the two it is.
+ */
 export async function writeMemory(session: KeilSession, address: number, bytes: number[]): Promise<{ ok: boolean; readBack: number[] | null; detail: string }> {
   const wrote = await session.client.send(OP.DBG_MEM_WRITE, memoryWrite(address, bytes), 12_000);
   if (!wrote.ok) return { ok: false, readBack: null, detail: wrote.message ?? wrote.statusName };
   const back = await readMemory(session, address, bytes.length);
   const readBack = back?.bytes ?? null;
   const same = readBack !== null && readBack.length >= bytes.length && bytes.every((byte, index) => readBack[index] === byte);
+  const chip = readBackConfirmsChip(address);
   return {
     ok: same,
     readBack,
     detail: same
-      ? `wrote ${bytes.length} byte(s) and read them back`
+      ? chip
+        ? `wrote ${bytes.length} byte(s) and read them back`
+        : `wrote ${bytes.length} byte(s) and this session reads them back, but that is the debugger's own view of ` +
+          `0x${address.toString(16)} — measured on flash, a fresh session and the chip both still hold the old bytes. ` +
+          "Use `flash` to change the image; this write cannot be taken as evidence about the chip."
       : readBack === null
         ? `wrote ${bytes.length} byte(s) but could not read them back; the write is unconfirmed`
         : `wrote ${bytes.length} byte(s) but the read-back differs (${readBack.map((byte) => byte.toString(16).padStart(2, "0")).join(" ")}) — the region may be read-only or mask bits`,
   };
 }
 
-/** Where the program is stopped, as `file:line` when the symbols allow it. */
+/**
+ * Where the program is stopped, as `file:line` when the symbols allow it.
+ *
+ * The file name is read the same way `addressToSource` reads it. This function
+ * looked for the name after the first NUL past offset 36, and on a real reply
+ * that found nothing — `where` printed a bare address while `addressToSource`
+ * on the same address answered `../HARDWARE/UI/ui.c:497 UI_Update`.
+ */
 export async function currentLocation(session: KeilSession): Promise<{ address: number; file?: string; line?: number } | null> {
   const registers = readPCFrom(await readRegisters(session));
   if (registers === null) return null;
-  const request = Buffer.alloc(28);
-  request.writeBigUInt64LE(BigInt(registers), 4);
-  const reply = await session.client.send(OP.DBG_ADR_TOFILELINE, request, 8_000);
-  if (!reply.ok) return { address: registers };
-  const data = reply.data;
-  if (data.length < 40) return { address: registers };
-  const line = data.readUInt32LE(0);
-  const start = data.indexOf(0, 36);
-  const file = start > 0 ? data.subarray(start + 1).toString("latin1").replace(/\0.*$/s, "") : "";
-  return { address: registers, ...(file ? { file } : {}), ...(line ? { line } : {}) };
+  const source = await addressToSource(session, registers);
+  if (!source) return { address: registers };
+  return {
+    address: registers,
+    ...(source.file ? { file: source.file } : {}),
+    ...(source.line ? { line: source.line } : {}),
+  };
+}
+
+/**
+ * Why an evaluator's text is an error rather than a value, or undefined.
+ *
+ * Both evaluators answer a bad expression with the debugger's own diagnostic:
+ * `_____^ *** error 34: undefined identifier`, or `<cannot evaluate>`. Printed
+ * as a result it reads like a computed value, so it is turned into a failure
+ * that names the reason.
+ */
+export function evaluationError(text: string): string | undefined {
+  const trimmed = text.trim();
+  const error = /\*\*\*\s*error\s*\d+\s*:\s*(.*)$/i.exec(trimmed);
+  if (error) return error[1]!.trim() || "the debugger refused the expression";
+  if (/^<cannot evaluate>$/i.test(trimmed)) return "<cannot evaluate>";
+  return undefined;
 }
 
 /** The PC register from a register list, whichever name the core uses. */
@@ -935,27 +1092,46 @@ export async function projectGroups(session: KeilSession): Promise<string[]> {
   return groupsInProject(session.project);
 }
 
+/**
+ * The `<Target>` block for one target, or the first one when none is named.
+ *
+ * A multi-target `.uvprojx` holds one block per target, each with its own
+ * `<Groups>`, `<OutputDirectory>` and `<OutputName>`. Every reader below that
+ * works on the file has to start here: reading the whole document returned
+ * each group once per target.
+ */
+export function targetBlock(xml: string, wanted?: string): string {
+  const blocks = [...xml.matchAll(/<Target>([\s\S]*?)<\/Target>/g)].map((match) => match[1]);
+  if (blocks.length === 0) return xml;
+  if (!wanted) return blocks[0]!;
+  const nameOf = (body: string) => /<TargetName>([^<]*)<\/TargetName>/.exec(body)?.[1]?.trim();
+  return blocks.find((body) => nameOf(body) === wanted) ?? blocks[0]!;
+}
+
 /** The project's groups, read from the `.uvprojx`. */
-export function groupsInProject(projectFile: string): string[] {
+export function groupsInProject(projectFile: string, target?: string): string[] {
   let text = "";
   try {
     text = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
   } catch {
     return [];
   }
-  return [...text.matchAll(/<GroupName>([^<]*)<\/GroupName>/g)].map((match) => match[1]).filter(Boolean);
+  // One target's block only: every target lists the same groups, so reading
+  // the document returned `USER, CORE, USER, CORE` on a two-target project.
+  const body = targetBlock(text, target);
+  return [...body.matchAll(/<GroupName>([^<]*)<\/GroupName>/g)].map((match) => match[1]).filter(Boolean);
 }
 
 
 /** One group's files from the `.uvprojx`, as `{ name, path }`. */
-export function filePathsInGroup(projectFile: string, group: string): { name: string; path: string }[] {
+export function filePathsInGroup(projectFile: string, group: string, target?: string): { name: string; path: string }[] {
   let text = "";
   try {
     text = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
   } catch {
     return [];
   }
-  const groups = [...text.matchAll(/<Group>([\s\S]*?)<\/Group>/g)].map((match) => match[1]);
+  const groups = [...targetBlock(text, target).matchAll(/<Group>([\s\S]*?)<\/Group>/g)].map((match) => match[1]);
   const wanted = groups.find((body) => new RegExp(`<GroupName>\\s*${escapeRegExp(group)}\\s*</GroupName>`).test(body));
   if (!wanted) return [];
   return [...wanted.matchAll(/<File>([\s\S]*?)<\/File>/g)]
@@ -983,7 +1159,7 @@ export async function addGroup(session: KeilSession, group: string): Promise<Rep
  * group" is not something this interface can do. Knowing that up front turns
  * an opaque refusal into an answer.
  */
-export function allProjectFiles(projectFile: string): { group: string; name: string; path: string }[] {
+export function allProjectFiles(projectFile: string, target?: string): { group: string; name: string; path: string }[] {
   let text = "";
   try {
     text = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
@@ -991,7 +1167,7 @@ export function allProjectFiles(projectFile: string): { group: string; name: str
     return [];
   }
   const out: { group: string; name: string; path: string }[] = [];
-  for (const match of text.matchAll(/<Group>([\s\S]*?)<\/Group>/g)) {
+  for (const match of targetBlock(text, target).matchAll(/<Group>([\s\S]*?)<\/Group>/g)) {
     const body = match[1];
     const group = /<GroupName>([^<]*)<\/GroupName>/.exec(body)?.[1] ?? "";
     for (const file of body.matchAll(/<File>([\s\S]*?)<\/File>/g)) {
@@ -1005,12 +1181,44 @@ export function allProjectFiles(projectFile: string): { group: string; name: str
   return out;
 }
 
+/**
+ * A file path as the `.uvprojx` stores it: relative to the **project file**.
+ *
+ * uVision resolves `<FilePath>` against the directory the `.uvprojx` sits in,
+ * and writes whatever it is given. The tool takes paths the way a person types
+ * them — often relative to the workspace — so a project that lives in `USER\`
+ * turns `USER\probe_add.c` into `USER\USER\probe_add.c`, a file that does not
+ * exist. Measured: `add_file` answered "added", the entry was dead, and the
+ * only mention of it was a build failure much later.
+ *
+ * "Relative to the project" is ambiguous on disk — `USER/probe_add.c` is a
+ * legal path inside `USER\` whether or not it exists. The file is therefore
+ * **located** the way a reader would: the workspace interpretation when that
+ * is the one that exists, then the project one. Only what actually exists is
+ * written into the project.
+ */
+export function projectRelativeFile(projectFile: string, file: string): string {
+  const dir = dirname(projectFile);
+  if (isAbsolute(file)) return relative(dir, resolve(file)).replace(/\//g, "\\");
+  const fromProject = resolve(dir, file);
+  const fromWorkspace = resolve(process.cwd(), file);
+  const absolute = existsSync(fromProject) || !existsSync(fromWorkspace) ? fromProject : fromWorkspace;
+  const rel = relative(dir, absolute);
+  return rel === "" ? "." : rel.replace(/\//g, "\\");
+}
+
 export async function addFile(session: KeilSession, group: string, file: string): Promise<Reply> {
+  const stored = projectRelativeFile(session.project, file);
   // uVision's own `ALREADY_PRESENT` names the group it was given, which reads
   // like "it is already in this group" — it is not; it is in whichever group
   // had it first. Say which one.
-  const base = (file.split(/[\\/]/).pop() ?? file).toLowerCase();
-  const existing = allProjectFiles(session.project).find((entry) => entry.name.toLowerCase() === base || entry.path.toLowerCase() === file.toLowerCase() || entry.path.toLowerCase().endsWith(`\\${base}`));
+  const base = (stored.split(/[\\/]/).pop() ?? stored).toLowerCase();
+  const existing = allProjectFiles(session.project).find(
+    (entry) =>
+      entry.name.toLowerCase() === base ||
+      entry.path.toLowerCase() === stored.toLowerCase() ||
+      entry.path.toLowerCase().endsWith(`\\${base}`),
+  );
   if (existing && existing.group !== group) {
     return {
       ok: false,
@@ -1020,7 +1228,7 @@ export async function addFile(session: KeilSession, group: string, file: string)
       message: `${existing.path} is already in the project, under ${existing.group}. uVision will not list one file twice, so it cannot be added to ${group} as well.`,
     };
   }
-  return session.client.send(OP.PRJ_ADD_FILE, prjData(group, file), 12_000);
+  return session.client.send(OP.PRJ_ADD_FILE, prjData(group, stored), 12_000);
 }
 
 /**
@@ -1124,6 +1332,38 @@ function dedupe(lines: string[]): string[] {
 
 /** Ask uVision to download the built image to flash on its configured target. */
 /**
+ * Clean the current target through the socket.
+ *
+ * `PRJ_CLEAN` is answered `SUCCESS` and streams the same report `UV4 -c`
+ * writes into its log — measured: `Clean started: Project: 'TOUCH'`, the
+ * per-target line, then the `0x5000` completion frame, in 0.4 s. `keil_debug
+ * clean` spawned a second UV4 for the same job while this session was already
+ * open, which is slower and can collide with the probe the session holds.
+ */
+export async function cleanInIde(session: KeilSession, timeoutMs = 5 * 60_000): Promise<{ ok: boolean; status: number; lines: string[] }> {
+  const mark = session.client.mark;
+  const reply = await session.client.send(OP.PRJ_CLEAN, Buffer.alloc(0), 15_000);
+  if (!reply.ok) return { ok: false, status: reply.status, lines: [reply.message ?? reply.statusName] };
+  const started = Date.now();
+  let status = 0;
+  while (Date.now() - started < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const done = session.client.since(mark).find((frame) => frame.type === 0x5000);
+    if (done && done.data.length >= 8) {
+      status = done.data.readUInt32LE(4);
+      break;
+    }
+  }
+  const lines = session.client
+    .since(mark)
+    .filter((frame) => frame.type === 0x5001)
+    .map((frame) => frame.data.subarray(8).toString("latin1").replace(/\0+$/, ""))
+    .filter(Boolean);
+  // UVBUILDCODES: 1 ok, 2 warnings, 3 errors, 4 cancelled, 5 cleaned.
+  return { ok: status === 1 || status === 2 || status === 5, status, lines: dedupe(lines) };
+}
+
+/**
  * Download the current target's image through uVision.
  *
  * Measured constraint: this is a **project** operation, not a debugger one. In
@@ -1187,7 +1427,23 @@ export async function flashInIde(session: KeilSession, timeoutMs = 5 * 60_000): 
 export async function verifyFlash(session: KeilSession, hexPath: string, bytes = 64): Promise<{ ok: boolean; detail: string; expected?: string; got?: string }> {
   let records: { address: number; bytes: number[] }[] = [];
   try {
-    records = parseIntelHex(readFileSync(hexPath, "latin1"));
+    const raw = readFileSync(hexPath);
+    // A project without "Create HEX File" has only the `.axf`. That is an ELF,
+    // so it is turned into the same records `fromelf --i32` would write rather
+    // than skipping the chip comparison entirely.
+    if (/\.(axf|elf|out)$/i.test(hexPath) || (raw[0] === 0x7f && raw.subarray(1, 4).toString("ascii") === "ELF")) {
+      const fromelf = fromelfFor(session.client.programPath);
+      if (!fromelf) return { ok: false, detail: `this image is an ELF and fromelf was not found to convert it to Intel HEX` };
+      const converted = await new Promise<{ code: number | null; out: string }>((resolveRun) => {
+        execFile(fromelf, ["--i32", "--output", `${hexPath}.verify.hex`, hexPath], { windowsHide: true, timeout: 120_000 }, (error, stdout) =>
+          resolveRun({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, out: `${stdout ?? ""}` }),
+        );
+      });
+      if (converted.code === 0) records = parseIntelHex(readFileSync(`${hexPath}.verify.hex`, "latin1"));
+      if (records.length === 0) return { ok: false, detail: `could not convert ${hexPath} to Intel HEX to compare against flash` };
+    } else {
+      records = parseIntelHex(raw.toString("latin1"));
+    }
   } catch {
     return { ok: false, detail: `could not read ${hexPath} to compare against flash` };
   }
@@ -1308,6 +1564,24 @@ export function parseVariables(frames: AsyncFrame[]): Variable[] {
     });
   }
   return out;
+}
+
+/**
+ * One variable's value as a line a reader will not misread.
+ *
+ * The enumeration's `value` field is the address for anything the debugger
+ * renders by reference: measured, `LTDC_Handler` comes back as
+ * `0x20000240 &LTDC_Handler` and `ltdc_lcd_framebuf` as `0xC0000000`. Printed
+ * as a value, that array's address reads like the number 3221225472. The
+ * address is useful — `read` takes it — so it is kept and labelled.
+ */
+export function describeVariableValue(variable: { name: string; value: string; type?: string; count?: number }): string {
+  const value = variable.value.trim();
+  const type = variable.type ?? "";
+  const address = /^(0x[0-9a-f]+)/i.exec(value)?.[1] ?? value;
+  if (/^struct/i.test(type)) return `struct at ${address} (the address; fields are not listed here)`;
+  if (variable.count && variable.count > 0) return `array at ${address} (${variable.count} element(s); element values are not listed here)`;
+  return value;
 }
 
 /**
@@ -1462,14 +1736,36 @@ export async function addressToSource(session: KeilSession, address: number): Pr
 }
 
 /** Watch an address for reads, writes, or both (hardware watchpoint). */
+/**
+ * Whether a watchpoint exists after the request, judged by the debugger's list.
+ *
+ * `DBG_CREATE_BP` answers `SUCCESS` for every one of these requests, including
+ * one whose expression it could not resolve: measured with `{type: 3,
+ * expr: "uwTick"}` the reply is SUCCESS and `DBG_ENUMERATE_BP` comes back
+ * empty — the name was evaluated as a C expression, produced nothing, and no
+ * watchpoint was created. With a literal address the entry appears. So the
+ * list is the authority, exactly as it is for a `file:line` breakpoint.
+ */
+export function accessBreakpointCreated(before: Breakpoint[], after: Breakpoint[]): boolean {
+  const key = (entry: Breakpoint) => `${entry.type}:${entry.address ?? ""}:${entry.expression ?? ""}`;
+  const had = new Set(before.map(key));
+  const now = new Set(after.map(key));
+  // A watchpoint that was already there and survived still counts as success:
+  // re-adding one is not a failure to create it.
+  return [...now].some((entry) => !had.has(entry)) || [...had].some((entry) => now.has(entry));
+}
+
 export async function addAccessBreakpoint(
   session: KeilSession,
   expression: string,
   kind: "read" | "write" | "readwrite",
   accessSize = 4,
-): Promise<Reply> {
+): Promise<Reply & { created?: boolean; listed?: Breakpoint[] }> {
   const type = kind === "read" ? BREAK.READ : kind === "write" ? BREAK.WRITE : BREAK.READWRITE;
-  return session.client.send(OP.DBG_CREATE_BP, breakpointParam(expression, { type, accessSize }), 12_000);
+  const before = await listBreakpoints(session);
+  const reply = await session.client.send(OP.DBG_CREATE_BP, breakpointParam(expression, { type, accessSize }), 12_000);
+  const listed = await listBreakpoints(session);
+  return { ...reply, created: accessBreakpointCreated(before, listed), listed };
 }
 
 /* ---------- project management ---------- */
@@ -1514,6 +1810,22 @@ export async function eraseFlash(session: KeilSession): Promise<Reply> {
 export async function getOutputName(session: KeilSession): Promise<string> {
   const reply = await session.client.send(OP.PRJ_GET_OUTPUTNAME, Buffer.alloc(4), 8_000);
   return reply.ok ? readSstr(reply.data, 0) : "";
+}
+
+/**
+ * Whether the debugger's output-name reply is the name that was written.
+ *
+ * The reply carries the whole path — measured, setting `app.axf` answers
+ * `..\OBJ\app.axf` — because uVision prepends the target's `OutputDirectory`.
+ * Comparing it with the bare name the caller sent made every successful rename
+ * report "still reports ..., nothing was changed". The comparison is therefore
+ * on the last path segment, case-insensitively, which is the rule Windows
+ * itself applies to the file it names.
+ */
+export function sameOutputName(stored: string, wanted: string): boolean {
+  const base = (value: string) => (value.split(/[\\/]/).pop() ?? value).trim().toLowerCase();
+  if (!stored.trim()) return false;
+  return base(stored) === base(wanted);
 }
 
 /**

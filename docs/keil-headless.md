@@ -77,6 +77,10 @@ Keil 自己没有 Linux 那种「一个命令做所有事」的入口。它公�
 「accepted but reads back …」，并且能按人写的名字找到寄存器——调试器列的是
 `R15 (PC)`、`R13 (SP)`，直接找 `PC` 是找不到的。
 
+> 第十轮复核（本机 STM32F429）：`R0` 回 `SUCCESS` 但读回仍是旧值
+> （`0x200003A8` 写 `0x42` 后没变），`R15 (PC)` 回 `Register index is out of range`。
+> 两种失败都如实报出；命令窗口的 `R0 = 0x42` 实测生效。
+
 ### 3. 写变量：SUCCESS，但请求里没有值
 
 `VARIABLE_SET` 收 `VARVAL`（`IVARENUM` + 新值），按 **nID** 定位，不是按名字。
@@ -221,7 +225,7 @@ flash check: flash at 0x8000000 matches …\OBJ\TOUCH.hex for 64 byte(s)
 | `keil_project targets` | `* TOUCH`(列出全部目标并标出当前) |
 | `keil_project set_output_name` | 写入后回读核对 |
 | `keil_debug watch_remove` | 实测**要表达式本身**,不是 `watch_add` 给的 id |
-| `keil_debug trace_get` | `TRAPS = 0x1` |
+| `keil_debug trace_get` | 读得到目标自己枚举的 `CURR_TID`/`STCLK`/`STLINK_PM`/`CORE_CLK`/`TRACE_CLK`；`TRAPS` 不在枚举里，被拒 |
 | `keil_debug itm` | 通道模式字必须是 0;之前发的 1 被拒(`16Bit Mode not supported`) |
 | `keil_debug event_recorder` | 启动后列出 SCVD;没有就是「这个镜像不描述事件」 |
 | `keil_debug show_code` | 在 IDE 里定位到地址 |
@@ -298,7 +302,7 @@ flash check: flash at 0x8000000 matches …\OBJ\TOUCH.hex for 64 byte(s)
 | 操作 | 实测 |
 |---|---|
 | `DBG_READ_REGISTERS` | 忽略名字，对 `PC`/`SP`/`R0,R1` 都回 `0x00000001`；改用枚举 |
-| `DBG_VTR_GET` | 回 `Unknown VTR-name`，即使名字是它自己枚举出来的 |
+| `DBG_VTR_GET` | 只认 `DBG_ENUM_VTR` 列出来的名字；`TRAPS` 这类名字**不在**该列表里，回 `Unknown VTR-name` |
 | `DBG_EVAL_EXPRESSION_TO_STR` / `DBG_EVTR_GETSTATUS` | 永不回复 |
 | `DBG_ENUM_SYMTP` | 回 `PARSE_ERROR`（缺该版本不暴露的 symbol-table id） |
 | `DBG_FILELINE_TO_ADR` | 相对/绝对路径都回 `NO_ADRMAP` |
@@ -323,8 +327,10 @@ flash check: flash at 0x8000000 matches …\OBJ\TOUCH.hex for 64 byte(s)
   退出时写 `.uvprojx`。这一点已经用字节比对证实（见第五节之五），不是推断。
 - **一个文件挂到两个组**：uVision 不允许。
 - **`PRJ_FLASH_ERASE`**：接口不回复；下载本身会擦除它写的扇区。
-- **寄存器写入**：`REGISTER_SET` 对 R0 一路回 SUCCESS 却不改变值（`R0 = 0x42` 走命令
-  窗口可以）；工具会明确报「接受了但读回没变」，命令通道是可行替代。
+- **寄存器写入**：`REGISTER_SET` 在这块板子上两种失败都出现过——`R0` 回 `SUCCESS` 却
+  **不改变值**（`0x200003A8` 写 `0x42` 后仍是 `0x200003A8`），`R15 (PC)` 直接**被拒**
+  （`Register index is out of range`）。工具按「接受但读回没变 / 被拒」两种说法分别报出来，
+  不会当成成功。命令窗口的 `R0 = 0x42` 实测生效（读回 `0x00000042`），是可行替代。
 - **局部变量**：该目标上调试器对任何帧都只报全局（`nVars` 恒为 0），接口层无从列出。
 - **`-et` / `-ep` 导出 cprj**：MDK 5.43a 上退 0、零输出、不写文件；带不带 `-j0`/`-o`、
   相对或绝对路径、指定或不指定 `-t` 都一样。调试会话里的菜单模型也没有这一项。
@@ -481,10 +487,11 @@ run()            → 停在 0x08006BF8，正好是 main.c:38
 - **那张「本版本不支持」的表没有任何读者。** 记录了 13 条，但没有任何代码路径会
   把它呈现给用户。现在 `keil_debug action: capabilities` 会列出：能用的、要先进调试
   的、明确被拒的（带原因）、以及要先开 extended stack 的。动作数 53 → 54。
-- **表里有一条是错的。** `DBG_VTR_GET` 被写成「对接口自己枚举出来的名字也回
-  FAILED」。实测：`TRAPS` 回 `SUCCESS`，只有不存在的名字才回
-  `Unknown VTR-name`。也就是说按名字读 trace 变量一直是好的，是这张表让
-  `trace_get` 看起来不能用。已删除该条目。
+- **表里有一条被我自己判错了，现已改回。** 上一轮把 `DBG_VTR_GET` 判成「表写错了」，
+  依据是一次 `TRAPS` 回 `SUCCESS`。再测一遍，目标 `DBG_ENUM_VTR` 列出的只有
+  `CURR_TID`、`STCLK`、`STLINK_PM`、`CORE_CLK`、`TRACE_CLK`——**`TRAPS` 不在其中**，
+  读它回 `Unknown VTR-name`。表原本是对的，那条「更正」才是错的。现在条目保留，
+  但把理由写准：它只认枚举里的名字。
 
 另外核对了 `DBG_READ_REGISTERS` 那条：「对 R0 / PC / SP 都回同一个
 `0x00000000`」——解码原始字节确认属实，结论保留。
@@ -529,8 +536,151 @@ keil_project add_file/close→ 编辑生效；close 报告是否写盘
 
 ---
 
-## 九、边界没有变
+## 八之二、第八轮：全面重扫，八处已修 + 一处 Keil 侧缺陷
+这一轮换角度重扫（可达性、参数一致性、失败语义、字节布局、真机逐动作），每一条都是先造出
+会失败的测试再改。
 
+**1. `detectProject` 会把兄弟目录的工程当成当前工程。** 从 `projB/work` 向上走到 `projB` 的
+父目录时，`findProjectFile` 会再向下看一层，于是 `projA/P.uvprojx` 被当成「当前工程」。
+`keil_project info` 会报别人目录的目标，编辑也会写到那个工程上。csolution 分支早就为同一个
+问题加过 `dirname(...) === dir` 的防护，厂商分支漏了。现在向上查找只接受**包含**起点的
+那些工程。
+
+**2. `add_file` 的文件路径按工作区解析，不按工程解析。** 工程在 `USER\` 下时，传入
+`USER/probe_add.c` 会被 uVision 原样写入，解析成 `USER\USER\probe_add.c`——不存在的文件。
+工具回「added」，直到构建失败才暴露。现在按磁盘上真实存在的解释定位，写入工程相对路径。
+
+**3. `set_output_name` 把每一次成功都报成失败。** `PRJ_GET_OUTPUTNAME` 回的是整条路径
+（`..\OBJ\app.axf`），而比对用的是裸文件名。实测：改名成功，工具却报「nothing was changed」。
+
+**4. `breakpoint_add` 的 watchpoint 是假成功。** `DBG_CREATE_BP` 对符号名（`uwTick`）回
+`SUCCESS` 但一个都不创建；地址形式（`0x20000000`）才生效。现在创建后读断点列表核对，
+没新增就判失败并说明用地址。
+
+**5. `breakpoint_delete` 丢掉了回复。** 删不掉时（`BP_NOTFOUND`）也回成功。现在读回复并
+重新枚举列表核对。
+
+**6. `erase` 等一批动作失败时不返回 `isError`。** 十几个分支只把「失败」写进文案，调用方
+（agent）看不到。现在统一走一个失败标记，工具结果带上 `isError`。
+
+**7. 工程会话的编辑对调试会话不可见。** 编辑只在 4824 那个 uVision 的内存里，调试器从磁盘
+加载工程——实测：编辑会话读得到新 define，调试端口上全新的 uVision 读到旧值。现在进入调试
+前先把同一工程的编辑会话关闭落盘。真机验证：`add_group` 之后 `open`，磁盘上立刻有该分组，
+调试器也看得到。
+
+**8. `symbols_all` / `export_cprjs` 有实现没入口。** `keilCli` 里 `-X1`/`-ep` 完整，
+但动作枚举里没有。已补，真机跑通。
+
+另外两处修正：
+
+- **只做增量构建时 RAM 少报 2 MB。** `fromelf -z` 的 `ROM Totals` 行 ZI 恒为 0，真实 ZI
+  在上一行的对象行里。旧代码取 totals 行，得到 108 字节而不是 2 MB。旧的单元测试还把这个
+  错值当成正确答案断言了——一并更正。
+- **`DBG_VTR_GET` 的结论上一轮被我判反了。** 目标枚举的是 `CURR_TID`/`STCLK`/
+  `STLINK_PM`/`CORE_CLK`/`TRACE_CLK`，**`TRAPS` 不在其中**。表原本是对的，那条「更正」才错。
+
+### 一条 Keil 侧的缺陷，改不了但要说清
+
+**核心停在某个断点上再 `run`，它不动，uVision 也不发停止帧。** 实测：`DBG_START_EXECUTION`
+回 `SUCCESS`，`DBG_STATUS` 一直报「运行中」（1），而 `DBG_STOP_EXECUTION` 立即返回、PC 与
+运行前一模一样。命令通道的 `G`、删除全部断点后重跑都一样。真机连续多次、重置后重试都是这个
+结果。
+
+工具现在会指出这一点：PC 前后没变、且该地址上有断点，就明确说「核心停在断点上没动，先单步
+一步或删掉那个断点再跑」，而不是只回一句「没停下」。
+
+### 这一轮补的测试
+
+`tests/round12-uvsock.test.ts` 从 49 条增到 57 条，新增覆盖：兄弟目录不误识别、文件路径按
+工程解析、输出名按文件名比对、watchpoint 以列表为准、`run` 的第二条通道、只做增量构建时的
+ZI、`TRAPS` 的真实归属。另有 `tests/round12-close.test.ts` 固定「先退出调试再关进程」。
+
+全量 801 条、799 通过、2 条原有条件跳过、0 失败。
+
+---
+
+## 八之三、第九轮：换角度再扫，又五处
+
+这一轮按「同一份数据的两条路径是否一致」「写操作的回读」「枚举与求值是否对得上」重扫。
+
+**1. 多 Target 工程的分组列表重复。** 每个 `<Target>` 块各带一份 `<Groups>`，直接对整个
+文档做正则，`groups` 回 `USER, CORE, USER, CORE`。现在按当前 Target 的块读。同一处修正也
+应用到了 `files`、`allProjectFiles`、`imageLocation`。
+
+**2. `clean` 一直绕道 CLI，而接口版 0.4 秒就能做完。** `PRJ_CLEAN` 实测回 `SUCCESS` 并推
+同样的报告与完成帧，从未被代码发送过。现在 `keil_debug clean` 走会话内的接口。
+
+**3. 变量列表把地址当值打印。** 结构体的值是 `0x20000240 &LTDC_Handler`，数组的是首元素
+地址（`0xC0000000`）。打印成「= 0xC0000000」会让人以为这是它的数值。现在如实写成
+「struct at …」「array at …（N 个元素）」。
+
+**4. 栈帧里的 `variables` 是假的。** 真实 48 字节帧是
+`nItem(4) nAdr(8) nRetAdr(8) 源码文本@20`——**没有计数字段**。旧代码把 20 处当整数读，
+得到 `840967456`，正是源码文本 `"   dot = …"` 的前四个字节。工具没显示它，所以一直没被
+发现。现在读出的是源码行，并附在 `stack` 的输出里。
+
+**5. `where` 只给地址，不给文件名。** `currentLocation` 用自己的一套偏移找文件名，在真实
+回复上找不到；同一地址走 `addressToSource` 就能拿到 `../HARDWARE/UI/ui.c:497 UI_Update`。
+现在两条路径统一。
+
+**6. 求值失败被当成值打印。** 两个求值器对坏表达式都回
+`_____^ *** error 34: undefined identifier`，工具原样写成 `uwTick = _____^ *** error …`，
+读起来像算出了一个值。现在识别为失败并报原因。
+
+顺带确认一件事：**`uwTick` 这类 HAL 的 `__IO`（volatile）全局在这个求值器里读不出来**
+（`Error in expression` / `undefined identifier`），即使核心正停在 `main` 里也一样；同一份
+列表里的 `SystemCoreClock`、`main` 都能求值。这是 Keil 侧的限制，`variables` 读它的值和
+地址仍然正常。
+
+---
+
+## 八之四、第十轮：写 Flash 的「成功」是假的，与探针掉线的关系
+
+这一轮查的是**写操作的回读到底证明了什么**，结果推翻了一个一直当作已完成的结论。
+
+### 1. `write` 到 Flash 区会「成功并读回一致」，而芯片没变
+
+复现步骤与证据：
+
+```
+会话 A：read  0x08000000 → a8 09 00 20 55 02 00 08
+        write 0x08000000 = de ad be ef → "wrote 4 byte(s) and read them back"
+        read  0x08000000 → de ad be ef 55 02 00 08   ← 会话 A 里"生效"了
+关掉会话 A，另开会话 B：
+        read  0x08000000 → a8 09 00 20 55 02 00 08   ← 芯片根本没变
+用 STM32CubeProgrammer 直接读芯片：
+        a8 09 00 20 55 02 00 08                       ← 外部工具确认
+```
+
+**同一进程里的第二个会话也是这样**：A 写 → A 读回一致 → B 读回原值 → B 写 → B 读回一致。
+两个会话各有一份自己的「影子」，谁也不代表芯片。
+
+而在**新起的会话**里，同样的写入会正确报「读回不一致」：
+
+```
+trial 1/2/3: before a8 09 00 20 … | write false (read-back differs) | after a8 09 00 20 …
+```
+
+也就是说，回读校验本身是有效的，但它验证的是**调试器自己那份内存视图**，不是 Flash。
+把「写后回读一致」当成「写进芯片了」，是这个项目里最像成功的一处假完成。
+
+**结论**：`write` 对 Flash 区不可信，工具的输出不能证明芯片内容。要改 Flash 只能用下载
+（`flash`）或擦除+下载。这一条已经写进工具与文档，`write` 的说明会点明它靠不住。
+
+### 2. 探针为什么老是掉线
+
+同一批实验里，写 Flash 之后紧接着出现：
+
+- uVision：`Flash Download failed - Target DLL has been cancelled`
+- STM32CubeProgrammer：`ST-LINK error (DEV_USB_COMM_ERR)`
+
+连写几次之后探针进入错误状态，需要等待若干秒（有时要重新插拔）才恢复。两次掉线都发生在
+对 Flash 区做写入之后，而不是普通读、断点、单步、下载之后。所以「掉线」不是随机的，是这组
+操作把 ST-Link 弄进错误态。
+
+---
+
+## 九、边界没有变
 - 安装包里没有任何 Keil 二进制、器件包或编译器；不下载、不重分发。
 - 探测只读：默认路径 + `TOOLS.INI` + 注册表 `HKLM\SOFTWARE\WOW6432Node\Keil\Products\MDK`。
 - 没有 Keil 的机器上，`keil_debug` 直接说明情况，并指向 OpenOCD / pyOCD / J-Link 链路。

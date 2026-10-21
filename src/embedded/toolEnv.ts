@@ -243,12 +243,3 @@ function runVersion(program: string): string {
   }
 }
 
-/** 某个 pack 自己声明的额外环境变量，占位符已展开。 */
-export function packVars(manifest: { id: string; env: { vars: Record<string, string> } }, packDirectory: string): Record<string, string> {
-  const state = join(packDirectory, "state");
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(manifest.env.vars ?? {})) {
-    out[key] = value.replace(/\{pack\}/g, packDirectory).replace(/\{state\}/g, state);
-  }
-  return out;
-}

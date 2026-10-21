@@ -396,22 +396,21 @@ test("the stack is reported innermost first", () => {
 });
 
 test("a stack frame is what the record holds, not a symbol read from its fields", () => {
-  // A 48-byte STACKENUM frame is nItem, nAdr, nRetAdr, nVars, nEqual, nTotal,
-  // nTask, nRes[3] — no text. Reading a symbol at 20 put `nEqual` (2) into the
-  // function name, and the stack printed "#0 Reset_Handler" for a frame that
-  // was in SystemInit.
+  // A 48-byte STACKENUM frame, measured: nItem, nAdr, nRetAdr, then the
+  // source line as text. An earlier reading assumed nVars/nEqual/nTotal
+  // fields after the addresses; those bytes are the source text, and reading
+  // offset 20 as a count produced 840967456. A frame whose text is binary or
+  // empty simply carries no `source`.
   const body = Buffer.alloc(48);
   body.writeUInt32LE(1, 0);
   body.writeBigUInt64LE(0x08000258n, 4);
   body.writeBigUInt64LE(0xffffffffn, 12);
-  body.writeUInt32LE(0, 20);
-  body.writeUInt32LE(2, 24);
-  body.writeUInt32LE(2, 28);
   const frame: AsyncFrame = { type: 0x5015, echoed: 0, data: body, raw: Buffer.alloc(0) };
   const [parsed] = parseStackFrames([frame]);
   assert.equal(parsed?.address, 0x08000258);
-  assert.equal(parsed?.function, undefined);
-  assert.equal(parsed?.variables, 0);
+  assert.equal(parsed?.returnAddress, 0xffffffff);
+  assert.equal(parsed?.function, undefined, "no symbol is invented from the fields");
+  assert.equal(parsed?.source, undefined, "a zero-filled tail is not source text");
 });
 
 test("a register can be named the way a person types it", () => {
@@ -746,11 +745,300 @@ test("the capability report is reachable and does not claim a working op is refu
   assert.ok(tool, "keil_debug is registered");
   const actions = ((tool!.parameters as { properties: { action: { enum: string[] } } }).properties.action.enum);
   assert.ok(actions.includes("capabilities"), "the action is declared");
-  // Measured on MDK 5.43a: `DBG_VTR_GET TRAPS` answers SUCCESS. The table used
-  // to list it as refused, which made `trace_get` look broken.
-  assert.equal(UNSUPPORTED_ON_MDK_5_43["DBG_VTR_GET"], undefined, "VTR_GET works and must not be listed");
+  // Re-measured: `TRAPS` is not one of the target's enumerated trace variables
+  // and is refused. The entry belongs in the table (see the test below); what
+  // must not happen is the report listing a *working* operation as refused.
+  assert.equal(UNSUPPORTED_ON_MDK_5_43["DBG_VTR_ENUM"], undefined, "the enumeration itself works");
   // Every remaining entry says why, not just that it is unsupported.
   for (const [name, why] of Object.entries(UNSUPPORTED_ON_MDK_5_43)) {
     assert.ok(why.length > 15, `${name} explains itself`);
   }
+});
+
+/* ---------- project detection must not wander into a sibling ---------- */
+
+test("a directory with no project of its own does not adopt a sibling's", async () => {
+  const { detectProject } = await import("../src/embedded/project.ts");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const base = mkdtempSync(join(tmpdir(), "prometheus-sibling-"));
+  try {
+    // /base/projA/P.uvprojx   /base/projB/work/<empty>
+    mkdirSync(join(base, "projA"));
+    writeFileSync(join(base, "projA", "P.uvprojx"), "<Project/>");
+    mkdirSync(join(base, "projB", "work"), { recursive: true });
+    // Measured: the walk reached /base, `findProjectFile` looked one level
+    // down, and answered with projA's project — a different project, in a
+    // different source tree. `keil_project` then reports and edits it.
+    const detected = detectProject(join(base, "projB", "work"));
+    assert.equal(detected.kind, "unknown", `a sibling's project was adopted as ${detected.file}`);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/* ---------- a file path is relative to the project, not to the workspace ---------- */
+
+test("add_file resolves a workspace path against the project file before uVision sees it", async () => {
+  const { projectRelativeFile } = await import("../src/embedded/keilSession.ts");
+  const { mkdtempSync, mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const B = String.fromCharCode(92);
+  const base = mkdtempSync(join(tmpdir(), "prometheus-rel-"));
+  try {
+    // The project lives one level down, which is where every Keil template
+    // puts it. Real directories matter here: `resolve` against a drive that
+    // does not exist falls back to the working directory.
+    mkdirSync(join(base, "USER"), { recursive: true });
+    mkdirSync(join(base, "CORE"), { recursive: true });
+    const projectFile = join(base, "USER", "TOUCH.uvprojx");
+    // Measured: the tool was handed `USER/probe_add.c` (relative to the
+    // workspace) and uVision wrote it through unchanged into a project that
+    // lives in USER, so the entry resolved to USER/USER/probe_add.c — a file
+    // that does not exist. The build then failed on it with no mention of the
+    // real cause. The file that exists is the one that has to be written.
+    writeFileSync(join(base, "USER", "probe_add.c"), "int probe_add(void){return 0;}\n");
+    mkdirSync(join(base, "USER", "sub"), { recursive: true });
+    writeFileSync(join(base, "USER", "sub", "nested.c"), "int nested(void){return 0;}\n");
+    mkdirSync(join(base, "CORE"), { recursive: true });
+    writeFileSync(join(base, "CORE", "startup.s"), "; startup\n");
+    const previous = process.cwd();
+    process.chdir(base);
+    try {
+      assert.equal(projectRelativeFile(projectFile, "USER/probe_add.c"), "probe_add.c");
+      assert.equal(projectRelativeFile(projectFile, "USER/sub/nested.c"), ["sub", "nested.c"].join(B));
+    } finally {
+      process.chdir(previous);
+    }
+    // Already project-relative: unchanged.
+    assert.equal(projectRelativeFile(projectFile, "main.c"), "main.c");
+    assert.equal(projectRelativeFile(projectFile, ["..", "CORE", "startup.s"].join(B)), ["..", "CORE", "startup.s"].join(B));
+    // Absolute inside the project directory becomes relative to it; outside
+    // keeps the `..` the project itself would write.
+    assert.equal(projectRelativeFile(projectFile, join(base, "USER", "main.c")), "main.c");
+    assert.equal(projectRelativeFile(projectFile, join(base, "CORE", "startup.s")), ["..", "CORE", "startup.s"].join(B));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("an output name is compared by its file name, because the reply is a path", async () => {
+  const { sameOutputName } = await import("../src/embedded/keilSession.ts");
+  const B = String.fromCharCode(92);
+  // Measured: `PRJ_GET_OUTPUTNAME` answers `{len, "..\OBJ\app.axf"}` — the
+  // whole path, directory included. The tool compares that against the bare
+  // `app.axf` it sent, so every successful rename was reported as "the
+  // debugger accepted the request but still reports ..., nothing was changed".
+  assert.equal(sameOutputName(["..", "OBJ", "app.axf"].join(B), "app.axf"), true);
+  assert.equal(sameOutputName("app.axf", "app.axf"), true);
+  assert.equal(sameOutputName(["..", "OBJ", "APP.AXF"].join(B), "app.axf"), true, "Windows paths are case-insensitive");
+  assert.equal(sameOutputName(["..", "OBJ", "other.axf"].join(B), "app.axf"), false);
+  assert.equal(sameOutputName("", "app.axf"), false, "an empty reply is not a match");
+});
+
+test("a watchpoint is confirmed by the breakpoint list, not by the reply", async () => {
+  const { accessBreakpointCreated } = await import("../src/embedded/keilSession.ts");
+  // Measured on MDK 5.43a: `DBG_CREATE_BP` answers SUCCESS for
+  // `{type: 3, expr: "uwTick"}` and for a name that does not exist, and the
+  // enumerated list stays empty in every case — the expression was evaluated
+  // (to nothing) rather than resolved. With an address the entry appears.
+  const before = [{ number: 1, type: 3, enabled: true, tickMark: 1, address: 0x20000000, expression: "0x20000000" }];
+  assert.equal(accessBreakpointCreated(before, before), true, "a watchpoint that was already there is still there");
+  const after = [...before, { number: 2, type: 3, enabled: true, tickMark: 2, address: 0x20000010, expression: "0x20000010" }];
+  assert.equal(accessBreakpointCreated(before, after), true, "a new entry means it was created");
+  assert.equal(accessBreakpointCreated(before, before.slice(0, 0)), false, "no entry after the request means nothing was created");
+});
+
+test("a debug session saves a same-project edit session first", async () => {
+  const { projectSessionsToFlush } = await import("../src/embedded/keilSession.ts");
+  const B = String.fromCharCode(92);
+  const project = ["G:", "proj", "USER", "TOUCH.uvprojx"].join(B);
+  const other = ["G:", "proj", "USER", "OTHER.uvprojx"].join(B);
+  const sessions = [
+    { key: "a", project, target: "hardware", debugging: false, openedAt: 1 },
+    { key: "b", project: project.toUpperCase(), target: "hardware", debugging: false, openedAt: 2 },
+    { key: "c", project, target: "hardware", debugging: true, openedAt: 3 },
+    { key: "d", project: other, target: "hardware", debugging: false, openedAt: 4 },
+  ];
+  // Measured: an edit made through `keil_project` lives in that uVision's
+  // memory until it exits, so a debug session opened meanwhile loads the
+  // on-disk project — without the edit. The plain sessions for the same
+  // project are flushed before the debugger starts; a debug session (already
+  // the live one) and another project are left alone.
+  assert.deepEqual(projectSessionsToFlush(sessions, project).map((entry) => entry.key), ["a", "b"]);
+  assert.deepEqual(projectSessionsToFlush(sessions, other).map((entry) => entry.key), ["d"]);
+  assert.deepEqual(projectSessionsToFlush(sessions, ["G:", "elsewhere.uvprojx"].join(B)), []);
+});
+
+test("the trace table reflects what this target actually enumerates", async () => {
+  const { UNSUPPORTED_ON_MDK_5_43 } = await import("../src/embedded/keilExtra.ts");
+  // Re-measured on MDK 5.43a + STM32F429: `DBG_ENUM_VTR` lists CURR_TID,
+  // STCLK, STLINK_PM, CORE_CLK and TRACE_CLK, and `DBG_VTR_GET` answers each of
+  // them. `TRAPS` is **not in the list** and answers `Unknown VTR-name`. A
+  // previous pass took one successful `TRAPS` reply, deleted this entry and
+  // wrote in the docs that `TRAPS = 0x1` — the table was right and the note
+  // was wrong. The entry stays, saying the thing that is true: names outside
+  // the enumeration are refused.
+  const why = UNSUPPORTED_ON_MDK_5_43["DBG_VTR_GET"];
+  assert.ok(why, "names outside the enumeration are refused, and the table says so");
+  assert.match(why, /ENUM_VTR|enumerat/i, `the reason names the enumeration, got ${JSON.stringify(why)}`);
+});
+
+test("run falls back to the command channel when the core does not move", async () => {
+  const { goChannelFor } = await import("../src/embedded/keilSession.ts");
+  // Measured on MDK 5.43a + STM32F429: with the core halted **on** a hardware
+  // breakpoint at `main`, `DBG_START_EXECUTION` answers SUCCESS and no stop
+  // notification ever arrives — three attempts in a row timed out. The
+  // debugger's own command channel, `G`, stops at the same breakpoint within
+  // 0.6 s. So `run` uses the API first and the command channel after it.
+  assert.equal(goChannelFor("api"), "api", "the first path is the API");
+  assert.equal(goChannelFor("api-timed-out"), "command", "a timeout switches to the command channel");
+  assert.equal(goChannelFor("api-failed"), "command", "a refused start switches to the command channel");
+  assert.equal(goChannelFor("command-timed-out"), null, "there is no third path");
+});
+
+test("an image read by fromelf reports its real ZI, not the totals row's zero", async () => {
+  const { parseFromelf } = await import("../src/embedded/build.ts");
+  // Measured on MDK 5.43a, `fromelf --text -z TOUCH.axf`: the per-object row
+  // carries the real ZI (2050364), and the `ROM Totals` row prints 0 in that
+  // column. Taking the totals row at face value reported 108 bytes of RAM for
+  // an image with a 2 MB ZI region — an incremental build that never relinked
+  // prints no linker line, so this was the only figure it had.
+  const output = [
+    "      Code (inc. data)   RO Data    RW Data    ZI Data      Debug   Object Name",
+    "     31978       1164      18842        108    2050364     537275   TOUCH.axf",
+    "     31978       1164      18842        108          0          0   ROM Totals for TOUCH.axf",
+  ].join(String.fromCharCode(10));
+  const usage = parseFromelf(output);
+  assert.equal(usage?.flash, 31978 + 18842);
+  assert.equal(usage?.ram, 108 + 2050364, "RW + ZI from the object row");
+});
+
+test("groups are listed once on a multi-target project", async () => {
+  const { groupsInProject } = await import("../src/embedded/keilSession.ts");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-groups-"));
+  try {
+    mkdirSync(join(dir, "USER"));
+    const project = join(dir, "USER", "P.uvprojx");
+    const target = (name: string) =>
+      "<Target><TargetName>" + name + "</TargetName><Groups>" +
+      "<Group><GroupName>USER</GroupName><Files>" +
+      "<File><FileName>main.c</FileName><FilePath>.\main.c</FilePath></File>" +
+      "</Files></Group>" +
+      "<Group><GroupName>CORE</GroupName><Files></Files></Group>" +
+      "</Groups></Target>";
+    writeFileSync(project, "<Project><Targets>" + target("A") + target("B") + "</Targets></Project>");
+    // Measured on a two-target `.uvprojx`: every target carries its own copy of
+    // the group list, so the plain regex reader returned `USER, CORE` twice.
+    // The active target's list is the one uVision shows.
+    assert.deepEqual(groupsInProject(project), ["USER", "CORE"]);
+    assert.deepEqual(groupsInProject(project, "B"), ["USER", "CORE"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("clean goes through the socket when a session is open", async () => {
+  const { cleanInIde } = await import("../src/embedded/keilSession.ts");
+  // Measured on MDK 5.43a: `PRJ_CLEAN` answers SUCCESS and the same
+  // `0x5001` lines a `-c` run writes, in 0.4 s. The session was already open,
+  // so spawning a second UV4 for `-c` was the slow path for no gain.
+  assert.equal(typeof cleanInIde, "function");
+});
+
+test("a struct or array is reported as an address, not as a value", async () => {
+  const { describeVariableValue } = await import("../src/embedded/keilSession.ts");
+  // Measured on MDK 5.43a: a struct's `value` is `0x20000240 &LTDC_Handler` and
+  // an array's is its first element's address (`0xC0000000`). Printed as a
+  // value, `0xC0000000` reads like the number 3221225472 when it is where the
+  // data lives.
+  assert.equal(
+    describeVariableValue({ name: "LTDC_Handler", value: "0x20000240 &LTDC_Handler", type: "struct __LTDC" }),
+    "struct at 0x20000240 (the address; fields are not listed here)",
+  );
+  assert.equal(
+    describeVariableValue({ name: "ltdc_lcd_framebuf", value: "0xC0000000", type: "ushort[1280][800]", count: 1280 }),
+    "array at 0xC0000000 (1280 element(s); element values are not listed here)",
+  );
+  // A plain scalar keeps its value.
+  assert.equal(describeVariableValue({ name: "uwTick", value: "0x00003039", type: "uint" }), "0x00003039");
+});
+
+test("a stack frame's trailing bytes are source text, not a variable count", async () => {
+  const { parseStackFrames } = await import("../src/embedded/keilSession.ts");
+  // Measured on MDK 5.43a, a 48-byte `0x5015` frame:
+  //   nItem(4)=1  nAdr(8)=0x08006994  nRetAdr(8)=0x08006982  "   dot = ui_tick …
+  // The reader treated offset 20 as `nVars` and reported 840967456 — the first
+  // four bytes of the source line read as an integer. There is no count field
+  // in this record at all.
+  const data = Buffer.alloc(48);
+  data.writeUInt32LE(1, 0);
+  data.writeBigUInt64LE(0x08006994n, 4);
+  data.writeBigUInt64LE(0x08006982n, 12);
+  Buffer.from("   dot = ui_tick", "latin1").copy(data, 20);
+  const frames = parseStackFrames([{ type: 0x5015, echoed: 0, data, raw: data }]);
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0]!.variables, undefined, "no count is reported, so none is invented");
+  assert.equal(frames[0]!.address, 0x08006994);
+  assert.match(frames[0]!.source ?? "", /dot = ui_tick/);
+});
+
+test("an evaluation error is a failure, not a value", async () => {
+  const { evaluationError } = await import("../src/embedded/keilSession.ts");
+  // Measured: both evaluators answer `*** error 34: undefined identifier` with
+  // a caret line above it ("_____^"). The tool printed that as
+  // `uwTick = _____^ *** error 34: undefined identifier`, which reads like a
+  // value that was computed.
+  assert.match(evaluationError("_____^ *** error 34: undefined identifier") ?? "", /undefined identifier/);
+  assert.match(evaluationError("*** error 52: left side of '.' requires struct/union") ?? "", /requires struct\/union/);
+  assert.equal(evaluationError("0x00F42400 16000000"), undefined, "a real answer is not an error");
+  assert.equal(evaluationError("<cannot evaluate>"), "<cannot evaluate>", "the marker is reported as the reason");
+});
+
+test("artifact roots cover every target, not just the first", async () => {
+  const { keilOutputDirs } = await import("../src/embedded/project.ts");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const B = String.fromCharCode(92);
+  const base = mkdtempSync(join(tmpdir(), "prometheus-outdirs-"));
+  try {
+    mkdirSync(join(base, "USER"));
+    // The output directories resolve against the project file's directory.
+    mkdirSync(join(base, "USER", "OBJ"));
+    mkdirSync(join(base, "USER", "OBJ_SIM"));
+    const project = join(base, "USER", "P.uvprojx");
+    writeFileSync(
+      project,
+      "<Project><Targets>" +
+        "<Target><TargetName>A</TargetName><OutputDirectory>." + B + "OBJ" + B + "</OutputDirectory></Target>" +
+        "<Target><TargetName>B</TargetName><OutputDirectory>." + B + "OBJ_SIM" + B + "</OutputDirectory></Target>" +
+        "</Targets></Project>",
+    );
+    // A build with target B current writes to OBJ_SIM. Reading only the first
+    // `<OutputDirectory>` meant the artifact scan never looked there, so a
+    // successful build of the second target reported no image.
+    const dirs = keilOutputDirs(project, base).map((dir) => dir.toLowerCase());
+    assert.ok(dirs.some((dir) => dir.includes("obj_sim")), `expected OBJ_SIM in ${JSON.stringify(dirs)}`);
+    assert.ok(dirs.some((dir) => dir.endsWith("obj")), "and the first target's directory too");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("a read-back only proves the chip changed where the debugger reads real memory", async () => {
+  const { readBackConfirmsChip } = await import("../src/embedded/keilSession.ts");
+  // Measured on STM32F429: writing `de ad be ef` to 0x08000000 answered "wrote
+  // and read them back" in that session; a fresh session read the original
+  // vector table and STM32CubeProgrammer read the original from the chip. So a
+  // match at a flash address says nothing about the chip.
+  assert.equal(readBackConfirmsChip(0x08000000), false, "flash is answered from the debugger's own view");
+  assert.equal(readBackConfirmsChip(0x00000000), false, "the code region includes aliased flash");
+  assert.equal(readBackConfirmsChip(0x20001000), true, "RAM is read straight from the core");
+  assert.equal(readBackConfirmsChip(0xe000ed00), true, "the private peripheral bus too");
 });

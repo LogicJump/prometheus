@@ -190,6 +190,17 @@ export class Repl {
       if (this.shouldExit) break;
     }
     saveSession(this.sessionFile());
+    // A Keil project edit lives in uVision's memory until that process exits,
+    // and nothing else runs after this point in the CLI. Without the close, an
+    // `add_file` someone did five minutes ago is still not in the `.uvprojx`
+    // when the app quits — measured, the file is untouched while the session
+    // is open and written only on a clean exit.
+    const keil = await import("./embedded/keilSession.ts");
+    try {
+      await keil.closeAllKeilSessions();
+    } catch {
+      /* no Keil install, or a session already gone: nothing to save */
+    }
     // The counterpart to SessionStart: cleanup hooks run while the session id
     // is still meaningful, before the lock is released.
     await this.agent.fireSessionHooks("SessionEnd", { sessionId: this.sessionId });

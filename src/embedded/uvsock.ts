@@ -179,8 +179,6 @@ export function statusName(code: number): string {
 
 /** `BKTYPE`: what a breakpoint watches. */
 export const BREAK = { EXEC: 1, READ: 2, WRITE: 3, READWRITE: 4, COMPLEX: 5 } as const;
-/** `CHG_TYPE` for `DBG_CHANGE_BP`. */
-export const CHANGE = { KILL: 1, ENABLE: 2, DISABLE: 3 } as const;
 /** `UV_TARGET_HW` / `UV_TARGET_SIM`, as `PRJ_SET_DEBUG_TARGET` takes them. */
 export const TARGET = { HW: 0, SIM: 1 } as const;
 

@@ -150,6 +150,12 @@ export async function writeRegister(session: KeilSession, name: string, value: s
  * measured as `nID=… | 0 | 0 | 0 | 0x02001001 | 11 | "0x08006BE0" | "int f() "`.
  */
 export async function addWatch(session: KeilSession, expression: string): Promise<{ ok: boolean; id?: number; value?: string; type?: string; message?: string }> {
+  // A session that is not in the debugger at all reports `extended: false`
+  // too, and answering "close it and open it again" sends the caller after the
+  // wrong thing: there is no debugger to add a watch to yet.
+  if (!session.debugging) {
+    return { ok: false, message: "not in debug mode; enter it before adding a watch expression" };
+  }
   if (!session.extended) {
     return {
       ok: false,
@@ -460,9 +466,13 @@ export const UNSUPPORTED_ON_MDK_5_43: Record<string, string> = {
   "DBG_EVAL_EXPRESSION_TO_STR": "never replies; DBG_CALC_EXPRESSION answers the same question",
   "DBG_EVTR_GETSTATUS": "never replies on this build",
   "DBG_ENUM_SYMTP": "needs a symbol-table id the build does not expose; answers PARSE_ERROR",
-  // Re-tested on MDK 5.43a: `TRAPS` answers SUCCESS; only a name that does
-  // not exist answers FAILED 'Unknown VTR-name'. Reading a trace variable by
-  // name works, so this entry was wrong and is gone. (`trace_get` uses it.)
+  // Re-measured on MDK 5.43a + STM32F429. `DBG_ENUM_VTR` lists CURR_TID,
+  // STCLK, STLINK_PM, CORE_CLK and TRACE_CLK, and `VTR_GET` answers every one
+  // of them. `TRAPS` is not in that list and answers `Unknown VTR-name`. One
+  // earlier pass took a single successful `TRAPS` reply, deleted this entry and
+  // wrote into the docs that reading it worked — that note was the mistake, not
+  // the table. The entry is back, saying what is true.
+  "DBG_VTR_GET": "only answers names the target's own DBG_ENUM_VTR lists; any other name, TRAPS included, is refused with 'Unknown VTR-name'",
   "DBG_VERIFY_CODE": "answers FAILED on a simulator target (no flash to verify against)",
   "DBG_FILELINE_TO_ADR": "answers NO_ADRMAP 'Address mapping failed' for both relative and absolute paths",
   "DBG_STEP_INTO_N": "documented as taking no count; the _HLL_N and _INSTRUCTION_N forms work",

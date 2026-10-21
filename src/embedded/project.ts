@@ -14,7 +14,7 @@
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 
 export type ProjectKind =
   | "zephyr"
@@ -245,12 +245,17 @@ export function keilOutputDirs(projectFile: string, root: string): string[] {
   const dirs: string[] = [];
   try {
     const xml = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
-    const match = /<OutputDirectory>([^<]*)<\/OutputDirectory>/.exec(xml);
-    if (match?.[1]?.trim()) {
+    // Every target has its own `<OutputDirectory>`. Reading the first one meant
+    // a build of the second target wrote to `OBJ_SIM\` while the artifact scan
+    // only looked in `OBJ\`, so a successful build reported no image.
+    for (const match of xml.matchAll(/<OutputDirectory>([^<]*)<\/OutputDirectory>/g)) {
+      if (!match[1]?.trim()) continue;
       const output = match[1].trim().replace(/\\/g, "/");
-      // Relative output directories resolve against the project file, not
-      // against the workspace root — that is Keil's own rule.
-      dirs.push(join(projectFile, "..", output));
+      // Relative output directories resolve against the project file's
+      // **directory**, not against the workspace root — that is Keil's own
+      // rule. `join(projectFile, "..", output)` resolved against the file path
+      // itself and produced `<dir>/USER/<dir>`.
+      dirs.push(resolve(dirname(projectFile), output));
     }
   } catch {
     /* an unreadable project is reported by the build itself */
@@ -298,6 +303,43 @@ function readdirSyncSafe(dir: string): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * A project file inside `start`'s own subtree, when walking up from it.
+ *
+ * `findProjectFile` answers for "this directory or one level below", which at
+ * an ancestor of several projects means a sibling. This variant accepts only a
+ * project whose directory is `start` or lies under it, so walking up cannot
+ * re-point detection at a different source tree.
+ */
+function findProjectFileAbove(root: string, start: string, pattern: RegExp): string | null {
+  const under = resolve(start);
+  const candidates = [
+    ...readdirSyncSafe(root)
+      .filter((name) => pattern.test(name) && !/\.(bak|orig|backup|save|tmp)$/i.test(name))
+      .map((name) => join(root, name)),
+    ...readdirSyncSafe(root)
+      .filter((name) => !/^(OBJ|obj|build|Build|DebugConfig|RTE|\.|node_modules)$/.test(name))
+      .flatMap((name) => {
+        const dir = join(root, name);
+        try {
+          if (!statSync(dir).isDirectory()) return [];
+        } catch {
+          return [];
+        }
+        return readdirSyncSafe(dir)
+          .filter((entry) => pattern.test(entry) && !/\.(bak|orig|backup|save|tmp)$/i.test(entry))
+          .map((entry) => join(dir, entry));
+      }),
+  ];
+  const inside = candidates.filter((path) => insideRoot(resolve(path, ".."), under));
+  return inside.sort((a, b) => a.localeCompare(b))[0] ?? null;
+}
+
+/** True when `candidate` is `root` or under it, compared as whole segments. */
+function insideRoot(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${sep}`);
 }
 
 /** Detect from the given directory upward, stopping at the first strong match. */
@@ -358,9 +400,18 @@ export function detectProject(start = process.cwd()): DetectedProject {
     // `MDK-ARM\`, `Project\`). Looking only at the directory itself found
     // nothing on a real project whose root holds CORE/HALLIB/OBJ and whose
     // `.uvprojx` lives one level down.
-    const vendor = findProjectFile(dir, /\.uvprojx?$|\.ewp$/i);
+    //
+    // But the search must stay **below** `dir` on the way up: `findProjectFile`
+    // also looks one level down, so at an ancestor that is the parent of
+    // several projects it answers with a sibling's `.uvprojx`. Measured: a
+    // directory with no project of its own was detected as a Keil project
+    // pointing at another project in an unrelated tree, and `keil_project`
+    // then read and edited that one. Only `start` itself may look downward —
+    // that is the "run from the repository root" case the downward search is
+    // for; an ancestor may only match a project that *contains* `start`.
+    const vendor = dir === start ? findProjectFile(dir, /\.uvprojx?$|\.ewp$/i) : findProjectFileAbove(dir, start, /\.uvprojx?$|\.ewp$/i);
     if (vendor) {
-      const name = vendor.slice(vendor.lastIndexOf("\\") + 1);
+      const name = vendor.split(/[\\/]/).pop() ?? vendor;
       const kind = /\.ewp$/i.test(vendor) ? "iar" : "keil";
       // The file path is carried on the result: a Keil debug session opens the
       // project, not the directory, and the caller should not have to repeat

@@ -575,6 +575,14 @@ if (positionals.length > 0) {
     const { finishWorker } = await import("../src/workers.ts");
     finishWorker(values["worker-id"], failure ? "failed" : "done", failure ?? "turn finished");
   }
+  // A Keil project edit lives in uVision's memory until that process exits;
+  // a one-shot run that edited a project and then quit left the edit behind.
+  try {
+    const keil = await import("../src/embedded/keilSession.ts");
+    await keil.closeAllKeilSessions();
+  } catch {
+    /* no Keil install, or no session was opened */
+  }
   await agent.fireSessionHooks("SessionEnd", { sessionId: oneShotId });
   const { saveSession } = await import("../src/sessions.ts");
   // `--ephemeral` means "nothing on disk": a run that is a probe, a smoke

@@ -334,22 +334,32 @@ export function parseFromelf(output: string): MemoryUsage | undefined {
     const [, code, ro, rw, zi] = program.map(Number);
     return { flash: code + ro, ram: rw + zi, sections: [] };
   }
-  for (const line of output.split(/\r?\n/)) {
-    if (!/ROM\s+Totals/i.test(line)) continue;
-    const numbers = line
-      .replace(/ROM\s+Totals.*$/i, "")
+  // `ROM Totals` prints **0** in the ZI column; the per-object row above it is
+  // where the real figure is. Measured on `fromelf --text -z TOUCH.axf`:
+  //
+  //      31978  1164  18842  108  2050364  537275  TOUCH.axf
+  //      31978  1164  18842  108        0       0  ROM Totals for TOUCH.axf
+  //
+  // so RAM read from the totals row was 108 bytes instead of 2 MB. The totals
+  // row is used for flash only, and ZI is taken from the object row.
+  const row = (line: string) =>
+    line
+      .replace(/(ROM\s+Totals|Object\s+Name).*$/i, "")
       .match(/[\d,]+/g)
       ?.map((value) => Number(value.replace(/,/g, "")))
-      .filter((value) => Number.isFinite(value));
-    if (!numbers || numbers.length < 5) continue;
-    const [code, , roData, rwData, ziData] = numbers;
-    return {
-      flash: code + roData,
-      ram: rwData + ziData,
-      sections: [],
-    };
+      .filter((value) => Number.isFinite(value)) ?? [];
+  let totals: number[] | undefined;
+  let objectRow: number[] | undefined;
+  for (const line of output.split(/\r?\n/)) {
+    if (/ROM\s+Totals/i.test(line)) totals = row(line);
+    else if (!objectRow && /\.axf|\.elf|\.out/i.test(line) && row(line).length >= 5) objectRow = row(line);
   }
-  return undefined;
+  if (!totals || totals.length < 5) return undefined;
+  const [code, , roData, rwData] = totals;
+  // Both rows have six numbers — Code, the "(inc. data)" subtotal, RO Data,
+  // RW Data, ZI Data, Debug — so ZI is index 4, not 3.
+  const zi = objectRow && objectRow.length >= 5 ? objectRow[4] : totals[4];
+  return { flash: code + roData, ram: rwData + (zi || 0), sections: [] };
 }
 
 /**

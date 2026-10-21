@@ -36,6 +36,7 @@ import {
   buildInIde,
   cancelBuild,
   changeBreakpoint,
+  cleanInIde,
   closeKeilSession,
   verifyFlash,
   currentLocation,
@@ -46,6 +47,7 @@ import {
   flashInIde,
   getOption,
   getOutputName,
+  sameOutputName,
   halt,
   imageLocation,
   listBreakpoints,
@@ -60,6 +62,8 @@ import {
   readStack,
   readTasks,
   readVariables,
+  describeVariableValue,
+  evaluationError,
   readVtr,
   readNamedRegisters,
   readScvdFiles,
@@ -143,23 +147,30 @@ async function closeAndReport(cwd: string): Promise<ToolResult> {
   // list. Only after uVision exits does the group appear. So an edit that is
   // reported as made is not on disk until this runs, and a close that changed
   // nothing is reported as such rather than assumed to have saved.
-  const projectFile = detectProject(cwd).file;
-  const before = projectFile && existsSync(projectFile) ? readFileSync(projectFile) : null;
+  //
+  // The file to watch is the one the **open sessions** were opened on, not
+  // whatever detection answers now: a session started with an explicit
+  // `project` argument can point outside `cwd`, and detection would then
+  // compare the wrong file and report "unchanged" about a project nobody
+  // touched.
+  const watched = [...new Set(listKeilSessions().map((entry) => entry.project))];
+  const fallback = detectProject(cwd).file;
+  const files = (watched.length > 0 ? watched : fallback ? [fallback] : []).filter((file) => existsSync(file));
+  const before = new Map(files.map((file) => [file, readFileSync(file)]));
   let closed = 0;
   for (const entry of listKeilSessions()) if (await closeKeilSession(entry.key)) closed++;
-  const after = projectFile && existsSync(projectFile) ? readFileSync(projectFile) : null;
-  const saved = Boolean(before && after && !before.equals(after));
-  return {
-    content: [
-      `closed ${closed} Keil session(s)`,
-      saved
-        ? `wrote ${projectFile}`
-        : projectFile
-          ? `${projectFile} is unchanged; there were no edits to write, or they were already on disk`
-          : "no .uvprojx was found, so there was nothing to write",
-    ].join("\n"),
-    display: "closed",
-  };
+  const lines = [`closed ${closed} Keil session(s)`];
+  if (files.length === 0) {
+    lines.push("no .uvprojx is known — no session was open and none was detected — so there was nothing to write");
+  }
+  for (const file of files) {
+    const after = existsSync(file) ? readFileSync(file) : null;
+    const previous = before.get(file)!;
+    if (!after) lines.push(`${file} disappeared while the session closed`);
+    else if (!previous.equals(after)) lines.push(`wrote ${file}`);
+    else lines.push(`${file} is unchanged; there were no edits to write, or they were already on disk`);
+  }
+  return { content: lines.join("\n"), display: "closed" };
 }
 
 /** The stop, in the words a person would use. */
@@ -173,6 +184,36 @@ function describeStop(info: { stopped: boolean; reason?: string; reasonCode?: nu
   }
   for (const line of info.output) lines.push(`  ${line}`);
   return lines;
+}
+
+/**
+ * Why a run that never stopped is a failure, in one line.
+ *
+ * `run` is "execute until something stops it". A target that is still running
+ * when the wait expires has not done what was asked, so reporting the call as
+ * a success told the caller "fine" about a program that is still going. The
+ * message says what is true instead: it is running, and there was no stop.
+ */
+function didNotStop(
+  info: { stopped: boolean; reason?: string },
+  context?: { pcBefore?: number; pcAfter?: number; breakpoints?: { address?: number }[] },
+): string | undefined {
+  if (info.stopped) return undefined;
+  const why = info.reason ?? "no stop notification arrived";
+  // Measured: a core halted **on** a breakpoint often does not move when told
+  // to run, and uVision sends no stop frame at all — the PC before and after
+  // are the same address, and that address has a breakpoint on it. Naming that
+  // turns "it did not stop" into something the caller can act on.
+  const stuck = context?.pcBefore !== undefined && context.pcAfter !== undefined && context.pcBefore === context.pcAfter;
+  const onBreakpoint = stuck && (context?.breakpoints ?? []).some((entry) => entry.address === context?.pcAfter);
+  if (onBreakpoint) {
+    return (
+      `the target did not stop: ${why}. The core is halted at ${hex(context!.pcAfter!)} and did not move — ` +
+      "a breakpoint sits on exactly that address, so it stops again the instant execution starts. " +
+      "Step once (`step` / `step_instruction`) to leave it, or delete that breakpoint, then run."
+    );
+  }
+  return `the target did not stop: ${why}. It may still be running — halt it, or set a breakpoint it will reach.`;
 }
 
 // ---- keil_debug ------------------------------------------------------------
@@ -236,6 +277,8 @@ const keilDebugTool: Tool = {
           "clean_rebuild",
           "export_cprj",
           "symbols",
+          "symbols_all",
+          "export_cprjs",
           "convert",
           "flash",
           "erase",
@@ -289,12 +332,25 @@ const keilDebugTool: Tool = {
     // the plain session, which is the same one `keil_project` edits through.
     // Everything else here is a debugger operation and needs the debug session.
     const projectAction = action === "build" || action === "rebuild" || action === "flash" || action === "erase";
+    // `clean`, `clean_rebuild`, `export_cprj`, `symbols` and `convert` are one
+    // UV4 command-line run each; they do not need a debugger, and entering one
+    // first makes them fail on a machine with no image to load ("Flash
+    // Download failed — Could not load file"). Measured: `convert` on a clean
+    // tree reported that failure before ever reaching the conversion.
+    const cliAction =
+      action === "clean" ||
+      action === "clean_rebuild" ||
+      action === "export_cprj" ||
+      action === "export_cprjs" ||
+      action === "symbols" ||
+      action === "symbols_all" ||
+      action === "convert";
     // `keil_project action: "close"` and `keil_debug action: "close_project"`
     // close both sessions, and need no new one.
     if (action === "close_project") {
       return closeAndReport(ctx.cwd);
     }
-    const opened = await sessionFor(input, ctx.cwd, projectAction ? { connectOnly: true } : {});
+    const opened = await sessionFor(input, ctx.cwd, projectAction || cliAction ? { connectOnly: true } : {});
     if (!opened.ok) return { isError: true, content: opened.content, display: "Keil unavailable" };
     const session = opened.session;
     // The debug session and the project session are two uVision instances on
@@ -306,6 +362,15 @@ const keilDebugTool: Tool = {
       // repeating it on every action buries the answer.
       const lines: string[] = [];
       const location = input.location ? String(input.location) : "";
+      // Some failures are only known after the debugger's own words have been
+      // collected into `lines` (a refused delete, an erase that never answers).
+      // Marking them here keeps the single return at the end of the action
+      // honest instead of forcing every branch to build its own result.
+      let failure: string | undefined;
+      const fail = (reason: string) => {
+        failure = reason;
+        lines.push(reason);
+      };
 
       if (action === "open") {
         // Re-entering after `EXIT` from the command window: the session was
@@ -323,7 +388,17 @@ const keilDebugTool: Tool = {
         lines.push(`target: ${session.target}`);
         if (where) lines.push(`pc: ${hex(where.address)}${where.file ? ` (${where.file}:${where.line ?? "?"})` : ""}`);
       } else if (action === "run" || action === "continue") {
-        lines.push(...describeStop(await run(session, Number(input.timeout_ms ?? 30_000))));
+        const pcBefore = (await currentLocation(session))?.address;
+        const ran = await run(session, Number(input.timeout_ms ?? 30_000));
+        lines.push(...describeStop(ran));
+        if (!ran.stopped) {
+          const stalled = didNotStop(ran, {
+            ...(pcBefore !== undefined ? { pcBefore } : {}),
+            ...((await currentLocation(session))?.address !== undefined ? { pcAfter: (await currentLocation(session))!.address } : {}),
+            breakpoints: await listBreakpoints(session),
+          });
+          if (stalled) fail(stalled);
+        }
         const where = await currentLocation(session);
         if (where) lines.push(`at ${describeWhere(where)}`);
       } else if (action === "reset") {
@@ -332,20 +407,29 @@ const keilDebugTool: Tool = {
       } else if (action === "run_to") {
         const address = Number(input.address);
         if (!Number.isFinite(address)) return { isError: true, content: "run_to needs an `address`.", display: "missing address" };
-        lines.push(...describeStop(await runToAddress(session, address, (_session, mark, timeoutMs) => waitForStop(session, mark, timeoutMs), Number(input.timeout_ms ?? 30_000))));
+        const reached = await runToAddress(session, address, (_session, mark, timeoutMs) => waitForStop(session, mark, timeoutMs), Number(input.timeout_ms ?? 30_000));
+        lines.push(...describeStop(reached));
+        const missed = didNotStop(reached);
+        if (missed) fail(`the target never reached ${hex(address)}: ${missed}`);
         const where = await currentLocation(session);
         if (where) lines.push(`at ${describeWhere(where)}`);
       } else if (action === "halt") {
         lines.push(...describeStop(await halt(session)));
       } else if (action === "step" || action === "step_into" || action === "step_instruction" || action === "step_out") {
         const kind = action === "step" ? "over" : action === "step_into" ? "into" : action === "step_instruction" ? "instruction" : "out";
-        lines.push(...describeStop(await step(session, kind, Number(input.timeout_ms ?? 15_000))));
+        const stepped = await step(session, kind, Number(input.timeout_ms ?? 15_000));
+        lines.push(...describeStop(stepped));
+        const stuck = didNotStop(stepped);
+        if (stuck) fail(stuck);
         const where = await currentLocation(session);
         if (where) lines.push(`at ${describeWhere(where)}`);
       } else if (action === "step_many") {
         const steps = Math.max(1, Math.min(1000, Number(input.count ?? 1)));
         const kind = input.width === "u8" ? "instruction" : "line";
-        lines.push(...describeStop(await stepMany(session, steps, kind, (_session, mark, timeoutMs) => waitForStop(session, mark, timeoutMs))));
+        const many = await stepMany(session, steps, kind, (_session, mark, timeoutMs) => waitForStop(session, mark, timeoutMs));
+        lines.push(...describeStop(many));
+        const short = didNotStop(many);
+        if (short) fail(short);
         const where = await currentLocation(session);
         if (where) lines.push(`at ${describeWhere(where)}`);
       } else if (action === "breakpoints") {
@@ -374,7 +458,19 @@ const keilDebugTool: Tool = {
           );
         } else {
           const reply = await addAccessBreakpoint(session, location, kind as "read" | "write" | "readwrite", Number(input.width === "u8" ? 1 : input.width === "u16" ? 2 : 4));
-          lines.push(reply.ok ? `breakpoint set on ${location}` : `could not set it: ${reply.message ?? reply.statusName}`);
+          // The reply is SUCCESS for an expression the debugger could not
+          // resolve — measured with `uwTick`, where nothing was created. A
+          // watchpoint's address form (`0x20000000`) is the one that works.
+          if (!reply.created) {
+            return {
+              isError: true,
+              content:
+                `uVision answered ${reply.statusName} but created no ${kind} watchpoint on ${location}. ` +
+                "It accepts a literal address here; a symbol name is evaluated as a C expression and can produce nothing.",
+              display: "watchpoint not created",
+            };
+          }
+          lines.push(`breakpoint set on ${location}`);
         }
       } else if (action === "breakpoint_delete") {
         // `location` carries the breakpoint number (`#2` or `2`), which is
@@ -388,16 +484,40 @@ const keilDebugTool: Tool = {
         }
         const target = list.find((entry) => entry.number === requested);
         if (!target) return { isError: true, content: `there is no breakpoint ${requested}; the list has ${list.length}.`, display: "not found" };
+        // The reply is the only evidence the delete happened — the list is
+        // re-read rather than assumed, because `BP_NOTFOUND` is a failure that
+        // otherwise reads exactly like a delete that worked.
         const changed = await changeBreakpoint(session, target.tickMark, 1);
+        if (!changed.ok) {
+          return { isError: true, content: `could not delete breakpoint ${requested}: ${changed.message ?? changed.statusName}`, display: "delete refused" };
+        }
+        const remaining = await listBreakpoints(session);
+        if (remaining.some((entry) => entry.tickMark === target.tickMark)) {
+          return {
+            isError: true,
+            content: `the debugger accepted the delete of breakpoint ${requested} but still lists it.`,
+            display: "delete did not take",
+          };
+        }
+        lines.push(`deleted breakpoint ${requested}${target.expression ? ` (${target.expression})` : ""}`);
       } else if (action === "watch_remove") {
         if (!location) return { isError: true, content: "watch_remove needs the `location` expression that was added.", display: "missing expression" };
         const reply = await removeWatch(session, location);
-        lines.push(reply.ok ? `removed watch ${location}` : `could not remove it: ${reply.message ?? reply.statusName}`);
+        if (reply.ok) lines.push(`removed watch ${location}`);
+        else fail(`could not remove it: ${reply.message ?? reply.statusName}`);
       } else if (action === "watch_add") {
         if (!location) return { isError: true, content: "watch_add needs a `location` expression.", display: "missing expression" };
         const watched = await addWatch(session, location);
         if (!watched.ok) return { isError: true, content: `could not watch ${location}: ${watched.message ?? "no reason given"}`, display: "watch refused" };
-        lines.push(`watching ${location}${watched.value ? ` = ${watched.value}` : ""}${watched.type ? ` (${watched.type.trim()})` : ""}${watched.id !== undefined ? ` — watch #${watched.id}` : ""}`);
+        // The handle uVision returns is a pointer into its own watch list
+        // (`0x117b0708`), not a small index a person would recognise, and
+        // `watch_remove` takes the expression rather than this number. It is
+        // said here only so the reply matches the field, not as something to
+        // retype.
+        lines.push(
+          `watching ${location}${watched.value ? ` = ${watched.value}` : ""}${watched.type ? ` (${watched.type.trim()})` : ""}` +
+            `${watched.id !== undefined ? ` [debugger handle ${watched.id}]` : ""}. Remove it with \`watch_remove\` and the same expression.`,
+        );
       } else if (action === "registers") {
         const list = await readRegisters(session);
         if (list.length === 0) lines.push("(no registers reported)");
@@ -431,7 +551,9 @@ const keilDebugTool: Tool = {
         }
         for (const entry of list.slice(0, 200)) {
           const size = entry.count > 0 ? `[${entry.count}]` : "";
-          lines.push(`${entry.name}${size}${entry.type ? `: ${entry.type}` : ""} = ${entry.value}${entry.editable === false ? " (read-only)" : ""}`);
+          lines.push(
+            `${entry.name}${size}${entry.type ? `: ${entry.type}` : ""} = ${describeVariableValue(entry)}${entry.editable === false ? " (read-only)" : ""}`,
+          );
         }
         if (list.length > 200) lines.push(`… and ${list.length - 200} more`);
         if (frame === 0 && list.length > 0) lines.push("", "pass `frame` to list the locals of a stack frame instead of the globals");
@@ -442,9 +564,10 @@ const keilDebugTool: Tool = {
           const source = await addressToSource(session, frame.address);
           const fn = source?.function ? `${source.function} ` : "";
           const where = source?.file ? `${source.file}:${source.line ?? "?"}` : hex(frame.address);
-          // `variables: 0` is what the debugger reports on this build even
-          // inside a function, so it is not printed as if it meant something.
-          lines.push(`#${frame.level} ${fn}${where}  (${hex(frame.address)})`);
+          // The debugger attaches the source line to the frame; it is the one
+          // thing `addressToSource` cannot supply from an inline function.
+          const hint = frame.source ? `  ${frame.source}` : "";
+          lines.push(`#${frame.level} ${fn}${where}  (${hex(frame.address)})${hint}`);
         }
       } else if (action === "where") {
         const where = await currentLocation(session);
@@ -492,12 +615,15 @@ const keilDebugTool: Tool = {
         // `CALC_EXPRESSION` is the interface's own evaluator; the command
         // window is the fallback for forms it refuses.
         const direct = await evaluate(session, expression);
-        if (direct.ok) {
+        const directError = direct.ok ? evaluationError(direct.text ?? "") : direct.message;
+        if (direct.ok && directError === undefined) {
           const rendered = direct.text && direct.text !== expression ? direct.text : `0x${(direct.value ?? 0n).toString(16)}`;
           lines.push(`${expression} = ${rendered}${direct.value !== undefined ? ` (${direct.value})` : ""}`);
         } else {
           const viaWindow = await evalInWindow(session, expression);
-          lines.push(viaWindow.ok ? `${expression} = ${viaWindow.value}` : `the debugger could not evaluate ${expression}: ${direct.message ?? viaWindow.lines.join(" ")}`);
+          const windowError = evaluationError(viaWindow.value ?? "");
+          if (viaWindow.ok && windowError === undefined) lines.push(`${expression} = ${viaWindow.value}`);
+          else fail(`the debugger could not evaluate ${expression}: ${directError ?? windowError ?? viaWindow.lines.join(" ")}`);
         }
       } else if (action === "command") {
         const typed = input.command ? String(input.command) : "";
@@ -556,7 +682,8 @@ const keilDebugTool: Tool = {
           const id = Number(input.count ?? input.value ?? -1);
           if (!Number.isFinite(id) || id < 0) return { isError: true, content: "menu_exec needs a menu `id` from the `menus` list.", display: "missing id" };
           const reply = await execMenu(session, id);
-          lines.push(reply.ok ? `ran menu ${id}` : `could not run it: ${reply.message ?? reply.statusName}`);
+          if (reply.ok) lines.push(`ran menu ${id}`);
+          else fail(`could not run it: ${reply.message ?? reply.statusName}`);
         }
       } else if (action === "time") {
         const clock = await timeInfo(session);
@@ -586,7 +713,8 @@ const keilDebugTool: Tool = {
       } else if (action === "window") {
         const state = (input.window as "show" | "hide" | "minimize" | undefined) ?? "hide";
         const reply = await windowState(session, state);
-        lines.push(reply.ok ? `uVision window: ${state}` : `could not change it: ${reply.message ?? reply.statusName}`);
+        if (reply.ok) lines.push(`uVision window: ${state}`);
+        else fail(`could not change it: ${reply.message ?? reply.statusName}`);
       } else if (action === "trace_set") {
         const name = input.location ? String(input.location) : "";
         if (!name) return { isError: true, content: "trace_set needs a `location` naming the trace variable.", display: "missing name" };
@@ -594,7 +722,8 @@ const keilDebugTool: Tool = {
         if (!reply.ok) return { isError: true, content: `could not enable ${name}: ${reply.message ?? reply.statusName}`, display: "trace refused" };
         // `SUCCESS` is not the claim being made — "enabled" is. Read it back.
         const after = await readVtrValue(session, name);
-        lines.push(after.ok ? `trace variable ${name} = ${after.value}` : `the debugger accepted the change but would not read it back`);
+        if (after.ok) lines.push(`trace variable ${name} = ${after.value}`);
+        else fail(`the debugger accepted the change to ${name} but would not read it back`);
       } else if (action === "tasks") {
         const tasks = await readTasks(session);
         lines.push(
@@ -608,11 +737,8 @@ const keilDebugTool: Tool = {
       } else if (action === "trace_get") {
         if (!location) return { isError: true, content: "trace_get needs a `location` naming the trace variable.", display: "missing name" };
         const read = await readVtrValue(session, location);
-        lines.push(
-          read.ok
-            ? `${location} = ${read.value}`
-            : `could not read ${location}: ${read.message ?? "no reason given"}`,
-        );
+        if (read.ok) lines.push(`${location} = ${read.value}`);
+        else fail(`could not read ${location}: ${read.message ?? "no reason given"}`);
       } else if (action === "itm") {
         // `count` carries the channel number; `value` 0 turns it off.
         const channel = Number(input.count ?? -1);
@@ -621,7 +747,8 @@ const keilDebugTool: Tool = {
         }
         const enable = input.value === undefined ? true : Number(input.value) !== 0;
         const reply = await registerItm(session, channel, enable);
-        lines.push(reply.ok ? `ITM stimulus port ${channel} ${enable ? "enabled" : "disabled"}` : `could not change it: ${reply.message ?? reply.statusName}`);
+        if (reply.ok) lines.push(`ITM stimulus port ${channel} ${enable ? "enabled" : "disabled"}`);
+        else fail(`could not change it: ${reply.message ?? reply.statusName}`);
       } else if (action === "event_recorder") {
         const enable = input.value === undefined ? true : Number(input.value) !== 0;
         const reply = await setEventRecorder(session, enable);
@@ -635,20 +762,29 @@ const keilDebugTool: Tool = {
         const address = Number(input.address);
         if (!Number.isFinite(address)) return { isError: true, content: "show_code needs an `address`.", display: "missing address" };
         const reply = await showCodeAt(session, address, input.width !== "u8");
-        lines.push(reply.ok ? `the editor was asked to show ${hex(address)}` : `could not show it: ${reply.message ?? reply.statusName}`);
-      } else if (action === "clean" || action === "clean_rebuild" || action === "export_cprj" || action === "symbols" || action === "convert") {
+        if (reply.ok) lines.push(`the editor was asked to show ${hex(address)}`);
+        else fail(`could not show it: ${reply.message ?? reply.statusName}`);
+      } else if (action === "clean") {
+        // The session is already open and `PRJ_CLEAN` does the same job in
+        // 0.4 s; a second UV4 for `-c` was the slow path.
+        const cleaned = await cleanInIde(session);
+        lines.push(...cleaned.lines.slice(-20));
+        if (!cleaned.ok) fail(`the clean failed (uVision build code ${cleaned.status})`);
+      } else if (action === "clean_rebuild" || action === "export_cprj" || action === "export_cprjs" || action === "symbols" || action === "symbols_all" || action === "convert") {
         // These are the rest of UV4's documented switches; each is one headless
         // run, so the build's log/exit-code reading applies unchanged.
         const operation =
-          action === "clean"
-            ? "clean"
-            : action === "clean_rebuild"
-              ? "clean-rebuild"
-              : action === "export_cprj"
-                ? "export-cprj"
+          action === "clean_rebuild"
+            ? "clean-rebuild"
+            : action === "export_cprj"
+              ? "export-cprj"
+              : action === "export_cprjs"
+                ? "export-cprjs"
                 : action === "symbols"
                   ? "symbols"
-                  : "convert";
+                  : action === "symbols_all"
+                    ? "symbols-all"
+                    : "convert";
         const result = await keilCli({
           cwd: ctx.cwd,
           operation,
@@ -656,8 +792,8 @@ const keilDebugTool: Tool = {
           ...(session.project ? { project: session.project } : {}),
           ...(input.target ? { target: String(input.target) } : {}),
         });
-        lines.push(`${operation}: ${result.ok ? "done" : "failed"} (exit ${result.exitCode}, ${result.durationMs} ms)`);
-        if (result.reason) lines.push(`reason: ${result.reason}`);
+        if (result.ok) lines.push(`${operation}: done (exit ${result.exitCode}, ${result.durationMs} ms)`);
+        else fail(`${operation}: failed (exit ${result.exitCode}, ${result.durationMs} ms)${result.reason ? ` — ${result.reason}` : ""}`);
         if (result.produced.length > 0) lines.push(`wrote: ${result.produced.join(", ")}`);
         if (result.log) lines.push(...result.log.split(String.fromCharCode(10)).slice(-12));
       } else if (action === "build" || action === "rebuild") {
@@ -671,16 +807,21 @@ const keilDebugTool: Tool = {
       } else if (action === "flash") {
         const flashed = await flashInIde(session);
         lines.push(...flashed.lines.slice(-30));
-        if (!flashed.ok) lines.push("the download did not finish cleanly");
-        else {
+        if (!flashed.ok) {
+          fail("the download did not finish cleanly");
+        } else {
           lines.push("downloaded to flash");
           // The downloader says "Verify OK"; this is the chip's own answer.
           // The 4824 session is not a debug session, so the comparison needs
           // the debugger — a second session on the debug port, read-only.
-          const hexName = `${basename(session.project, extname(session.project))}.hex`;
-          const hex = keilOutputDirs(session.project, ctx.cwd)
-            .map((dir) => join(dir, hexName))
-            .find((path) => existsSync(path));
+          const name = `${basename(session.project, extname(session.project))}`;
+          const dirs = keilOutputDirs(session.project, ctx.cwd);
+          // A project without "Create HEX File" produces only the `.axf`. The
+          // comparison used to be skipped outright in that case; `fromelf` can
+          // render the same image the `.hex` would contain.
+          const hex =
+            dirs.map((dir) => join(dir, `${name}.hex`)).find((path) => existsSync(path)) ??
+            dirs.map((dir) => join(dir, `${name}.axf`)).find((path) => existsSync(path));
           if (hex) {
             const check = await openKeilSession({ cwd: ctx.cwd, project: session.project, target: "hardware", port: 4823, timeoutMs: 40_000 });
             if (check.ok && check.session) {
@@ -694,16 +835,27 @@ const keilDebugTool: Tool = {
               lines.push(`flash check: skipped — the debugger could not be opened to read the chip back (${check.reason ?? "no session"})`);
             }
           } else {
-            lines.push("flash check: skipped — the build produced no .hex to compare against");
+            lines.push("flash check: skipped — the build produced no .hex or .axf to compare against");
           }
         }
       } else if (action === "erase") {
         const erased = await eraseFlash(session);
-        lines.push(erased.ok ? "flash erase accepted by the configured algorithm" : `erase failed: ${erased.message ?? erased.statusName}`);
+        if (!erased.ok) {
+          return {
+            isError: true,
+            content: `erase failed: ${erased.message ?? erased.statusName}`,
+            display: "erase failed",
+          };
+        }
+        lines.push("flash erase accepted by the configured algorithm");
       } else {
         return { isError: true, content: `unknown action \`${action}\``, display: "unknown action" };
       }
-      return { content: lines.join("\n") || "(no output)", display: `keil: ${action}` };
+      return {
+        ...(failure ? { isError: true } : {}),
+        content: lines.join("\n") || "(no output)",
+        display: failure ? `keil: ${action} failed` : `keil: ${action}`,
+      };
     } finally {
       // Sessions are kept open deliberately: re-entering debug mode re-flashes
       // the target and drops every breakpoint, which would make a
@@ -759,6 +911,13 @@ const keilProjectTool: Tool = {
     const session = opened.session;
     const group = input.group ? String(input.group) : "";
     const lines: string[] = [];
+    // A project operation that the debugger refused is a failed call, not a
+    // successful one with a sad sentence in it.
+    let failure: string | undefined;
+    const fail = (reason: string) => {
+      failure = reason;
+      lines.push(reason);
+    };
 
     if (action === "info") {
       lines.push(`project: ${session.project}`);
@@ -782,17 +941,22 @@ const keilProjectTool: Tool = {
       if (!group) return { isError: true, content: "files needs a `group`.", display: "missing group" };
       // The project file is where uVision itself keeps the list, and it is
       // readable without an entered debugger — which `PRJ_ENUM_FILES` needs.
-      const files = filePathsInGroup(session.project, group);
+      // Read the active target's block: a multi-target project lists one set
+      // of groups per target, and the debugger's "current" one is what the
+      // user means by "this project".
+      const files = filePathsInGroup(session.project, group, (await currentTarget(session)) || undefined);
       lines.push(files.length > 0 ? files.map((entry) => entry.path || entry.name).join("\n") : `(no files in ${group})`);
     } else if (action === "add_group") {
       if (!group) return { isError: true, content: "add_group needs a `group` name.", display: "missing group" };
       const reply = await addGroup(session, group);
-      lines.push(reply.ok ? `added group ${group}` : `could not add it: ${reply.message ?? reply.statusName}`);
+      if (reply.ok) lines.push(`added group ${group}`);
+      else fail(`could not add it: ${reply.message ?? reply.statusName}`);
     } else if (action === "add_file") {
       const file = input.file ? String(input.file) : "";
       if (!group || !file) return { isError: true, content: "add_file needs a `group` and a `file`.", display: "missing argument" };
       const reply = await addFile(session, group, file);
-      lines.push(reply.ok ? `added ${file} to ${group}` : `could not add it: ${reply.message ?? reply.statusName}`);
+      if (reply.ok) lines.push(`added ${file} to ${group}`);
+      else fail(`could not add it: ${reply.message ?? reply.statusName}`);
     } else if (action === "remove_file") {
       const file = input.file ? String(input.file) : "";
       if (!group || !file) return { isError: true, content: "remove_file needs a `group` and a `file`.", display: "missing argument" };
@@ -801,7 +965,7 @@ const keilProjectTool: Tool = {
       // `{"CORE", "../CORE/startup.s"}` removed `startup.s` no matter which
       // group was named. Resolving the exact entry first is what keeps a
       // request for one file from deleting another with the same base name.
-      const listed = filePathsInGroup(session.project, group);
+      const listed = filePathsInGroup(session.project, group, (await currentTarget(session)) || undefined);
       const base = file.split(/[\\/]/).pop() ?? file;
       const normalize = (text: string) => text.replace(/\//g, "\\").toLowerCase();
       const match =
@@ -817,21 +981,35 @@ const keilProjectTool: Tool = {
         };
       }
       const reply = await removeFile(session, group, match.name);
-      lines.push(reply.ok ? `removed ${match.name} from ${group}` : `could not remove it: ${reply.message ?? reply.statusName}`);
+      if (reply.ok) lines.push(`removed ${match.name} from ${group}`);
+      else fail(`could not remove it: ${reply.message ?? reply.statusName}`);
     } else if (action === "remove_group") {
       if (!group) return { isError: true, content: "remove_group needs a `group`.", display: "missing group" };
       const reply = await removeGroup(session, group);
-      lines.push(reply.ok ? `removed group ${group}` : `could not remove it: ${reply.message ?? reply.statusName}`);
+      if (reply.ok) lines.push(`removed group ${group}`);
+      else fail(`could not remove it: ${reply.message ?? reply.statusName}`);
     } else if (action === "get_option") {
       const option = (input.option ? String(input.option) : "CDEF") as OptionName;
       const result = await getOption(session, option, input.target ? String(input.target) : undefined);
-      lines.push(result.ok ? `${option}: ${result.values.join(", ") || "(empty)"}` : `could not read it: ${result.message}`);
+      if (result.ok) lines.push(`${option}: ${result.values.join(", ") || "(empty)"}`);
+      else fail(`could not read it: ${result.message}`);
     } else if (action === "set_option") {
       const option = (input.option ? String(input.option) : "") as OptionName;
       if (!option) return { isError: true, content: "set_option needs an `option`.", display: "missing option" };
       const value = input.value !== undefined ? String(input.value) : "";
       const reply = await setOption(session, option, value, input.target ? String(input.target) : undefined);
-      lines.push(reply.ok ? `${option} set to ${value || "(empty)"}` : `could not set it: ${reply.message ?? reply.statusName}`);
+      if (!reply.ok) fail(`could not set it: ${reply.message ?? reply.statusName}`);
+      else {
+        // The reply is not the state. `REGISTER_SET` and `PRJ_SET_OUTPUTNAME`
+        // both answer SUCCESS without writing anything, so a project option is
+        // read back too rather than trusted because the call returned.
+        const stored = await getOption(session, option, input.target ? String(input.target) : undefined);
+        if (stored.ok && stored.values.join(", ").trim() !== value.trim()) {
+          fail(`the debugger accepted it but reads back ${JSON.stringify(stored.values.join(", ") || "(empty)")}, not ${JSON.stringify(value)}`);
+        } else {
+          lines.push(`${option} set to ${stored.ok ? stored.values.join(", ") : value || "(empty)"}`);
+        }
+      }
     } else if (action === "set_target") {
       const target = input.target ? String(input.target) : "";
       if (!target) return { isError: true, content: "set_target needs a `target`.", display: "missing target" };
@@ -873,9 +1051,10 @@ const keilProjectTool: Tool = {
       // Settling for the reply is how this went wrong once: the project kept
       // the old name while the call reported success, and the next build and
       // debug session pointed at a file that did not exist. The debugger's own
-      // answer is the check.
+      // answer is the check — and it answers with the whole path, not the
+      // bare name that was sent, so the comparison is on the file name.
       const stored = await getOutputName(session);
-      if (stored && stored !== name) {
+      if (!sameOutputName(stored, name)) {
         return {
           isError: true,
           content: `the debugger accepted the request but still reports ${JSON.stringify(stored)}, not ${JSON.stringify(name)}; nothing was changed.`,
@@ -889,7 +1068,11 @@ const keilProjectTool: Tool = {
     } else {
       return { isError: true, content: `unknown action \`${action}\``, display: "unknown action" };
     }
-    return { content: lines.join("\n"), display: `keil: ${action}` };
+    return {
+      ...(failure ? { isError: true } : {}),
+      content: lines.join("\n"),
+      display: failure ? `keil: ${action} failed` : `keil: ${action}`,
+    };
   },
 };
 

@@ -238,10 +238,12 @@ test("fromelf -z ROM Totals is the fallback when the linker line is absent", () 
   const usage = parseFromelf(output);
   assert.ok(usage);
   assert.equal(usage.flash, 31978 + 18842);
-  // The ROM Totals row is the one used, so ZI there is 0: RAM is the RW bytes
-  // only. This is a fallback because it under-reports, which is why the
-  // linker's own Program Size line is preferred when a build produced one.
-  assert.equal(usage.ram, 108);
+  // RAM is RW + the **object row's** ZI. This test used to expect 108, which
+  // was the totals row's zero taken at face value: it reported 108 bytes of
+  // RAM for an image with a 2 MB ZI region, and that wrong number was locked
+  // in here as if it were the answer. Verified against `fromelf --text -z` on
+  // TOUCH.axf, where both rows are present exactly as above.
+  assert.equal(usage.ram, 108 + 2050364);
 });
 
 test("output without totals yields no usage rather than zeros", () => {
