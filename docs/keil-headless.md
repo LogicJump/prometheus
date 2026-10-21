@@ -209,6 +209,29 @@ left debug mode; the debugger's breakpoints were cleared with it
 现在 `enterDebug` 把这条命令窗口错误当作进入失败，原因写成
 「调试器进去了但加载不了镜像，请先构建，并确认工程的输出名指向一个存在的文件」。
 
+## 四之六、Keil 里的 CMSIS-Toolbox 整个没被发现
+
+这台机器的 `G:\software\keil5\ARM\cmsis-toolboxin` 里装着一整套 Arm 的
+CMSIS-Toolbox：`cbuild 2.10.0`、`cpackget 2.1.8`、`svdconv 3.3.48`，还有
+`csolution`、`cbuild2cmake`、`packchk`。上一版的探测里**一个都没有**——`toolchain.ts`
+连 `cbuild` 三个字都搜不到。后果：
+
+- `*.csolution.yml` / `*.cprj` 工程根本认不出来，更谈不上构建
+- `cpackget` 明明就在本机，`embed_packs` 却只会告诉用户「自己装一个」
+- 我在文档里写「`-et` 导出的 cprj 供 CMSIS-Toolbox 构建」，而我们并不支持那个工具链
+
+现在：三个工具成为一等工具链（会去 Keil 安装目录的 `ARM\cmsis-toolboxin` 找），
+`csolution` 成为新的工程类型并用 `cbuild` 构建，`embed_packs` 增加了 `install` / `remove`
+（走 `cpackget add --agree-embedded-license`，参数是实测的：`--agree-embed-pdk` 那个拼法会被拒绝）。
+
+另外 `cpackget` 会在失败时仍返回 0，所以判定看输出里的 `E:`，不看退出码。
+
+### 顺带修掉的一个探测 bug
+
+工程探测会向上走五层找祖先目录。加上 `csolution` 之后，它把**另一个无关临时目录**里的
+`.csolution.yml` 当成了本工程的解——测试里两个临时目录互相串了。这在真实机器上意味着
+按 `%TEMP%` 或某个用户主目录去构建。现在 `csolution`/`cprj` 只在当前目录匹配。
+
 ## 五、接口清单与覆盖情况
 
 公开接口共 **88 个操作**，当前：**71 个已接通并实测**，**17 个在该版本上不可用**（逐个列在下面，

@@ -476,18 +476,48 @@ const powerTool: Tool = {
 const packsTool: Tool = {
   name: "embed_packs",
   description:
-    "Look up a part in installed CMSIS-Packs: its SVD, flash/RAM size and the pack file it came from. Works for any vendor that ships a pack, which is the vendor-neutral way to answer 'where is this chip's register map'. Also lists what is installed.",
-  readonly: true,
+    "Look up a part in installed CMSIS-Packs: its SVD, flash/RAM size and the pack file it came from. Works for any vendor that ships a pack, which is the vendor-neutral way to answer 'where is this chip's register map'. Also lists what is installed, and can install a pack through `cpackget` when that tool is available.",
+  readonly: false,
   parameters: {
     type: "object",
     properties: {
       device: { type: "string", description: "Part name, e.g. `STM32F429ZI`. Omit to list installed packs" },
       include_svd_path: { type: "boolean", description: "Return the absolute SVD path so embed_registers can use it" },
+      install: {
+        type: "string",
+        description:
+          "Install a pack with `cpackget add`. Accepts what cpackget accepts: `Vendor::PackName`, `Vendor::PackName@1.2.3`, or a local `.pack` file. This writes to the pack store the device lookup already reads.",
+      },
+      remove: { type: "string", description: "Remove an installed pack with `cpackget rm`." },
+      list_files: { type: "boolean", description: "For a pack name: list the files cpackget reports for it" },
     },
     additionalProperties: false,
   },
-  summarize: (input) => String(input.device ?? "packs"),
+  summarize: (input) => String(input.install ? `install ${input.install}` : input.remove ? `remove ${input.remove}` : input.device ?? "packs"),
   async execute(input, ctx): Promise<ToolResult> {
+    if (input.install || input.remove) {
+      const report = await detectToolchains();
+      const cpackget = report.tools.find((entry) => entry.kind === "cpackget")?.path;
+      if (!cpackget) {
+        return {
+          isError: true,
+          content:
+            "cpackget was not found. It ships with the Arm CMSIS-Toolbox and inside a Keil MDK install " +
+            "(`ARM\cmsis-toolbox\bin`); install one of those, or add the pack from the vendor's pack manager.",
+          display: "no cpackget",
+        };
+      }
+      // `--agree-embedded-license` is what cpackget calls it (the `--agree-embed-pdk`
+      // spelling is rejected). A pack's licence is the user's to accept; this
+      // only records that they asked to install it.
+      const args = input.install ? ["add", String(input.install), "--agree-embedded-license"] : ["rm", String(input.remove)];
+      const outcome = await run(cpackget, args, ctx.cwd, 5 * 60_000);
+      const text = outcome.output.trim().split(String.fromCharCode(10)).slice(-12).join(String.fromCharCode(10));
+      return {
+        ...(outcome.code === 0 && !/^E:/m.test(outcome.output) ? {} : { isError: true }),
+        content: `${cpackget} ${args.join(" ")}${String.fromCharCode(10)}${text || "(no output)"}`,
+      };
+    }
     if (input.device) {
       const found = findDeviceInPacks(String(input.device), ctx.cwd);
       if (!found) {

@@ -350,6 +350,40 @@ test("a debug session that could not load the image is not reported as open", as
   assert.match(source, /session\.debugging = false/, "and the session is not left claiming to be debugging");
 });
 
+/* ---------- the CMSIS-Toolbox ---------- */
+
+test("a csolution project is recognised and built with cbuild", async () => {
+  const { detectProject, buildCommand } = await import("../src/embedded/project.ts");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "prometheus-csol-"));
+  try {
+    mkdirSync(join(dir, "app"), { recursive: true });
+    writeFileSync(join(dir, "demo.csolution.yml"), ["solution:", "  projects: []"].join(String.fromCharCode(10)));
+    const project = detectProject(dir);
+    assert.equal(project.kind, "csolution");
+    assert.match(project.file ?? "", /\.csolution\.yml$/);
+    const command = buildCommand(project, { cbuild: "cbuild.exe" }, {});
+    assert.equal(command?.program, "cbuild.exe");
+    assert.match(command?.args[0] ?? "", /\.csolution\.yml$/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the three toolbox tools are first-class toolchains", async () => {
+  const { TOOLCHAIN_INFO } = await import("../src/embedded/toolchain.ts");
+  for (const kind of ["cbuild", "cpackget", "svdconv"] as const) {
+    assert.ok(TOOLCHAIN_INFO[kind], `${kind} has an entry`);
+    assert.ok(TOOLCHAIN_INFO[kind].purpose.length > 20, `${kind} says what it is for`);
+  }
+  // The toolbox ships inside a Keil install, so the search must look there.
+  const { readFileSync } = await import("node:fs");
+  const source = readFileSync("src/embedded/toolchain.ts", "utf8");
+  assert.match(source, /cmsis-toolbox/, "the Keil install's toolbox directory is searched");
+});
+
 /* ---------- status names ---------- */
 
 test("status codes are named, and an unknown one is still honest", () => {

@@ -14,7 +14,7 @@
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export type ProjectKind =
   | "zephyr"
@@ -26,6 +26,11 @@ export type ProjectKind =
   | "make"
   | "keil"
   | "iar"
+  /**
+   * A CMSIS-Toolbox solution (`*.csolution.yml`) or bare project
+   * (`*.cprj`), built by `cbuild` rather than by an IDE.
+   */
+  | "csolution"
   | "unknown";
 
 export interface BuildCommand {
@@ -234,6 +239,20 @@ export function detectProject(start = process.cwd()): DetectedProject {
     if (cargo.length > 0) return finish("cargo-embedded", dir, cargo);
     const arduino = arduinoEvidence(dir);
     if (arduino.some((name) => name.endsWith(".ino"))) return finish("arduino", dir, arduino);
+
+    // A CMSIS-Toolbox project states itself before any generic evidence does:
+    // `*.csolution.yml` is the solution, `*.cprj` a single project. Both are
+    // built by `cbuild`, which Keil ships in `ARM\cmsis-toolboxin`.
+    // Only the directory itself: `findProjectFile` walks one level down *and*
+    // this loop walks up five, so a match here picked up a `.csolution.yml`
+    // from an unrelated sibling — measured, a temp directory detected the
+    // solution file of a completely different temp directory. A solution file
+    // names its own projects, so it only counts where it sits.
+    if (readdirSyncSafe(dir).some((name) => /\.csolution\.yml$/i.test(name))) {
+      return { ...finish("csolution", dir, ["csolution"]), file: join(dir, readdirSyncSafe(dir).find((name) => /\.csolution\.yml$/i.test(name))!) };
+    }
+    const cprj = findProjectFile(dir, /\.cprj$/i);
+    if (cprj && dirname(cprj) === dir) return { ...finish("csolution", dir, ["cprj"]), file: cprj };
 
     const parent = join(dir, "..");
     if (parent === dir) break;
@@ -470,6 +489,21 @@ export function buildCommand(
         // memory dump was being listed as a build artifact.
         artifactPatterns: ["*.axf", "*.hex", "*.bin"],
         artifactRoots: keilOutputDirs(project1, root),
+      };
+    }
+    case "csolution": {
+      // `cbuild <solution.csolution.yml>` resolves the project list, the packs
+      // and the toolchain from the solution; a bare `.cprj` is built the same
+      // way. `--outdir` is left at its default (`./out`), which is where the
+      // images land.
+      const solution = project.file ?? findProjectFile(root, /\.csolution\.yml$/i) ?? findProjectFile(root, /\.cprj$/i);
+      if (!solution) return null;
+      return {
+        kind: "csolution",
+        program: toolchains.cbuild ?? "cbuild",
+        args: [solution, ...(options.release ? ["--configuration", "Release"] : [])],
+        cwd: root,
+        artifactPatterns: ["out/**/*.elf", "out/**/*.hex", "out/**/*.bin", "*.elf"],
       };
     }
     case "iar": {

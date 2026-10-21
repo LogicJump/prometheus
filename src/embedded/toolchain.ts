@@ -18,6 +18,9 @@ import { homedir } from "node:os";
 import { packBinDirs } from "../packs/registry.ts";
 
 export type ToolchainKind =
+  | "cbuild"
+  | "cpackget"
+  | "svdconv"
   | "gcc-arm"
   | "gcc-riscv"
   | "cmake"
@@ -87,6 +90,21 @@ export const TOOLCHAIN_INFO: Record<ToolchainKind, { label: string; purpose: str
   pio: { label: "PlatformIO", purpose: "Builds platformio.ini projects across boards and frameworks", group: "build" },
   "arduino-cli": { label: "Arduino CLI", purpose: "Compiles and uploads Arduino sketches", group: "build" },
   cargo: { label: "Cargo", purpose: "Builds Rust firmware and embedded Rust crates", group: "build" },
+  cbuild: {
+    label: "CMSIS-Toolbox (cbuild)",
+    purpose: "Builds csolution/cprj projects; ships with Keil MDK and the standalone Arm CMSIS-Toolbox",
+    group: "build",
+  },
+  cpackget: {
+    label: "cpackget",
+    purpose: "Installs and removes CMSIS-Packs; the same layout the device/SVD lookup reads",
+    group: "build",
+  },
+  svdconv: {
+    label: "SVDConv",
+    purpose: "Validates and converts CMSIS-SVD files, including the vendor SVDs a pack ships",
+    group: "analyze",
+  },
   keil: {
     label: "Keil MDK",
     purpose: "Builds .uvprojx projects headless; its compilers and device packs are licensed and are never bundled",
@@ -172,7 +190,11 @@ function windowsDirs(): string[] {
   }
   // Keil and IAR install wherever the user said. Keil names its own root in
   // TOOLS.INI; IAR's is under Program Files\IAR Systems.
-  for (const root of keilRoots()) candidates.push(join(root, "UV4"));
+  for (const root of keilRoots()) {
+    candidates.push(join(root, "UV4"));
+    // Keil bundles the CMSIS-Toolbox next to its compilers.
+    candidates.push(join(root, "ARM", "cmsis-toolbox", "bin"));
+  }
   for (const root of roots) {
     for (const product of ["IAR Systems", join("IAR Systems", "Embedded Workbench")]) {
       const base = join(root, product);
@@ -261,6 +283,13 @@ const SPECS: Spec[] = [
       "C:\\Program Files (x86)\\IAR Systems\\Embedded Workbench 8.3\\common\\bin\\IarBuild.exe",
     ],
   },
+  // The CMSIS-Toolbox ships inside a Keil install (`ARM\cmsis-toolboxin`)
+  // and standalone. Without these three the app could not build a csolution
+  // project, install a pack, or validate an SVD — all of which the toolbox on
+  // this machine can do.
+  { kind: "cbuild", names: ["cbuild", "cbuild.exe"], versionArgs: ["--version"] },
+  { kind: "cpackget", names: ["cpackget", "cpackget.exe"], versionArgs: ["--version"] },
+  { kind: "svdconv", names: ["SVDConv", "SVDConv.exe", "svdconv", "svdconv.exe"], versionArgs: [] },
   { kind: "openocd", names: ["openocd", "openocd.exe"], versionArgs: ["--version"] },
   { kind: "pyocd", names: ["pyocd", "pyocd.exe"], versionArgs: ["--version"] },
   { kind: "probe-rs", names: ["probe-rs", "probe-rs.exe"], versionArgs: ["--version"] },
