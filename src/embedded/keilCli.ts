@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 import { toolEnv } from "./toolEnv.ts";
 import { keilProjectFile } from "./project.ts";
 
-export type KeilCliOperation = "clean" | "clean-rebuild" | "export-cprj" | "export-cprjs" | "symbols" | "symbols-all" | "convert";
+export type KeilCliOperation = "clean" | "clean-rebuild" | "export-cprj" | "export-cprjs" | "symbols" | "symbols-all" | "convert" | "save";
 
 export interface KeilCliResult {
   ok: boolean;
@@ -42,6 +42,9 @@ const SWITCH: Record<KeilCliOperation, string> = {
   symbols: "-X",
   "symbols-all": "-X1",
   convert: "-5",
+  // Not a UV4 switch: uVision rewrites the `.uvprojx` when it exits, and that
+  // is the only way an interface edit reaches the file. See `saveProject`.
+  save: "",
 };
 
 /**
@@ -72,6 +75,55 @@ export function symbolHeaderPaths(projectFile: string): string[] {
     .map((target) => join(outDir, `co-arm_${target}.h`));
 }
 
+/**
+ * Write interface-made edits into the `.uvprojx`.
+ *
+ * `PRJ_ADD_FILE`, `PRJ_ADD_GROUP` and the option setters change uVision's
+ * in-memory project and answer `SUCCESS`, but they never touch the file: a
+ * clean exit, a `-b` run and a killed process all leave the `.uvprojx` exactly
+ * as it was. Measured — a group's `Files` stayed empty through all three.
+ *
+ * uVision rewrites the project when one *opens* it, so an empty headless run
+ * is what performs the save: it loads the file, writes it back, and exits.
+ * The method is verified by the caller, which compares the file's bytes
+ * before and after, so "saved" is never reported without evidence.
+ */
+async function saveProject(options: KeilCliOptions, projectFile: string, started: number): Promise<KeilCliResult> {
+  const before = readFileSync(projectFile);
+  const result = await new Promise<{ code: number | null; out: string }>((resolve) => {
+    execFile(
+      options.uv4,
+      [projectFile, "-j0", "-sg"],
+      { cwd: options.cwd, timeout: options.timeoutMs ?? 120_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024, env: toolEnv() },
+      (error, stdout, stderr) => {
+        const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
+        resolve({ code, out: `${stdout ?? ""}${stderr ?? ""}` });
+      },
+    );
+  });
+  let changed = false;
+  try {
+    changed = !readFileSync(projectFile).equals(before);
+  } catch {
+    changed = false;
+  }
+  return {
+    ok: result.code === 0,
+    command: `${options.uv4} ${projectFile} -j0 -sg`,
+    exitCode: result.code,
+    log: result.out.trim(),
+    produced: changed ? [projectFile] : [],
+    durationMs: Date.now() - started,
+    ...(changed
+      ? {}
+      : {
+          reason:
+            "the project file is unchanged after uVision opened and closed it. Interface edits live in uVision's memory until it rewrites the project, " +
+            "and this run did not. Nothing was lost that was on disk, but the edit is not persisted.",
+        }),
+  };
+}
+
 export interface KeilCliOptions {
   /** Project directory; the `.uvprojx` is found the same way a build finds it. */
   cwd: string;
@@ -94,6 +146,7 @@ export async function keilCli(options: KeilCliOptions): Promise<KeilCliResult> {
   if (!existsSync(options.uv4)) {
     return { ok: false, command: "", exitCode: null, log: "", produced: [], durationMs: 0, reason: `UV4.exe was not found at ${options.uv4}` };
   }
+  if (options.operation === "save") return saveProject(options, projectFile, started);
   const logDir = join(options.cwd, "build");
   try {
     mkdirSync(logDir, { recursive: true });
@@ -130,12 +183,16 @@ export async function keilCli(options: KeilCliOptions): Promise<KeilCliResult> {
   }
 
   // What the operation should have produced, checked rather than assumed.
+  // `-5` converts `X.uvproj` into `X.uvprojx`; when the project already *is*
+  // a `.uvprojx` there is nothing to convert and the "expected" path was the
+  // input itself, which always exists — so the check passed on a run that
+  // exited 20 having done nothing.
   const expected =
     options.operation === "export-cprj" || options.operation === "export-cprjs"
       ? cprjPaths(projectFile)
       : options.operation === "symbols" || options.operation === "symbols-all"
         ? symbolHeaderPaths(projectFile)
-        : options.operation === "convert"
+        : options.operation === "convert" && /\.uvproj$/i.test(projectFile)
           ? [projectFile.replace(/\.uvproj$/i, ".uvprojx")]
           : [];
   const produced = expected.filter((path) => existsSync(path));
@@ -146,7 +203,11 @@ export async function keilCli(options: KeilCliOptions): Promise<KeilCliResult> {
   // `.cprj`; reporting that as success would be exactly the false completion
   // this project is trying to avoid.
   const shouldProduce = expected.length > 0;
-  const ok = (result.code === 0 || result.code === 1) && (!shouldProduce || produced.length > 0);
+  // `-5` on a project that is already `.uvprojx` has nothing to do; UV4 exits
+  // 20 ("cannot convert") for it, which is a refusal of the request rather
+  // than a failure of the tool.
+  const alreadyConverted = options.operation === "convert" && !/\.uvproj$/i.test(projectFile);
+  const ok = alreadyConverted ? true : (result.code === 0 || result.code === 1) && (!shouldProduce || produced.length > 0);
   return {
     ok,
     command: `${options.uv4} ${command.join(" ")}`,
@@ -155,7 +216,9 @@ export async function keilCli(options: KeilCliOptions): Promise<KeilCliResult> {
     produced,
     durationMs: Date.now() - started,
     ...(ok
-      ? {}
+      ? alreadyConverted
+        ? { reason: `${projectFile} is already a .uvprojx; there was nothing to convert` }
+        : {}
       : shouldProduce
         ? { reason: `UV4 exited ${result.code} but wrote none of: ${expected.join(", ")}` }
         : {

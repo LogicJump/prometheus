@@ -21,16 +21,20 @@
  *    read from the status and those frames rather than from the reply.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import type { Tool, ToolResult } from "../types.ts";
+import { detectProject } from "../embedded/project.ts";
 import {
   addAccessBreakpoint,
   addBreakpoint,
   addFile,
   addGroup,
+  addWatch,
+  filePathsInGroup,
   addressToSource,
   buildInIde,
   cancelBuild,
+  changeBreakpoint,
   closeKeilSession,
   currentLocation,
   currentTarget,
@@ -45,7 +49,6 @@ import {
   listKeilSessions,
   enterDebug,
   openKeilSession,
-  projectFiles,
   projectGroups,
   projectTargets,
   readMemory,
@@ -75,9 +78,9 @@ import {
   removeGroup,
   run,
   setOption,
-  setRegister,
   setTarget,
   step,
+  writeRegister,
   writeMemory,
   type KeilSession,
   type OptionName,
@@ -117,6 +120,23 @@ function describeWhere(where: { address: number; file?: string; line?: number; f
   const symbol = where.function ? `${where.function} ` : "";
   const at = where.file ? `${where.file}:${where.line ?? "?"}` : hex(where.address);
   return `${symbol}${at}${where.file ? ` (${hex(where.address)})` : ""}`;
+}
+
+/** Close every session and say whether the project file was written. */
+async function closeAndReport(cwd: string): Promise<ToolResult> {
+  // Closing is how project edits reach the file: uVision writes the
+  // `.uvprojx` on its way out. Comparing the file around the close is what
+  // turns "closed" into "saved".
+  const projectFile = detectProject(cwd).file;
+  const before = projectFile && existsSync(projectFile) ? readFileSync(projectFile) : null;
+  let closed = 0;
+  for (const entry of listKeilSessions()) if (await closeKeilSession(entry.key)) closed++;
+  const after = projectFile && existsSync(projectFile) ? readFileSync(projectFile) : null;
+  const saved = Boolean(before && after && !before.equals(after));
+  return {
+    content: [`closed ${closed} Keil session(s)`, ...(saved ? [`wrote ${projectFile}`] : [])].join("\n"),
+    display: "closed",
+  };
 }
 
 /** The stop, in the words a person would use. */
@@ -192,6 +212,7 @@ const keilDebugTool: Tool = {
           "erase",
           "sessions",
           "close",
+          "close_project",
         ],
         description: "What to do. Default `run`: start execution and stop at the first breakpoint.",
       },
@@ -202,7 +223,8 @@ const keilDebugTool: Tool = {
       kind: { type: "string", enum: ["exec", "read", "write", "readwrite"], description: "Breakpoint kind (default exec)" },
       address: { type: "integer", description: "For read/write/run_to/disassemble: the address" },
       width: { type: "string", enum: ["u8", "u16", "u32"], description: "For read/write: access width (default u32)" },
-      count: { type: "integer", description: "For read: how many values; for step_many: how many steps (default 1)" },
+      count: { type: "integer", description: "For read: how many values; for step_many: how many steps (default 1); for disassemble: how many instructions' worth of bytes (default 8)" },
+      frame: { type: "integer", description: "For variables: which stack frame to list the locals of (0, the default, lists the globals)" },
       value: { type: "integer", description: "For write: the value to store" },
       expression: { type: "string", description: "For evaluate: a debugger expression, e.g. `uwTick` or `&g_state`" },
       command: {
@@ -230,14 +252,26 @@ const keilDebugTool: Tool = {
       };
     }
     if (action === "close") {
-      let closed = 0;
-      for (const entry of listKeilSessions()) if (await closeKeilSession(entry.key)) closed++;
-      return { content: `closed ${closed} Keil session(s)`, display: "closed" };
+      return closeAndReport(ctx.cwd);
     }
 
-    const opened = await sessionFor(input, ctx.cwd);
+    // Build, download and erase are **project** operations, and uVision
+    // refuses them in a debug session ("Target is in debug mode"). They run on
+    // the plain session, which is the same one `keil_project` edits through.
+    // Everything else here is a debugger operation and needs the debug session.
+    const projectAction = action === "build" || action === "rebuild" || action === "flash" || action === "erase";
+    // `keil_project action: "close"` and `keil_debug action: "close_project"`
+    // close both sessions, and need no new one.
+    if (action === "close_project") {
+      return closeAndReport(ctx.cwd);
+    }
+    const opened = await sessionFor(input, ctx.cwd, projectAction ? { connectOnly: true } : {});
     if (!opened.ok) return { isError: true, content: opened.content, display: "Keil unavailable" };
     const session = opened.session;
+    // The debug session and the project session are two uVision instances on
+    // two ports. `registry` picks one; by default a project operation runs on
+    // the plain session and everything else on the debugger, because uVision
+    // refuses each on the other's session.
     try {
       // The connection log belongs to `open`, where it is what was asked for;
       // repeating it on every action buries the answer.
@@ -300,26 +334,23 @@ const keilDebugTool: Tool = {
             : await addAccessBreakpoint(session, location, kind as "read" | "write" | "readwrite", Number(input.width === "u8" ? 1 : input.width === "u16" ? 2 : 4));
         lines.push(reply.ok ? `breakpoint set on ${location}` : `could not set it: ${reply.message ?? reply.statusName}`);
       } else if (action === "breakpoint_delete") {
-        const number = Number(location.replace(/^#/, ""));
+        // `location` carries the breakpoint number (`#2` or `2`), which is
+        // what `breakpoints` prints. The list is 1-based; an off-by-one here
+        // deleted the wrong breakpoint silently.
+        const requested = Number(location.replace(/^[#Bb]/, ""));
         const list = await listBreakpoints(session);
-        const target = list.find((entry) => entry.number === number);
-        if (!target) return { isError: true, content: `there is no breakpoint ${number}; the list has ${list.length}.`, display: "not found" };
-        const changed = await session.client.send(0x2016, (() => {
-          const payload = Buffer.alloc(40);
-          payload.writeUInt32LE(1, 0); // KILLBP
-          payload.writeUInt32LE(target.tickMark, 4);
-          return payload;
-        })(), 10_000);
-        lines.push(changed.ok ? `deleted breakpoint ${number}` : `could not delete it: ${changed.message ?? changed.statusName}`);
+        if (!Number.isInteger(requested)) {
+          const all = list.map((entry) => `#${entry.number} ${entry.expression ?? ""}`).join(", ");
+          return { isError: true, content: `breakpoint_delete needs a breakpoint number; the list has ${list.length}${all ? ` (${all})` : ""}.`, display: "missing number" };
+        }
+        const target = list.find((entry) => entry.number === requested);
+        if (!target) return { isError: true, content: `there is no breakpoint ${requested}; the list has ${list.length}.`, display: "not found" };
+        const changed = await changeBreakpoint(session, target.tickMark, 1);
       } else if (action === "watch_add") {
         if (!location) return { isError: true, content: "watch_add needs a `location` expression.", display: "missing expression" };
-        const reply = await session.client.send(0x202b, (() => {
-          const payload = Buffer.alloc(520);
-          payload.writeInt32LE(location.length + 1, 0);
-          Buffer.from(`${location}\0`, "latin1").copy(payload, 4);
-          return payload;
-        })(), 10_000);
-        lines.push(reply.ok ? `watching ${location}` : `could not watch it: ${reply.message ?? reply.statusName}`);
+        const watched = await addWatch(session, location);
+        if (!watched.ok) return { isError: true, content: `could not watch ${location}: ${watched.message ?? "no reason given"}`, display: "watch refused" };
+        lines.push(`watching ${location}${watched.value ? ` = ${watched.value}` : ""}${watched.type ? ` (${watched.type.trim()})` : ""}${watched.id !== undefined ? ` — watch #${watched.id}` : ""}`);
       } else if (action === "registers") {
         const list = await readRegisters(session);
         if (list.length === 0) lines.push("(no registers reported)");
@@ -335,22 +366,38 @@ const keilDebugTool: Tool = {
         const name = input.name ? String(input.name) : "";
         const value = input.register_value !== undefined ? String(input.register_value) : "";
         if (!name) return { isError: true, content: "register_set needs a `name`.", display: "missing register" };
-        const reply = await setRegister(session, name, value);
-        lines.push(reply.ok ? `${name} = ${value}` : `could not write it: ${reply.message ?? reply.statusName}`);
+        const outcome = await writeRegister(session, name, value);
+        if (!outcome.ok) return { isError: true, content: `could not write ${name}: ${outcome.detail}`, display: "register refused" };
+        lines.push(outcome.detail);
       } else if (action === "variables") {
-        const list = await readVariables(session);
+        // Locals belong to a frame; `frame` says which, and the globals are
+        // always worth showing because a stopped "at main" is usually a
+        // question about one of them.
+        const frame = input.frame !== undefined ? Math.max(0, Number(input.frame)) : 0;
+        const list = await readVariables(session, frame);
         if (list.length === 0) {
-          lines.push("the debugger enumerated no variables — the image may have been built without debug info, or nothing is loaded.");
+          lines.push(
+            session.extended
+              ? `the debugger enumerated no variables at frame ${frame} — the image may have been built without debug info, or that frame has no locals (globals: frame 0).`
+              : "this session did not get extended stack mode, so variable enumeration is refused; close the session and open it again.",
+          );
         }
-        for (const entry of list.slice(0, 200)) lines.push(`${entry.name}${entry.type ? `: ${entry.type}` : ""} = ${entry.value}`);
+        for (const entry of list.slice(0, 200)) {
+          const size = entry.count > 0 ? `[${entry.count}]` : "";
+          lines.push(`${entry.name}${size}${entry.type ? `: ${entry.type}` : ""} = ${entry.value}${entry.editable === false ? " (read-only)" : ""}`);
+        }
         if (list.length > 200) lines.push(`… and ${list.length - 200} more`);
+        if (frame === 0 && list.length > 0) lines.push("", "pass `frame` to list the locals of a stack frame instead of the globals");
       } else if (action === "stack") {
         const frames = await readStack(session);
         if (frames.length === 0) lines.push("(empty stack)");
         for (const frame of frames) {
           const source = await addressToSource(session, frame.address);
           const fn = source?.function ? `${source.function} ` : "";
-          lines.push(`#${frame.level} ${fn}${source?.file ? `${source.file}:${source.line ?? "?"}` : hex(frame.address)}`);
+          const where = source?.file ? `${source.file}:${source.line ?? "?"}` : hex(frame.address);
+          // `variables: 0` is what the debugger reports on this build even
+          // inside a function, so it is not printed as if it meant something.
+          lines.push(`#${frame.level} ${fn}${where}  (${hex(frame.address)})`);
         }
       } else if (action === "where") {
         const where = await currentLocation(session);
@@ -435,17 +482,22 @@ const keilDebugTool: Tool = {
         const name = input.expression ? String(input.expression) : "";
         const value = input.value !== undefined ? String(input.value) : "";
         if (!name) return { isError: true, content: "variable_set needs an `expression` naming the variable.", display: "missing variable" };
-        const reply = await setVariable(session, name, value);
-        lines.push(reply.ok ? `${name} = ${value}` : `could not set it: ${reply.message ?? reply.statusName}`);
+        const written = await setVariable(session, name, value);
+        if (!written.ok) return { isError: true, content: `could not set ${name}: ${written.message ?? "no reason given"}`, display: "variable refused" };
+        lines.push(written.detail ?? `${name} = ${value}`);
       } else if (action === "disassemble") {
         const address = Number(input.address);
         if (!Number.isFinite(address)) return { isError: true, content: "disassemble needs an `address`.", display: "missing address" };
         const decoded = await disassemble(session, address, Math.max(4, Math.min(256, Number(input.count ?? 8) * 4)));
         if (!decoded) lines.push("the debugger refused the disassembly request");
-        else if (decoded.words.length === 0) lines.push(`the debugger holds no instruction at ${hex(decoded.address)} (it reported ${decoded.bytes} bytes)`);
-        else {
-          lines.push(`disassembly at ${hex(decoded.address)}:`);
-          decoded.words.forEach((word, index) => lines.push(`  ${hex(decoded.address + index * 4)}  ${word.toString(16).padStart(8, "0")}`));
+        else if (!decoded.text.trim()) {
+          lines.push(
+            `the debugger returned no code at ${hex(decoded.address)}. ` +
+              "On this build a small byte count comes back empty; ask for more (`count`), or check that the address is inside the loaded image.",
+          );
+        } else {
+          lines.push(`at ${hex(decoded.address)}:`);
+          lines.push(...decoded.text.replace(/\r/g, "").split("\n").filter((line) => line.trim()));
         }
       } else if (action === "menus" || action === "menu_exec") {
         const entries = await readMenus(session);
@@ -510,11 +562,15 @@ const keilDebugTool: Tool = {
         const started = await buildInIde(session, action === "rebuild");
         const wanted = started.lines.filter((line) => /error|warning|Program Size|Build target|Rebuild target/i.test(line));
         lines.push(...(wanted.length > 0 ? wanted : started.lines).slice(-60));
-        if (!started.ok) lines.push(`build ended with code ${started.status}`);
+        // `buildInIde` returns uVision's `UVBUILDCODES`: 1 ok, 2 warnings,
+        // 3 errors, 4 cancelled, 5 cleaned.
+        if (!started.ok) lines.push(`the build failed (uVision build code ${started.status}); no image was produced`);
+        else if (started.status === 2) lines.push("the build completed with warnings (uVision build code 2)");
       } else if (action === "flash") {
         const flashed = await flashInIde(session);
         lines.push(...flashed.lines.slice(-30));
         if (!flashed.ok) lines.push("the download did not finish cleanly");
+        else lines.push("downloaded to flash");
       } else if (action === "erase") {
         const erased = await eraseFlash(session);
         lines.push(erased.ok ? "flash erase accepted by the configured algorithm" : `erase failed: ${erased.message ?? erased.statusName}`);
@@ -547,7 +603,7 @@ const keilProjectTool: Tool = {
       },
       project: { type: "string", description: "The .uvprojx path; defaults to the detected project" },
       group: { type: "string", description: "Group name for files / add_file / add_group / remove_group" },
-      file: { type: "string", description: "File path for add_file / remove_file" },
+      file: { type: "string", description: "File for add_file / remove_file; a path relative to the project directory, or the file name the project lists" },
       target: { type: "string", description: "Target name for set_target / get_option / set_option; defaults to the current target" },
       option: {
         type: "string",
@@ -564,16 +620,14 @@ const keilProjectTool: Tool = {
   async execute(input, ctx): Promise<ToolResult> {
     const action = String(input.action);
     if (action === "close") {
-      let closed = 0;
-      for (const entry of listKeilSessions()) if (await closeKeilSession(entry.key)) closed++;
-      return { content: `closed ${closed} Keil session(s)`, display: "closed" };
+      return closeAndReport(ctx.cwd);
     }
     // Every project operation runs on a plain (non-debug) session, measured on
     // MDK 5.43a: an entered debugger answers "Target is in debug mode" to all
     // of them. The structure listers additionally need an entered debugger, so
-    // those four fail on a plain session with `NOT_DEBUGGING` — that is
-    // reported as such instead of being presented as an empty project.
-    const listed = new Set(["info", "groups", "files"]);
+    // groups/files fail on a plain session with `NOT_DEBUGGING` — at which
+    // point there is nothing this session can do, so the list falls back to
+    // uVision's own `PRJ_ENUM_*` stream rather than showing an empty project.
     const opened = await sessionFor(input, ctx.cwd, { connectOnly: true });
     if (!opened.ok) return { isError: true, content: opened.content, display: "Keil unavailable" };
     const session = opened.session;
@@ -594,8 +648,10 @@ const keilProjectTool: Tool = {
       lines.push(groups.length > 0 ? groups.join("\n") : "(no groups)");
     } else if (action === "files") {
       if (!group) return { isError: true, content: "files needs a `group`.", display: "missing group" };
-      const files = await projectFiles(session, group);
-      lines.push(files.length > 0 ? files.join("\n") : `(no files in ${group})`);
+      // The project file is where uVision itself keeps the list, and it is
+      // readable without an entered debugger — which `PRJ_ENUM_FILES` needs.
+      const files = filePathsInGroup(session.project, group);
+      lines.push(files.length > 0 ? files.map((entry) => entry.path || entry.name).join("\n") : `(no files in ${group})`);
     } else if (action === "add_group") {
       if (!group) return { isError: true, content: "add_group needs a `group` name.", display: "missing group" };
       const reply = await addGroup(session, group);
@@ -603,18 +659,33 @@ const keilProjectTool: Tool = {
     } else if (action === "add_file") {
       const file = input.file ? String(input.file) : "";
       if (!group || !file) return { isError: true, content: "add_file needs a `group` and a `file`.", display: "missing argument" };
-      if (!existsSync(file) && !file.startsWith(".")) {
-        // uVision stores an absolute path; a relative one must already exist
-        // relative to the project for it to be useful.
-        lines.push(`note: ${file} was not found on disk; adding it anyway`);
-      }
       const reply = await addFile(session, group, file);
       lines.push(reply.ok ? `added ${file} to ${group}` : `could not add it: ${reply.message ?? reply.statusName}`);
     } else if (action === "remove_file") {
       const file = input.file ? String(input.file) : "";
       if (!group || !file) return { isError: true, content: "remove_file needs a `group` and a `file`.", display: "missing argument" };
-      const reply = await removeFile(session, group, file);
-      lines.push(reply.ok ? `removed ${file} from ${group}` : `could not remove it: ${reply.message ?? reply.statusName}`);
+      // `PRJ_DEL_FILE` deletes by `FileName`, not by path, and it does not
+      // scope to the group it is given: measured, deleting
+      // `{"CORE", "../CORE/startup.s"}` removed `startup.s` no matter which
+      // group was named. Resolving the exact entry first is what keeps a
+      // request for one file from deleting another with the same base name.
+      const listed = filePathsInGroup(session.project, group);
+      const base = file.split(/[\\/]/).pop() ?? file;
+      const normalize = (text: string) => text.replace(/\//g, "\\").toLowerCase();
+      const match =
+        listed.find((entry) => normalize(entry.path) === normalize(file)) ??
+        listed.find((entry) => normalize(entry.name) === normalize(file)) ??
+        listed.find((entry) => normalize(entry.name) === normalize(base)) ??
+        listed.find((entry) => normalize(entry.path).endsWith(`\\${normalize(file)}`));
+      if (!match) {
+        return {
+          isError: true,
+          content: `"${file}" is not in group ${group}${listed.length > 0 ? ` (it has: ${listed.map((entry) => entry.name).join(", ")})` : " (the group has no files)"}; nothing was deleted.`,
+          display: "not in project",
+        };
+      }
+      const reply = await removeFile(session, group, match.name);
+      lines.push(reply.ok ? `removed ${match.name} from ${group}` : `could not remove it: ${reply.message ?? reply.statusName}`);
     } else if (action === "remove_group") {
       if (!group) return { isError: true, content: "remove_group needs a `group`.", display: "missing group" };
       const reply = await removeGroup(session, group);

@@ -14,17 +14,18 @@ import {
   asyncText,
   commandWindowText,
   prjData,
-  readDisassembly,
+  readDisassemblyText,
   readMenu,
   readSstr,
   readVset,
   sstr,
   vset,
+  vsetWithValue,
   type MenuEntry,
   type UvSocketClient,
 } from "./uvsock.ts";
 import type { KeilSession, StopInfo } from "./keilSession.ts";
-import { readRegisters } from "./keilSession.ts";
+import { findRegister, readRegisters, readVariables, readVtr, setRegister, setVariableById } from "./keilSession.ts";
 
 /* ---------- expression evaluation ---------- */
 
@@ -35,11 +36,16 @@ import { readRegisters } from "./keilSession.ts";
  * it answers with a 64-bit value **and** the debugger's rendering, where the
  * command window gives text that has to be parsed. Measured:
  *
- *   `main`  → 0x08006be0, "main"
- *   `$+4`   → 0x0800645c, "$+4"
+ *   `main`  → type 5, 0x08006be0, "main"
+ *   `$+4`   → type 9, 0x0800645c, "$+4"
  *
- * `DBG_EVAL_WATCH_EXPRESSION` answers `NOT_SUPPORTED` on this build for every
- * expression, so it is not used here.
+ * The record is a packed `VSET`, so the text is at 12 and the value at 4.
+ * Reading the value at 8 truncated it: `0x08006458` came back as `0x006458`,
+ * an address in the wrong half of memory.
+ *
+ * `DBG_EVAL_WATCH_EXPRESSION` answers `NOT_SUPPORTED` unless extended stack
+ * mode is on, and even then expects a watch id; `CALC_EXPRESSION` is the
+ * direct path.
  */
 export async function evaluate(session: KeilSession, expression: string): Promise<{ ok: boolean; value?: bigint; text?: string; message?: string }> {
   const reply = await session.client.send(OP.DBG_CALC_EXPRESSION, vset(expression), 10_000);
@@ -50,7 +56,11 @@ export async function evaluate(session: KeilSession, expression: string): Promis
   }
   const decoded = readVset(reply.data);
   if (!decoded) return { ok: false, message: "the reply carried no value" };
-  return { ok: true, value: decoded.value, ...(decoded.text ? { text: decoded.text } : {}) };
+  // The debugger echoes the expression back for `$` when it has no better
+  // rendering; the numeric value is the answer in that case and the caller
+  // formats it. A text that is a `<cannot evaluate>` marker is not a value.
+  const rendered = decoded.text && decoded.text !== expression ? decoded.text : undefined;
+  return { ok: true, value: decoded.value, ...(rendered && !rendered.startsWith("<cannot") ? { text: rendered } : {}) };
 }
 
 /** Evaluate through the command window, the path `EVAL` reaches. */
@@ -93,14 +103,77 @@ export async function debugCommand(session: KeilSession, command: string): Promi
   };
 }
 
-/** Set a variable, by name, to a new value. */
-export async function setVariable(session: KeilSession, name: string, value: string): Promise<Reply> {
-  // `UV_DBG_VARIABLE_SET` takes a `VARINFO` whose `value` is the new value and
-  // whose `name` identifies the variable.
-  const payload = Buffer.alloc(1100);
-  sstr(value).copy(payload, 20);
-  sstr(name).copy(payload, 540);
-  return session.client.send(OP.DBG_VARIABLE_SET, payload, 10_000);
+/**
+ * Set a variable, by name, to a new value.
+ *
+ * `VARIABLE_SET` is `VARVAL`: the `IVARENUM` that names the variable plus the
+ * value. A name-based request is answered `NOT_FOUND` (or, with a zeroed
+ * `IVARENUM`, `SUCCESS` that writes nothing), so the variable is looked up in
+ * the enumeration first and written by its id. The write is read back.
+ */
+export async function setVariable(session: KeilSession, name: string, value: string): Promise<{ ok: boolean; message?: string; detail?: string }> {
+  const variables = await readVariables(session);
+  const wanted = name.trim();
+  const target =
+    variables.find((entry) => entry.name === wanted) ??
+    variables.find((entry) => entry.name.toLowerCase() === wanted.toLowerCase()) ??
+    // A qualified name (`\file.c\symbol`) is what the debugger prints for a
+    // static; the plain name is what a person types.
+    variables.find((entry) => entry.name.split(/[\\/]/).pop() === wanted);
+  if (!target) {
+    const names = variables.slice(0, 12).map((entry) => entry.name).join(", ");
+    return {
+      ok: false,
+      message: variables.length === 0
+        ? "the debugger enumerated no variables; the image needs debug information and the target must be stopped"
+        : `${wanted} is not among the ${variables.length} variables the debugger lists (${names}${variables.length > 12 ? ", …" : ""})`,
+    };
+  }
+  const outcome = await setVariableById(session, target, value);
+  return { ok: outcome.ok, ...(outcome.ok ? { detail: outcome.detail } : { message: outcome.detail }) };
+}
+
+/** Write a register and check that it took. */
+export async function writeRegister(session: KeilSession, name: string, value: string) {
+  return setRegister(session, name, value);
+}
+
+/**
+ * Add an expression to the debugger's Watch window.
+ *
+ * `EVAL_WATCH_EXPRESSION` needs extended stack mode; without it the answer is
+ * `NOT_SUPPORTED` for every expression and the old code surfaced that as the
+ * whole feature being unavailable. The reply is a `VALAMEM`:
+ *
+ *   nID(4) nRes(4) nRes(4) nRes(4) type(4) len(4) value-text… type-text…
+ *
+ * measured as `nID=… | 0 | 0 | 0 | 0x02001001 | 11 | "0x08006BE0" | "int f() "`.
+ */
+export async function addWatch(session: KeilSession, expression: string): Promise<{ ok: boolean; id?: number; value?: string; type?: string; message?: string }> {
+  if (!session.extended) {
+    return {
+      ok: false,
+      message:
+        "the Watch window needs extended stack mode, which this session did not get — it is set before the debugger starts, so close the session and open it again",
+    };
+  }
+  const reply = await session.client.send(OP.DBG_EVAL_WATCH_EXPRESSION, vset(expression), 10_000);
+  if (!reply.ok) return { ok: false, message: reply.message ?? reply.statusName };
+  const data = reply.data;
+  if (data.length < 28) return { ok: false, message: "the reply carried no watch record" };
+  const id = data.readInt32LE(0);
+  const length = data.readUInt32LE(20);
+  const value = length > 0 ? data.subarray(24, Math.min(24 + length, data.length)).toString("latin1").replace(/\0.*$/s, "") : "";
+  // The type string follows the value's fixed 260-byte slot.
+  const typeLength = data.length >= 24 + 260 + 4 ? data.readUInt32LE(24 + 260) : 0;
+  const type = typeLength > 0 && typeLength < 200 ? data.subarray(24 + 260 + 4, 24 + 260 + 4 + typeLength).toString("latin1").replace(/\0.*$/s, "") : "";
+  if (value === "<cannot evaluate>") return { ok: false, message: `${expression} could not be evaluated in the current context` };
+  return { ok: true, id, value, ...(type ? { type } : {}) };
+}
+
+/** Remove a watch expression by the id `addWatch` reported. */
+export async function removeWatch(session: KeilSession, id: number): Promise<Reply> {
+  return session.client.send(OP.DBG_REMOVE_WATCH_EXPRESSION, vset(String(id)), 8_000);
 }
 
 /* ---------- run control beyond the basics ---------- */
@@ -149,18 +222,37 @@ export async function stepMany(
 /**
  * The instructions the debugger holds at an address.
  *
- * Returns `words: []` with `bytes: 0` when the build answers with an empty
- * record — which is what this one does for some addresses — rather than
- * `null`, so "the debugger has no instruction here" is distinguishable from
- * "the request failed".
+ * The reply is an `AMEM` whose bytes are the disassembly window's **text**, not
+ * instruction words. It carries both the source line and the decoded
+ * instruction when the image has symbols:
+ *
+ *   "    35:     HAL_Init();                     //初始化HAL库 \n"
+ *   "0x08006BE0 F7F9FF38  BL.W          0x08000A54 HAL_Init\n"
+ *
+ * An empty text is "the debugger has nothing here", which is distinct from a
+ * failed request (`null`).
  */
-export async function disassemble(session: KeilSession, address: number, bytes = 32): Promise<{ address: number; words: number[]; bytes: number } | null> {
-  const payload = Buffer.alloc(24);
-  payload.writeBigUInt64LE(BigInt(address), 0);
-  payload.writeUInt32LE(bytes, 8);
-  const reply = await session.client.send(OP.DBG_DSM_READ, payload, 10_000);
-  if (!reply.ok) return null;
-  return readDisassembly(reply.data);
+export async function disassemble(session: KeilSession, address: number, bytes = 32): Promise<{ address: number; text: string; bytes: number } | null> {
+  const request = (size: number) => {
+    const payload = Buffer.alloc(24);
+    payload.writeBigUInt64LE(BigInt(address), 0);
+    payload.writeUInt32LE(size, 8);
+    return payload;
+  };
+  let last: { address: number; text: string; bytes: number } | null = null;
+  // Measured: a request for 32 bytes comes back with `nBytes = 0` and no text,
+  // while 64 and 128 return the decoded lines. The window is filled by byte
+  // count, and one instruction plus its source line can exceed a small one, so
+  // a fixed small request silently disassembled nothing.
+  for (const size of [Math.max(32, bytes), 128]) {
+    const reply = await session.client.send(OP.DBG_DSM_READ, request(size), 10_000);
+    if (!reply.ok) return null;
+    const decoded = readDisassemblyText(reply.data);
+    if (!decoded) return null;
+    if (decoded.text.trim()) return { address: decoded.address, text: decoded.text, bytes: decoded.bytes };
+    last = decoded;
+  }
+  return last ? { address: last.address, text: last.text, bytes: last.bytes } : null;
 }
 
 /** uVision's own version strings, in the form the IDE reports them. */
@@ -213,12 +305,26 @@ export async function readScvdFiles(session: KeilSession): Promise<string[]> {
   return frames.map((frame) => readSstr(frame.data, 0)).filter(Boolean);
 }
 
-/** Turn a trace variable on or off by name. */
+/**
+ * Turn a trace variable on or off by name.
+ *
+ * `VTR_SET` is a `VSET`: the on/off state is the **value**, the name is the
+ * string. The old request put the state in the first word and the name at 12 —
+ * `SUCCESS` for any name at all, and nothing changed. Setting a name the
+ * debugger does not enumerate is now reported as such.
+ */
 export async function setVtr(session: KeilSession, name: string, on: boolean): Promise<Reply> {
-  const payload = Buffer.alloc(12 + 260);
-  payload.writeInt32LE(on ? 1 : 0, 0);
-  sstr(name).copy(payload, 12);
-  return session.client.send(OP.DBG_VTR_SET, payload, 8_000);
+  const known = await readVtr(session);
+  if (known.length > 0 && !known.some((entry) => entry.name === name)) {
+    return {
+      ok: false,
+      status: 9,
+      statusName: "NOT_FOUND",
+      data: Buffer.alloc(0),
+      message: `${name} is not one of the trace variables this target exposes (${known.map((entry) => entry.name).join(", ")})`,
+    };
+  }
+  return session.client.send(OP.DBG_VTR_SET, vsetWithValue(name, 5, on ? 1n : 0n), 8_000);
 }
 
 /** Simulator clock: cycles and the timestamp the debugger reports. */
@@ -265,26 +371,17 @@ export async function ideVersion(session: KeilSession): Promise<{ ide: number; s
  * Read registers by name.
  *
  * `UV_DBG_READ_REGISTERS` is **not** used: measured on MDK 5.43a it ignores
- * the names and answers a single `"0x00000000"` for `PC`, `SP`, `R13`,
- * `PC,SP` and `R0,R1` alike — a plausible-looking value that is simply wrong,
- * which is worse than a refusal. The values come from the register
+ * the names and answers a small constant (`0x00000001`) for `PC`, `R0,R1` and
+ * `SP` alike — a plausible-looking value that is simply wrong, which is worse
+ * than a refusal. The values come from the register
  * enumeration instead, filtered to the names asked for.
  */
 export async function readNamedRegisters(session: KeilSession, names: string[]): Promise<{ name: string; value: string }[]> {
   const all = await readRegisters(session);
-  const wanted = names.map((name) => name.trim().toUpperCase()).filter(Boolean);
+  const wanted = names.map((name) => name.trim()).filter(Boolean);
   // The debugger names its stack pointer `R13 (SP)`, not `SP`, and likewise
   // `R14 (LR)` and `R15 (PC)`. The parenthesised alias is what a person types.
-  const find = (name: string) =>
-    all.find((entry) => entry.name.toUpperCase() === name) ??
-    all.find((entry) => entry.name.toUpperCase().startsWith(`${name} `)) ??
-    all.find((entry) => entry.name.toUpperCase().endsWith(`(${name})`)) ??
-    (name === "PC" ? all.find((entry) => entry.isPC) : undefined) ??
-    // The architectural name for the same register: R13 = SP, and so on.
-    (name === "R13" ? all.find((entry) => /\(SP\)$/i.test(entry.name)) : undefined) ??
-    (name === "R14" ? all.find((entry) => /\(LR\)$/i.test(entry.name)) : undefined) ??
-    (name === "R15" ? all.find((entry) => entry.isPC) : undefined);
-  return wanted.map((name) => ({ name, value: find(name)?.value ?? "" }));
+  return wanted.map((name) => ({ name, value: findRegister(all, name)?.value ?? "" }));
 }
 
 /** Show the source at an address in the IDE's editor. */
@@ -309,8 +406,6 @@ export async function closeProject(session: KeilSession): Promise<Reply> {
  * leaving a defined-but-unreachable command that looks implemented.
  */
 export const UNSUPPORTED_ON_MDK_5_43: Record<string, string> = {
-  "DBG_EVAL_WATCH_EXPRESSION": "answers NOT_SUPPORTED for every expression (measured with `main`, `$`, `R0`)",
-  "DBG_REMOVE_WATCH_EXPRESSION": "answers NOT_SUPPORTED for every expression",
   "DBG_EVAL_EXPRESSION_TO_STR": "never replies; DBG_CALC_EXPRESSION answers the same question",
   "DBG_EVTR_GETSTATUS": "never replies on this build",
   "DBG_ENUM_SYMTP": "needs a symbol-table id the build does not expose; answers PARSE_ERROR",
@@ -319,12 +414,26 @@ export const UNSUPPORTED_ON_MDK_5_43: Record<string, string> = {
   "DBG_FILELINE_TO_ADR": "answers NO_ADRMAP 'Address mapping failed' for both relative and absolute paths",
   "DBG_STEP_INTO_N": "documented as taking no count; the _HLL_N and _INSTRUCTION_N forms work",
   "PRJ_ACTIVE_FILES": "only answers outside a debug session, where it is not needed",
-  "PRJ_CLOSE": "only answers outside a debug session; the session is closed by exiting uVision instead",
   "PRJ_LOAD": "the project is opened by the `-s` launch line; loading a second one mid-session is refused the same way",
-  "GEN_SET_OPTIONS": "answers 'Target is in debug mode' and covers layout, not behaviour",
   "PRJ_CMD_PROGRESS": "a progress notification (0x500D family), not a command",
-  "DBG_READ_REGISTERS": "ignores the names and answers one 0x00000000 whatever is asked; the enumeration is used instead",
+  "DBG_READ_REGISTERS": "ignores the names and answers one small constant whatever is asked; the enumeration is used instead",
   "DBG_WAKE": "simulator-only; accepted, no observable effect on a hardware build",
   "DBG_SLEEP": "simulator-only; accepted, no observable effect",
   "DBG_SET_CALLBACK": "simulator-only; accepted, no observable effect",
+} as const;
+
+/**
+ * Operations that work, but only on a session that turned on extended stack
+ * mode before entering the debugger.
+ *
+ * Kept separate from the list above because "unavailable" and "available only
+ * after the right setup" are different answers, and the first version of this
+ * file had the second group filed as the first.
+ */
+export const NEEDS_EXTENDED_STACK: Record<string, string> = {
+  "DBG_ENUM_VARIABLES": "variables, including locals of a frame",
+  "DBG_VARIABLE_SET": "writing a variable by the id the enumeration reports",
+  "DBG_ENUM_TASKS": "the RTOS task list",
+  "DBG_EVAL_WATCH_EXPRESSION": "adding an expression to the Watch window",
+  "DBG_REMOVE_WATCH_EXPRESSION": "removing a watch expression",
 } as const;

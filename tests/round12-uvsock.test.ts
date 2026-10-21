@@ -20,13 +20,16 @@ import {
   messagePayload,
   prjData,
   readCountedString,
-  readDisassembly,
+  readDisassemblyText,
   readMemoryReply,
   readMenu,
   readSstr,
   readVset,
   readVtrFrame,
+  ivarEnum,
+  varVal,
   vset,
+  vsetWithValue,
   readTrnOpt,
   sstr,
   statusName,
@@ -36,7 +39,8 @@ import {
   trnOptValue,
   type AsyncFrame,
 } from "../src/embedded/uvsock.ts";
-import { UNSUPPORTED_ON_MDK_5_43 } from "../src/embedded/keilExtra.ts";
+import { NEEDS_EXTENDED_STACK, UNSUPPORTED_ON_MDK_5_43 } from "../src/embedded/keilExtra.ts";
+import { findRegister, orderStackFrames, parseRegisters, parseStackFrames, parseVariables, readTaskFrames } from "../src/embedded/keilSession.ts";
 
 /* ---------- framing ---------- */
 
@@ -244,14 +248,22 @@ test("a trace-variable name is counted without its terminator", () => {
   assert.equal(readVtrFrame(frame)?.name, "CURR_TID");
 });
 
-test("a disassembly reply reports the word it holds even with a zero length", () => {
-  // Measured for 0x08006be0: address, nLen = 0, then one instruction word.
-  // address(8) | nLen(4) | nErr(4) | ErrAddr(8) | the word at 24
-  const reply = Buffer.from("e06b0008000000000000000000000000000000000000000020c0e30e", "hex");
-  const decoded = readDisassembly(reply);
+test("a disassembly reply is the window's text, not instruction words", () => {
+  // Measured for 0x08006be0: an AMEM whose aBytes are the decoded lines —
+  // address(8) | nBytes(4) | ErrAddr(8) | nErr(4) | text.
+  // The first implementation read them as 32-bit words and reported
+  // 0x30307830 — the ASCII "0x00" — as an opcode.
+  const text = "0x08006BE0 F7F9FF38  BL.W          0x08000A54 HAL_Init\n";
+  const reply = Buffer.alloc(24 + text.length);
+  reply.writeBigUInt64LE(0x08006be0n, 0);
+  reply.writeUInt32LE(text.length, 8);
+  reply.writeBigUInt64LE(0x08006be0n, 12);
+  reply.writeUInt32LE(0, 20);
+  Buffer.from(text, "latin1").copy(reply, 24);
+  const decoded = readDisassemblyText(reply);
   assert.equal(decoded?.address, 0x08006be0);
-  assert.equal(decoded?.bytes, 0);
-  assert.deepEqual(decoded?.words, [0x0ee3c020]);
+  assert.equal(decoded?.bytes, text.length);
+  assert.equal(decoded?.text, text);
 });
 
 test("the unsupported list names why, never a bare flag", () => {
@@ -259,7 +271,148 @@ test("the unsupported list names why, never a bare flag", () => {
     assert.ok(reason.length > 20, `${name} needs a measured reason`);
   }
   // The one that would quietly return a wrong number is named explicitly.
-  assert.match(UNSUPPORTED_ON_MDK_5_43.DBG_READ_REGISTERS ?? "", /0x00000000/);
+  assert.match(UNSUPPORTED_ON_MDK_5_43.DBG_READ_REGISTERS ?? "", /enumeration/);
+});
+
+test("watch expressions and variables are not filed as unsupported", () => {
+  // They answer NOT_SUPPORTED only until extended stack mode is on; that is a
+  // setup requirement, not a missing capability, and listing them as
+  // unavailable is how the feature stayed switched off.
+  for (const name of ["DBG_EVAL_WATCH_EXPRESSION", "DBG_REMOVE_WATCH_EXPRESSION", "DBG_ENUM_VARIABLES", "DBG_VARIABLE_SET", "DBG_ENUM_TASKS"]) {
+    assert.equal(UNSUPPORTED_ON_MDK_5_43[name], undefined, `${name} works in extended stack mode`);
+    assert.ok(NEEDS_EXTENDED_STACK[name], `${name} should be listed as needing extended stack mode`);
+  }
+});
+
+test("a register frame's value starts one byte past the flags", () => {
+  // Measured REGENUM: 0000 0000 "R0\0…" 02 "0x00000000\0…"
+  // The old parse read a u32 at 20, swallowing the first three characters of
+  // the value: 0x08006458 came out as the plausible "8006460".
+  const body = Buffer.alloc(53);
+  body.writeUInt16LE(0, 0);
+  body.writeUInt16LE(0, 2);
+  body.write("R0\0", 4, "latin1");
+  body.writeUInt8(0x02, 20);
+  body.write("0x08006458\0", 21, "latin1");
+  const frame: AsyncFrame = { type: 0x5028, echoed: 0, data: body, raw: Buffer.alloc(0) };
+  const [register] = parseRegisters([frame]);
+  assert.equal(register?.name, "R0");
+  assert.equal(register?.value, "0x08006458");
+  assert.equal(register?.canChange, true);
+  assert.equal(register?.isPC, false);
+});
+
+test("a register write carries the value in the VSET value field", () => {
+  // VSET is packed: type(4) value(8) len(4) text. Writing "R0" with the value
+  // left at zero is answered SUCCESS and changes nothing — the old request
+  // put the name and value in two back-to-back SSTRs.
+  const request = vsetWithValue("R0", 5, 0x42n);
+  assert.equal(request.readInt32LE(0), 5);
+  assert.equal(request.readBigInt64LE(4), 0x42n);
+  assert.equal(request.readInt32LE(12), 3);
+  assert.equal(request.subarray(16, 18).toString("latin1"), "R0");
+});
+
+test("a variable request carries a count, and a write names the variable by id", () => {
+  // IVARENUM with count = 0 is answered SUCCESS with an empty stream, so a
+  // request that asks for nothing looks like an image with no symbols.
+  const request = ivarEnum(0, 0, 0, 128);
+  assert.equal(request.length, 16);
+  assert.equal(request.readUInt16LE(12), 128);
+  // VARVAL is that IVARENUM followed by the new value as an SSTR.
+  const write = varVal(0x123456, 0, 0, "42");
+  assert.equal(write.readInt32LE(0), 0x123456);
+  assert.equal(write.readInt32LE(16), 3);
+  assert.equal(write.subarray(20, 22).toString("latin1"), "42");
+});
+
+test("a variable frame keeps its id, index and count", () => {
+  // VARINFO: nID(4) index(4) count(4) typeSize(4) flags(4) value(SSTR) …
+  const body = Buffer.alloc(20 + 260 * 4);
+  body.writeInt32LE(0x0abc, 0);
+  body.writeInt32LE(33, 4);
+  body.writeInt32LE(0, 8);
+  body.writeUInt32LE(1, 16); // editable
+  sstr("0x00003039").copy(body, 20);
+  sstr("uint").copy(body, 280);
+  sstr("uwTick").copy(body, 540);
+  const frame: AsyncFrame = { type: 0x5041, echoed: 0, data: body, raw: Buffer.alloc(0) };
+  const [variable] = parseVariables([frame]);
+  assert.equal(variable?.id, 0x0abc);
+  assert.equal(variable?.index, 33);
+  assert.equal(variable?.name, "uwTick");
+  assert.equal(variable?.value, "0x00003039");
+  assert.equal(variable?.editable, true);
+});
+
+test("a task's name is read from its counted slot, not straight after the address", () => {
+  // Measured STACKENUM task frame, 276 bytes: nItem, nAdr, nRetAdr, nVars,
+  // nEqual, nTotal, nTask, nRes[3], then a counted name — `0c 00 00 00` at 36
+  // and "Main Thread" at 40. Reading at 12 gave an empty string for a target
+  // with a real thread, which the caller then filtered away.
+  const body = Buffer.alloc(276);
+  body.writeUInt32LE(2, 0);
+  body.writeBigUInt64LE(0n, 4);
+  body.writeBigUInt64LE(0n, 12);
+  body.writeUInt32LE(12, 36);
+  body.write("Main Thread\0", 40, "latin1");
+  const frame: AsyncFrame = { type: 0x5051, echoed: 0, data: body, raw: Buffer.alloc(0) };
+  const task = readTaskFrames([frame])[0];
+  assert.equal(task?.name, "Main Thread");
+  assert.equal(task?.id, 2);
+});
+
+test("the stack is reported innermost first", () => {
+  // The debugger lists it from the bottom up: Reset_Handler's return address
+  // is 0xffffffff. Reporting that order made "#0" the startup code.
+  const frame = (item: number, address: number, ret: bigint) => {
+    const body = Buffer.alloc(48);
+    body.writeUInt32LE(item, 0);
+    body.writeBigUInt64LE(BigInt(address), 4);
+    body.writeBigUInt64LE(ret, 12);
+    return { type: 0x5015, echoed: 0, data: body, raw: Buffer.alloc(0) } as AsyncFrame;
+  };
+  const ordered = orderStackFrames([
+    frame(1, 0x08000258, 0xffffffffn),
+    frame(2, 0x08006460, 0x08000258n),
+  ]);
+  assert.equal(ordered[0]?.address, 0x08006460);
+  assert.equal(ordered[0]?.level, 0);
+  assert.equal(ordered[1]?.address, 0x08000258);
+});
+
+test("a stack frame is what the record holds, not a symbol read from its fields", () => {
+  // A 48-byte STACKENUM frame is nItem, nAdr, nRetAdr, nVars, nEqual, nTotal,
+  // nTask, nRes[3] — no text. Reading a symbol at 20 put `nEqual` (2) into the
+  // function name, and the stack printed "#0 Reset_Handler" for a frame that
+  // was in SystemInit.
+  const body = Buffer.alloc(48);
+  body.writeUInt32LE(1, 0);
+  body.writeBigUInt64LE(0x08000258n, 4);
+  body.writeBigUInt64LE(0xffffffffn, 12);
+  body.writeUInt32LE(0, 20);
+  body.writeUInt32LE(2, 24);
+  body.writeUInt32LE(2, 28);
+  const frame: AsyncFrame = { type: 0x5015, echoed: 0, data: body, raw: Buffer.alloc(0) };
+  const [parsed] = parseStackFrames([frame]);
+  assert.equal(parsed?.address, 0x08000258);
+  assert.equal(parsed?.function, undefined);
+  assert.equal(parsed?.variables, 0);
+});
+
+test("a register can be named the way a person types it", () => {
+  // The debugger lists `R15 (PC)`; the old lookup searched for `PC` exactly,
+  // found nothing, sent the write anyway and reported SUCCESS.
+  const registers = [
+    { group: 0, index: 0, name: "R0", value: "0x00000000", isPC: false, canChange: true },
+    { group: 0, index: 13, name: "R13 (SP)", value: "0x200009A8", isPC: false, canChange: true },
+    { group: 0, index: 15, name: "R15 (PC)", value: "0x08006458", isPC: true, canChange: true },
+  ];
+  assert.equal(findRegister(registers, "PC")?.name, "R15 (PC)");
+  assert.equal(findRegister(registers, "sp")?.name, "R13 (SP)");
+  assert.equal(findRegister(registers, "R15")?.name, "R15 (PC)");
+  assert.equal(findRegister(registers, "15")?.name, "R15 (PC)");
+  assert.equal(findRegister(registers, "R7"), undefined);
 });
 
 /* ---------- the Keil downloader ---------- */

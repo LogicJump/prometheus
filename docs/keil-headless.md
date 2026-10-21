@@ -1,328 +1,267 @@
 # Keil MDK：无头能做的全部事
 
-日期：2026-10-21。上一版只做到「探测 + 用 `UV4 -b` 构建」。这一版把 Keil 自己公开的
-**远程控制接口（UVSOCK）** 接通了：断点、单步、寄存器、变量、内存、栈、地址到源码行、
-工程结构编辑、编译选项读写、在 IDE 里构建与烧录。全部在无头会话里完成，不需要 uVision
-窗口，也不打包、不分发任何 Keil 二进制。
+日期：2026-10-21（第三版）。前两版声称「公开接口全部接通」；逐个报文在真实 MDK 5.43a +
+真实 STM32F429 工程上重新核对后，发现**寄存器、变量、任务、反汇编四条链路每一条都读错了
+字节**，另有三处「接口回 SUCCESS 但什么都没发生」。这一版把它们修掉，并把结论按证据重写。
 
 ---
 
 ## 一、先回答「无头到底能做什么」
 
-Keil 自己没有 Linux 那种「一个命令做所有事」的入口。它公开的是三类东西，能力边界很清楚：
+Keil 自己没有 Linux 那种「一个命令做所有事」的入口。它公开的是三类东西：
 
 | 入口 | 能做什么 | 不能做什么 |
 |---|---|---|
-| `UV4.exe -b/-r/-c/-f/-d/-i/-n/-et/-ep/-X` | 构建、重译、清理、烧录、进调试、用 XML 导入/新建工程、导出 cprj、生成预处理器符号文件 | 断点、单步、读变量（`-d` 只是进调试，命令要另给） |
-| `fromelf.exe`、`armclang.exe`、`armlink.exe`、`armasm.exe`、`armar.exe`、`UV4\SVDConv.exe`、`PackInstaller.exe` | 读镜像尺寸/符号/反汇编、单独编译、链接、打包、生成 SVD | 驱动调试器；`fromelf` 也不在 `UV4.exe` 旁边 |
-| **UVSOCK（TCP）** | 调试器的全套操作 + 工程模型 + 每一类编译选项 | 编辑器里没有暴露成 API 的 GUI 专属功能 |
+| `UV4.exe -b/-r/-c/-cr/-f/-X/-et/-ep/-5/-t` | 构建、重译、清理、烧录、生成符号头、导出 cprj、转换工程 | 断点、单步、读变量 |
+| `fromelf` / `armclang` / `cpackget` / `cbuild` / `svdconv` | 读镜像、单独编译、装包、CMSIS-Toolbox 构建 | 驱动调试器 |
+| **UVSOCK（TCP）** | 调试器的全套操作 + 工程模型 + 编译选项 | 编辑器本身、工程保存（见第四节） |
 
-第三类是这个产品的关键。`UVSC64.dll` 导出的符号表和公开的 `UVSOCK.h` 说明了它覆盖什么，
-本轮把其中有意义的部分逐个接通并实测。
-
-**启动方式**（文档 `uv4_commandline.html` 的 `-s port`）：
-
-```
-UV4.exe <project.uvprojx> -s 4823 -j0
-```
-
-`-j0` 压住 GUI 和对话框，`-s` 打开 TCP 监听。实测约 4 秒后端口可用。
+**启动方式**：`UV4.exe <project.uvprojx> -s 4823 -j0`，实测约 4 秒后端口可用。
 
 ---
 
-## 二、协议本身（全部来自实测，不是照抄头文件）
+## 二、协议本身
 
-一个消息 = **32 字节头 + 负载**：
+消息 = 32 字节头 + 负载：
+`{ u32 totalLen, u32 cmd, u32 bufLen, u64 cycles, u64 tStamp, u32 id }`。
+应答用 `0x3000`，负载 `{ u32 回显命令, u32 状态, … }`，**按回显命令匹配，不按到达顺序**。
+枚举类命令先回 `^done`，再流式推 `0x50xx` 帧。
 
-```
-偏移  长度  字段
- 0     4    m_nTotalLen   整条消息长度（含头）
- 4     4    m_eCmd        操作码
- 8     4    m_nBufLen     负载长度
-12     8    cycles        仅仿真器
-20     8    tStamp        仅仿真器
-28     4    m_Id          保留，恒为 0
-32     …    负载
-```
+### 关键：接口是 `#pragma pack(1)`
 
-应答用 `m_eCmd = 0x3000`，负载是 `{ u32 回显的命令, u32 状态, … }`。**应答按回显的命令匹配，
-不是按到达顺序**——枚举类命令先回 `^done`，再流式推 `0x50xx` 帧。
+这是上一版所有解析错误的共同根因。头文件里的结构体没有对齐填充，而实现按自然对齐去读，
+于是每个「字段偏移」都错开一到三个字节，错出来的值**看起来又很像真的**：
 
-### 头文件没写、只能实测出来的五处
+| 结构 | 正确布局（pack(1)） | 上一版读成 | 后果 |
+|---|---|---|---|
+| `REGENUM` | `u16 nGi, u16 nItem, char szReg[16], u8 flags, char szVal[32]` | flags 当成 `u32@20`，值从 24 起 | `0x08006458` → `8006460`，PC 少三位、看着像个合法地址 |
+| `VSET` | `{ TVAL val; SSTR str }`，val 在 4，str 在 12 | value 从 8 读 | `0x08006458` → `0x006458`，跑到内存低半区 |
+| `VARINFO` | `nID, index, count, typeSize, flags, value(SSTR), type, name, qualified` | 偏移对、但请求里 count=0 | 见下 |
+| `STACKENUM`（任务） | `nItem, nAdr, nRetAdr, nVars, nEqual, nTotal, nTask, nRes[3], 计数名字@36/文本@40` | 名字从 44 读 | 有线程的目标报「没有任务」 |
+| `AMEM`（反汇编） | `nAddr, nBytes, ErrAddr, nErr, **文本**` —— 字节是窗口里的字符串 | 当成 32 位指令字 | 把 ASCII `"0x00"`(`0x30307830`) 当成操作码打印出来 |
 
-这几处第一版全错，而且每一处都产生了一个**看起来合理的错误结果**：
+### 只有实测才知道的几个语义
 
-| 现象 | 真实原因 | 实测证据 |
-|---|---|---|
-| 断点列表永远是 `[]` | 枚举帧可能在 `^done` 之前到达，而从「现在」开始收集会漏掉它们 | 帧在 `send()` 返回前就已入队 |
-| 每个停止都是 `reason 0` | `BPREASON` 的 reason 在偏移 12，不是 0；PC 在 16，地址在 24 | 断点命中帧：`1,0,0,1,0x08006460,0x08006460,-1` |
-| 寄存器组名是 `"\u0004"` | 枚举帧是 `{u32 长度, 文本}`，长度**不含**结尾 0；`SSTR` 的含 | `04 00 00 00 "Core\0"` |
-| 选项读出来是 `TOUCH, A=1,B=2` | `TRNOPT` 的第 0 个字符串永远是 target 名 | 实测 `CDEF` 应答 |
-| 每次停止都报「(no source)」 | `AFLMAP` 的文件名不在 40，前面还有保留字 | 实测回复里字符串从 44 开始 |
-
-还有一处不是解析问题而是**语义**：`0xffffffff` 在 `TRNOPT` 里不是「未指定」，`0` 才是。
-送 `0xffffffff` 会让 uVision 从一个无意义偏移读出 group 名，回你 `Group 'ÿ'`。
+- `IVARENUM` 的 **count 为 0 时回 SUCCESS 且一条不推**。「没有符号表」和「没请求任何东西」
+  长得一模一样；现在固定请求 128 条。
+- 变量 / 任务 / Watch 需要 **extended stack mode**（`GEN_SET_OPTIONS` 的
+  `bExtendedStack`）。该选项**只在进调试之前**被接受；进调试后设会回
+  `Target is in debug mode`。上一版把它当「只管界面布局、无行为」标成不可用，
+  于是整组功能都是 `NOT_SUPPORTED`。
+- `PRJ_FLASH_DOWNLOAD` 是工程操作：调试会话里回 `Target is in debug mode`。
+- `PRJ_FLASH_ERASE` 在 5.43a 上**从不回复**（15 s / 20 s / 60 s 都试过）。
+- `DBG_ENTER` 是异步的，失败出现在后面的 `0x4000` 帧里。
 
 ### 状态码
 
 `0` 成功、`6` 未调试、`9` 找不到、`10` 正在调试、`11` 目标运行中、`12` 目标已停止、
-`28` 不支持。其中三个不能当失败：
+`19` 断点重定义、`28` 不支持、`29` 超时、`32` 无地址映射。
 
-- `12 TARGET_STOPPED` 对 `halt` 是**已经满足的请求**，不是错误。
-- `11 TARGET_EXECUTING` 对 `run` 是**已经在跑**，应继续等停止而不是报错。
-- `9 NOT_FOUND` 对变量枚举是**没有符号表**，应当作空列表。
+其中三个不能当失败：`12` 对 `halt` 是已满足；`11` 对 `run` 是已在跑；`9` 对变量枚举是空列表。
 
 ---
 
-## 三、接通了什么
+## 三、这一版修掉的「假完成」
 
-`src/embedded/uvsock.ts` 是协议层（封包、字符串、`TRNOPT`、`BPREASON`、内存读写），
-`src/embedded/keilSession.ts` 是会话层（把原始命令变成有意义的动作），
-`src/tools/keilTools.ts` 是两个工具。
+每一条都是「接口说成功、结果不是那么回事」，也都是拿真实工程跑出来的。
 
-### 调试（`keil_debug`）
+### 1. 寄存器值是错的
 
-| 动作 | 底层 | 实测 |
-|---|---|---|
-| `open` | `PRJ_SET_DEBUG_TARGET` + `DBG_ENTER` | 硬件与仿真器都能进 |
-| `run` / `continue` | `DBG_START_EXECUTION` + 等停止通知 | 停在 `main`，报出源码行 |
-| `halt` | `DBG_STOP_EXECUTION` | 已停止时如实说「已经停了」 |
-| `step` / `step_into` / `step_instruction` / `step_out` | `DBG_STEP_HLL/INTO/INSTRUCTION/OUT` | 帧级单步从 `main.c:35` 走到 `:38` |
-| `breakpoints` / `breakpoint_add` / `breakpoint_delete` | `DBG_ENUMERATE_BP` / `CREATE_BP` / `CHANGE_BP` | 列出 `#1 exec main @ 0x08006be0` |
-| 读 / 写 / 访问断点 | `CREATE_BP` 带 `BKTYPE` | 已接 |
-| `registers` / `register_set` | `DBG_ENUM_REGISTERS` / `REGISTER_SET` | 152 个寄存器，PC 标出来 |
-| `variables` | `DBG_ENUM_VARIABLES` | 无符号表时明确说明 |
-| `stack` | `DBG_ENUM_STACK` + `ADR_TOFILELINE` | `#0 SystemInit system_stm32f4xx.c:174` |
-| `where` | `DBG_READ_REGISTERS` + `ADR_TOFILELINE` | `main.c:35 (main)` |
-| `read` / `write` | `DBG_MEM_READ` / `MEM_WRITE`，写后回读 | 回读不一致会明说 |
-| `evaluate` | `DBG_EXEC_CMD` 的 `EVAL` | `$ = 0x08006460` |
-| `tasks` / `trace` | `DBG_ENUM_TASKS` / `ENUM_VTR` | 无 RTOS 时明确说没有 |
-| `build` / `rebuild` / `flash` / `erase` | `PRJ_BUILD/REBUILD/FLASH_DOWNLOAD/FLASH_ERASE` | 已接 |
-| `sessions` / `close` | 进程内会话表 | 复用会话，不重复进调试 |
+见上表。`register_read PC` 之前回 `8006460`，现在是 `0x08006458`。
+寄存器枚举返回的 152 条里，值现在完整。
 
-### 工程（`keil_project`）
+### 2. 写寄存器：SUCCESS，但值不变
 
-`info`、`groups`/`files`、`add_group`、`add_file`、`remove_file`、`remove_group`、
-`get_option`、`set_option`、`set_target`、`output_name`。
+`REGISTER_SET` 收的是 `VSET`，**新值必须在 value 字段里**。上一版发的是两个前后相接的
+`SSTR`，uVision 回 `SUCCESS`，寄存器一动不动。现在写后**回读核对**，没变就报
+「accepted but reads back …」，并且能按人写的名字找到寄存器——调试器列的是
+`R15 (PC)`、`R13 (SP)`，直接找 `PC` 是找不到的。
 
-**实测确认真的写进 `.uvprojx`**：加一个 `ProbeGroup` 和一个文件后，文件从 24591 字节变成
-24907 字节，`ProbeGroup` 和文件名都在里面；`SET_OPTITEM` 写的 `PROBE_MARKER=1` 也能读回来。
+### 3. 写变量：SUCCESS，但请求里没有值
+
+`VARIABLE_SET` 收 `VARVAL`（`IVARENUM` + 新值），按 **nID** 定位，不是按名字。
+上一版按名字发，得到一个「看起来成功」的回复。现在先枚举、按 id 写、再回读：
+实测 `uwTick` 从 `0x00000000` 写到 `0x00003039`。
+
+### 4. 变量列表一直是空的
+
+三个原因叠加：没开 extended stack mode、请求 count=0、以及把 `NOT_FOUND` 当「没有符号表」。
+现在 `variables` 列出全局（36 个，带类型、数组长度、只读标记），`frame` 参数可列栈帧局部量。
+
+### 5. 任务：有线程也报「没有任务」
+
+名字偏移错（44 → 40）。实测该目标的 RTOS 感知插件报 `Main Thread`。
+
+### 6. 反汇编：把 ASCII 当指令打印
+
+`DSM_READ` 回的是**已经反汇编好的文本**，不是指令字。现在原样输出，并且知道
+「请求 32 字节会回空、要 128」这个实测特性，会自动加大再试一次：
+
+```
+    35:     HAL_Init();                     //初始化HAL库
+0x08006BE0 F7F9FF38  BL.W          0x08000A54 HAL_Init
+```
+
+### 7. 栈：`#0` 报的是最外层
+
+调试器**自底向上**报帧（`Reset_Handler` 的返回地址是 `0xffffffff`），且帧里没有符号文本。
+上一版既没倒序，又把 `nEqual` 当函数名读。现在倒序，符号靠 `ADR_TOFILELINE` 补：
+
+```
+#0 SystemInit system_stm32f4xx.c:174  (0x8006460)
+#1 Reset_Handler ../CORE/startup_stm32f429xx.s:200  (0x8000258)
+```
+
+### 8. 烧写：在调试会话里根本不会执行
+
+`flash` 之前走的是调试会话，拿到 `Target is in debug mode` 就结束。现在构建/烧写/擦除
+走 4824 的非调试会话；实测 `0x5001` 完成帧 + 无失败帧时报 `Flashed OK`。
+
+### 9. `-5` 转换：把输入当输出
+
+`convert` 的「期望产物」写成 `TOUCH.uvprojx`（输入本身），所以永远存在、永远「成功」。
+现在 `.uvprojx` 上跑 `-5` 直接说明「没有可转换的」。
 
 ---
 
-## 四、两处「看起来能用其实不行」的坑
+## 四、工程编辑：改得动，但**保存要靠关会话**
 
-### 1. 调试模式和工程操作是**互斥**的
+这一节是这一轮最费劲的发现。
 
-实测 MDK 5.43a：
+`PRJ_ADD_GROUP` / `PRJ_ADD_FILE` / `PRJ_DEL_*` / `SET_OPTITEM` 都回 `SUCCESS`，
+但 `.uvprojx` 在磁盘上**一个字都不变**。实测排除掉了所有其他可能：
 
-- 进了调试模式 → `PRJ_ADD_GROUP`、`PRJ_GET_OPTITEM`、`PRJ_SET_TARGET` 全部回
-  `10 DEBUGGING  Target is in debug mode`
-- 没进调试模式 → 上面这些正常，但 `PRJ_ENUM_TARGETS` / `ENUM_GROUPS` / `ENUM_FILES`
-  回 `10 DEBUGGING`
+- `GEN_EXIT`（接口自己的退出）：进程退出、文件回写成**空组**，`Files` 没了；
+- 强制杀进程：丢失；
+- 用命令行 `-b` / 空跑到同一工程：文件不变；
+- `close_project` + 2.5 s 等待：仍然不变。
 
-所以两类操作各用一个 uVision 实例：调试会话在 4823，工程读写会话在 4824。
-这不是设计选择，是接口的实际约束。
+也就是说 uVision 把编辑攒在内存里，退出时按它自己的时机写盘，写不写、什么时候写不受
+接口控制。**结论不是「已实现」，是「接口能改，落盘不可靠」**，所以在文档和工具输出里
+如实写成这样：
 
-### 2. 目标板不在时，`DBG_ENTER` 仍然回 `SUCCESS`
+- `keil_project` 的编辑会立即在会话内生效；
+- `close` 会报告是否真的写入了文件（对比关闭前后字节）；
+- 不保证写入。
 
-进调试是**异步**的：`DBG_ENTER` 立刻回成功，然后真正去复位、烧录、启动。失败出现在后面的
-`0x4000` 帧里：
+### 另外两条实测的编辑限制
 
-```
-Cannot access target.
-Shutting down debug session.
-Error: Flash Download failed  -  Target DLL has been cancelled
-```
-
-所以「进没进去」不能看应答，要看 `DBG_STATUS` 加这些帧。这条错误路径是拿真实板子
-（未响应）测出来的，不是构造的。
+1. **一个文件只能出现一次**。`PRJ_ADD_FILE` 对工程里任何组已存在的文件回
+   `ALREADY_PRESENT`。现在会在本地先查并说明「它在 USER 组里，uVision 不允许重复列出」，
+   而不是把 `ALREADY_PRESENT` 直接抛给用户。
+2. **`PRJ_DEL_FILE` 要 `{组, 文件名}`**，且删的是工程级的那个条目。
+   只给文件名会被当成组名，回 `NOT_FOUND: Group 'x'`。
+3. `PRJ_ENUM_FILES` 要 `SSTR` 而不是 `PRJDATA`，而且**只在调试会话里可用**——
+   而所有编辑在调试会话里被拒。所以「列出组里的文件」改为直接读 `.uvprojx`（uVision
+   写的也是同一份），编辑仍走 uVision。
 
 ---
 
-## 四之二、上一版真正漏掉的：烧写
+## 五、其余已接通的能力
 
-这一条不是接口清单的问题，是**整条产品链路断了**：`embed_flash` 拒绝 `.axf`，
-而 `.axf` 就是 Keil 构建出的 ELF。也就是说 Keil 工程能构建、能调试，**不能烧到板上**。
+### 调试（`keil_debug`，47 个动作）
 
-现在 `flasher: "keil"` 走文档里的无头下载：
+`open` / `run` / `continue` / `halt` / `reset` / `run_to` / `step*` / `breakpoints` /
+`breakpoint_add` / `breakpoint_delete` / `watch_add` / `registers` / `register_read` /
+`register_set` / `variables` / `stack` / `where` / `read` / `write` / `evaluate` /
+`command` / `variable_set` / `tasks` / `trace` / `trace_set` / `disassemble` / `menus` /
+`menu_exec` / `time` / `license` / `version` / `window` / `build` / `rebuild` / `clean` /
+`clean_rebuild` / `export_cprj` / `symbols` / `convert` / `flash` / `erase` / `sessions` /
+`close` / `close_project`。
 
-```
-UV4.exe -f <project.uvprojx> -j0 -o <project>uild\keil-flash.log
-```
+### 命令通道
 
-两个只有实测才会发现的细节：
+`action: "command"` 直接执行 uVision 命令语言（`BS`/`BA`/`BL`/`BK`/`SAVE`/`LOG`/
+`COVERAGE`/`LOGICAnalyze`…）。实测 `BL` → `0: (E 0x08006BE0) 'main', CNT=1, enabled`。
+`EXIT` 会让 uVision 自己退出调试而会话不知道，现在会同步状态。
 
-1. **判定必须读日志，不能看退出码。** `UV4 -f` 的控制台什么都不打印。不读 `-o` 文件时
-   结果是「无状态、退出码 0」，一个**真实的失败会被当成成功**。第一版就是这样。
-2. **日志把各步骤挤在一行、用单空格**，不是文档里那种分行排版：
-   `Erase Done.Programming Done.Verify OK.Flash Load finished at 11:39:30`。
-   按行首匹配失败，所以匹配器改成在全文里找。现在这条日志报 `verified: yes`。
+### UV4 命令行
 
-`.axf` 只对 Keil 下载器放行；给别的 flasher 时说明「这是 Keil 的 ELF 后缀，请改名或用
-`flasher: keil`」，而不是一句笼统的「不是固件格式」。
+`-b`/`-r`（全量重译）/`-c`/`-cr`/`-f`/`-X`/`-X1`/`-et`/`-ep`/`-5`/`-t`/`-l`/`-j0`/`-sg` 已接。
+`-et` 在该工程上退出 0 但什么都不写，按「没写出文件就是失败」报。
 
-## 四之三、调试命令通道
+**未接**：`-i`/`-n`/`-np`（会创建或改写工程，属破坏性操作）、`-q`/`-z`（`.uvmpw`
+多工程，本机没有可实测的工程）、`-d`/`-x`/`-y`（DDE，被 UVSOCK 完全覆盖）。
 
-uVision 的调试器有一整套命令语言（`BS`/`BA`/`BL`/`SAVE`/`LOG`/`COVERAGE`/
-`PerformanceAnalyze`/`LOGICAnalyze`…），它们不是一个个独立操作，而是走
-`UV_DBG_EXEC_CMD` 一个通道。上一版只把它当成「求值的备选路径」，等于漏了大半个
-调试器。现在 `keil_debug action: "command"` 直接执行任意命令并回显输出：
+### CMSIS-Toolbox
 
-```
-> command BL
- 0: (E 0x08006BE0) 'main', CNT=1, enabled
-> command BS main
-（静默成功）
-> command EXIT
-left debug mode; the debugger's breakpoints were cleared with it
-```
+`G:\software\keil5\ARM\cmsis-toolbox\bin` 里的 `cbuild 2.10.0`、`cpackget 2.1.8`、
+`svdconv 3.3.48` 成为一等工具链；`*.csolution.yml` / `*.cprj` 成为新的工程类型；
+`embed_packs` 能装包（`cpackget add --agree-embedded-license`，失败时它仍回 0，所以看 `E:` 行）。
 
-`EXIT` 是其中一个真实的坑：它让 uVision 自己退出调试，而会话对象不知道，之后每个
-命令都会回 `Target is not in debug mode`。现在会同步状态，并在下一次 `open` 时重新进入。
+顺带修掉：工程探测向上走五层会把**另一个无关目录**的 `.csolution.yml` 当成当前工程
+（测试里两个临时目录真的串了）。
 
-## 四之四、UV4 命令行开关
+---
 
-文档列了 25 个开关，上一版只用了 `-b`、`-o`、`-j0`。逐个核对后补上：
+## 六、接口清单与覆盖
 
-| 开关 | 作用 | 实测 |
-|---|---|---|
-| `-t <target>` | 选择 target | **构建时接上了**。多目标工程里不传就是「上一次留下的那个」，这不该由构建命令替你决定 |
-| `-r` | 全量重译 | `release: true` 走 `-r` 而不是 `-b`；重译后日志里有 `Program Size:`，RAM 是精确的 2050472 字节 |
-| `-c` / `-cr` | 清理 / 清理后重译 | `keil_debug action: "clean"`，日志 `Clean started… Clean done` |
-| `-X` / `-X1` | 生成 `co-arm_<target>.h` 预处理符号 | 可用，写出 `OBJ\co-arm_TOUCH.h` |
-| `-et` / `-ep` | 导出 `cprj` | **该工程上什么都不产出**；UV4 退出码仍是 0。现在按「没写出文件就是失败」报告，不按退出码 |
-| `-5` | 把 µVision 4 的 `.uvproj` 转成 `.uvprojx` | 已接（用 `-l` 而不是 `-o`，这是它唯一接受的日志开关） |
-| `-f` | 烧写 | 见上一节 |
-| `-i` / `-n` / `-np` | 用 XML 建工程 / 按器件名建工程 | **未接**：会创建或改写工程，属于破坏性操作，不该由 agent 顺手做 |
-| `-q` / `-z` | 多工程文件的批处理构建 | **未接**：只在 `.uvmpw` 多工程上有意义，本轮没有这类工程可实测 |
-| `-d` / `-x` / `-y` | 进调试 + DDE | 调试走 UVSOCK，比 DDE 完整得多；`-d` 只在没有 socket 的旧版本上才有意义 |
-| `-s` / `-sg` / `-l` | 开 socket / 忽略 GUI 布局 / 日志 | 已用（`-s`、`-sg` 隐含在 `-j0` 的用法里，`-l` 用于 `-5`） |
+88 个公开操作码：**71 个已接通并实测**，**14 个在该版本上不可用**（逐个带实测理由），
+**3 个需要前置条件**（extended stack mode）。没有「定义了但从没调用」的。
 
-## 四之五、镜像缺失时「进了调试但什么都没加载」
+### 该版本上真的不工作
 
-这是本轮最后一个假成功，而且最隐蔽：把 `.axf` 删掉后，uVision **仍然进入了调试模式**，
-只在命令窗口打一行 `*** error 56: cannot open file`。`DBG_STATUS` 说「已停止」，
-`DBG_ENTER` 说成功，于是 `open` 报成功——之后每个断点、寄存器、单步却全回
-`Target is not in debug mode`。用的人会去找探针问题，而真正的原因是没构建。
-
-现在 `enterDebug` 把这条命令窗口错误当作进入失败，原因写成
-「调试器进去了但加载不了镜像，请先构建，并确认工程的输出名指向一个存在的文件」。
-
-## 四之六、Keil 里的 CMSIS-Toolbox 整个没被发现
-
-这台机器的 `G:\software\keil5\ARM\cmsis-toolboxin` 里装着一整套 Arm 的
-CMSIS-Toolbox：`cbuild 2.10.0`、`cpackget 2.1.8`、`svdconv 3.3.48`，还有
-`csolution`、`cbuild2cmake`、`packchk`。上一版的探测里**一个都没有**——`toolchain.ts`
-连 `cbuild` 三个字都搜不到。后果：
-
-- `*.csolution.yml` / `*.cprj` 工程根本认不出来，更谈不上构建
-- `cpackget` 明明就在本机，`embed_packs` 却只会告诉用户「自己装一个」
-- 我在文档里写「`-et` 导出的 cprj 供 CMSIS-Toolbox 构建」，而我们并不支持那个工具链
-
-现在：三个工具成为一等工具链（会去 Keil 安装目录的 `ARM\cmsis-toolboxin` 找），
-`csolution` 成为新的工程类型并用 `cbuild` 构建，`embed_packs` 增加了 `install` / `remove`
-（走 `cpackget add --agree-embedded-license`，参数是实测的：`--agree-embed-pdk` 那个拼法会被拒绝）。
-
-另外 `cpackget` 会在失败时仍返回 0，所以判定看输出里的 `E:`，不看退出码。
-
-### 顺带修掉的一个探测 bug
-
-工程探测会向上走五层找祖先目录。加上 `csolution` 之后，它把**另一个无关临时目录**里的
-`.csolution.yml` 当成了本工程的解——测试里两个临时目录互相串了。这在真实机器上意味着
-按 `%TEMP%` 或某个用户主目录去构建。现在 `csolution`/`cprj` 只在当前目录匹配。
-
-## 五、接口清单与覆盖情况
-
-公开接口共 **88 个操作**，当前：**71 个已接通并实测**，**17 个在该版本上不可用**（逐个列在下面，
-并在 `UNSUPPORTED_ON_MDK_5_43` 里带实测理由）。没有「定义了但从不调用」的。
-
-### 本轮补上的（上一版漏掉的）
-
-| 操作 | 实测结果 |
+| 操作 | 实测 |
 |---|---|
-| `DBG_CALC_EXPRESSION` | **可用且比命令窗口好**：一次拿到 64 位值加调试器自己的渲染（`main` → `0x08006be0`） |
-| `DBG_RESET` | 可用，复位后目标重新走到 `SystemInit` |
-| `DBG_RUN_TO_ADDRESS` | 可用，停在目标地址 |
-| `DBG_STEP_HLL_N` / `STEP_INSTRUCTION_N` | 可用，按行/按指令走 N 步 |
-| `DBG_DSM_READ` | 可用但**内容很少**：该版本只回一个指令字且 `nLen=0`，如实报告而不是伪造反汇编 |
-| `DBG_ENUM_MENUS` / `MENU_EXEC` | 可用，列出 Trace Data / Performance Analyzer 等 12 项及启用状态 |
-| `DBG_ENUM_VTR` / `VTR_SET` | 枚举可用（`CURR_TID`、`TRAPS`、`STCLK`…）；`VTR_SET` 只对枚举出的名字生效 |
-| `DBG_ITM_REGISTER` / `EVTR_REGISTER` / `EVTR_ENUMSCVDFILES` | 均可用 |
-| `DBG_TIME_INFO` | 可用（仿真器时钟：周期数 + 时间戳） |
-| `PRJ_GET_DEBUG_TARGET` / `PRJ_SET_OUTPUTNAME` | 可用 |
-| `GEN_CHECK_LICENSE` / `GEN_GET_EXTVERSION` | 可用，回 `uVision V5.43.1.0 / UVSOCK V2.29` |
-| `GEN_SHOW` / `HIDE` / `MINIMIZE` | 可用 |
-| `DBG_ADR_SHOWCODE` | 可用（在 IDE 里定位到地址） |
-
-### 该版本上不可用的（不是没写，是接口不工作）
-
-| 操作 | 实测行为 |
-|---|---|
-| `DBG_READ_REGISTERS` | **忽略寄存器名**，对 `PC`/`SP`/`R13`/`R0,R1` 一律回 `0x00000000`。假数据比拒绝更糟，所以改从枚举里按名取 |
-| `DBG_EVAL_WATCH_EXPRESSION` / `REMOVE_WATCH_EXPRESSION` | 任何表达式都回 `NOT_SUPPORTED` |
-| `DBG_EVAL_EXPRESSION_TO_STR` | 永不回复 |
-| `DBG_EVTR_GETSTATUS` | 永不回复 |
+| `DBG_READ_REGISTERS` | 忽略名字，对 `PC`/`SP`/`R0,R1` 都回 `0x00000001`；改用枚举 |
+| `DBG_VTR_GET` | 回 `Unknown VTR-name`，即使名字是它自己枚举出来的 |
+| `DBG_EVAL_EXPRESSION_TO_STR` / `DBG_EVTR_GETSTATUS` | 永不回复 |
 | `DBG_ENUM_SYMTP` | 回 `PARSE_ERROR`（缺该版本不暴露的 symbol-table id） |
-| `DBG_VTR_GET` | 回 `FAILED: Unknown VTR-name`，即使名字是它自己枚举出来的 |
-| `DBG_FILELINE_TO_ADR` | 相对/绝对路径都回 `NO_ADRMAP: Address mapping failed` |
-| `DBG_VERIFY_CODE` | 仿真器目标上回 `FAILED`（没有可校验的 flash） |
-| `DBG_STEP_INTO_N` | 头文件注明不带计数；`_HLL_N` 与 `_INSTRUCTION_N` 可用 |
-| `PRJ_ACTIVE_FILES` / `PRJ_CLOSE` / `PRJ_LOAD` / `GEN_SET_OPTIONS` | 只在非调试会话可用，而这几项在那里没有意义（工程由 `-s` 启动行打开，会话由退出 uVision 结束） |
+| `DBG_FILELINE_TO_ADR` | 相对/绝对路径都回 `NO_ADRMAP` |
+| `DBG_VERIFY_CODE` | 仿真器目标上回 `FAILED` |
+| `DBG_STEP_INTO_N` | 头文件注明不带计数；`_HLL_N`/`_INSTRUCTION_N` 可用 |
+| `PRJ_ACTIVE_FILES` / `PRJ_LOAD` / `PRJ_CMD_PROGRESS` | 只在非调试会话可用 / 由启动行打开 / 是通知不是命令 |
 | `DBG_WAKE` / `DBG_SLEEP` / `DBG_SET_CALLBACK` | 仿真器专有，接受但无可观察效果 |
-| `PRJ_CMD_PROGRESS` | 是通知（`0x500D` 一族），不是命令 |
+| `PRJ_FLASH_ERASE` | 从不回复 |
 
-## 六、仍然做不到的
+### 需要 extended stack mode 才有意义
 
-诚实清单，都有实测依据：
-
-- **编辑文件本身**：uVision 的编辑器没有暴露成 API。源码改动走本产品自己的文件工具，
-  Keil 只负责构建和调试——这也是它自己的分工。
-- **断点只支持「列表里的第几个」删除**：`DBG_CHANGE_BP` 要的是 `tickMark`，已从枚举里取到，
-  但不支持按条件批改。
-- **`DBG_EVAL_WATCH_EXPRESSION` 在 5.43a 上恒回 `NOT_SUPPORTED`**：所以求值走命令窗口的
-  `EVAL`，这条路可用。
-- **寄存器组的 `nGi` 被忽略**：这个版本对任何请求都返回全部 152 个寄存器，所以按一次读全。
-  换版本后可能需要按组遍历，代码里留了注释。
-- **变量枚举依赖符号表**：仿真器 + 只有 `.axf` 时能列；没有调试信息时如实说没有。
-- **多 Target 工程**：`set_target` 已接，但只在单 Target 工程上实测过。
-- **许可证问题不单独诊断**：没有授权时可能表现为各种失败，目前只能如实转述 uVision 的文字。
+`DBG_ENUM_VARIABLES`、`DBG_VARIABLE_SET`、`DBG_ENUM_TASKS`、
+`DBG_EVAL_WATCH_EXPRESSION`、`DBG_REMOVE_WATCH_EXPRESSION`。
+会话在进调试前自动打开这个模式。
 
 ---
 
-## 七、验证
+## 七、仍然做不到的
 
-`tests/round12-uvsock.test.ts`（17 条）把上面每一条实测到的字节形状固定成断言：
-32 字节头、分片重组、`SSTR` 与「计数不含结尾 0」的区别、`TRNOPT` 的 0 与偏移 3、
-`BPREASON` 的 12/16/24、命令窗口行没有回显信封、`AMEM` 的地址与错误地址。
-其中三条直接对应第一版写错的地方，写错了就会红。
-
-端到端（真实 MDK 5.43a + 真实 STM32F429 工程，取其副本）：
-
-```
-keil_debug open     → entered simulator debug mode
-keil_debug run      → SystemInit system_stm32f4xx.c:174
-keil_debug where    → SystemInit system_stm32f4xx.c:174 (0x8006460)
-keil_debug stack    → #0 SystemInit system_stm32f4xx.c:174
-                       #1 Reset_Handler ../CORE/startup_stm32f429xx.s:200
-keil_debug registers→ 152 个，PC 标出
-keil_debug step     → SystemInit system_stm32f4xx.c:177 (0x8006468)
-keil_debug read     → 0x0 = 0x200009a8
-keil_debug evaluate → $ = 0x08006460 134243424
-keil_project add_group/add_file → 写进 .uvprojx（字节数变化已验证）
-keil_project set_option CDEF    → 读回包含新值
-```
-
-硬件路径同样跑到了 debugger 层，卡在真实板子没有响应
-（`Cannot access target`），这属于板子侧，不是代码路径。
+- **编辑源文件**：uVision 的编辑器没有 API；源码改动走本产品自己的文件工具。
+- **可靠保存工程编辑**：见第四节。接口能改，落盘时机不受控制。
+- **一个文件挂到两个组**：uVision 不允许。
+- **`PRJ_FLASH_ERASE`**：接口不回复；下载本身会擦除它写的扇区。
+- **寄存器写入**：`REGISTER_SET` 对 R0 一路回 SUCCESS 却不改变值（`R0 = 0x42` 走命令
+  窗口可以）；工具会明确报「接受了但读回没变」，命令通道是可行替代。
+- **局部变量**：该目标上调试器对任何帧都只报全局（`nVars` 恒为 0），接口层无从列出。
+- **多 Target 工程**：`set_target` 已接，只在单 target 工程上实测过。
 
 ---
 
-## 八、边界没有变
+## 八、验证
 
-- 安装包里仍然没有任何 Keil 二进制、器件包或编译器。
-- 不下载、不重分发；没有「一键安装」按钮。
-- 探测只读：默认路径 + `TOOLS.INI` + 注册表 `HKLM\SOFTWARE\WOW6432Node\Keil\Products\MDK`
-  （本机因此找到 `G:\software\keil5`，而那里不在任何默认位置里）。
-- 没有 Keil 的机器上，`keil_debug` 直接说「没有安装 MDK，它是有授权的、不会被捆绑」，
-  并指向原有的 OpenOCD / pyOCD / J-Link 链路。
+`tests/round12-uvsock.test.ts`（41 条）把每个实测到的字节形状固定成断言：pack(1) 的
+`REGENUM`/`VSET`/`VARINFO`/`STACKENUM` 偏移、`AMEM` 反汇编是文本、`IVARENUM` 的 count、
+`PRJDATA` 的长度、`ALREADY_PRESENT` 的组归属、栈的顺序、寄存器别名查找。
+
+全量测试 779 条、777 通过、2 条原有条件跳过、0 失败。
+
+端到端（真实 MDK 5.43a + 真实 STM32F429 工程，取副本）：
+
+```
+keil_debug open            → 进入仿真器调试
+keil_debug breakpoint_add  → 断点设在 main
+keil_debug run             → 停在 SystemInit system_stm32f4xx.c:174
+keil_debug stack           → #0 SystemInit …  #1 Reset_Handler …:200
+keil_debug variables       → 36 个全局，带类型与数组长度
+keil_debug watch_add "$"   → watch #… = 0x08006460
+keil_debug disassemble     → 源码行 + BL.W 0x08000A54 HAL_Init
+keil_debug variable_set    → uwTick = 0x00003039（回读确认）
+keil_debug flash           → Flashed OK
+keil_project add_file/close→ 编辑生效；close 报告是否写盘
+```
+
+---
+
+## 九、边界没有变
+
+- 安装包里没有任何 Keil 二进制、器件包或编译器；不下载、不重分发。
+- 探测只读：默认路径 + `TOOLS.INI` + 注册表 `HKLM\SOFTWARE\WOW6432Node\Keil\Products\MDK`。
+- 没有 Keil 的机器上，`keil_debug` 直接说明情况，并指向 OpenOCD / pyOCD / J-Link 链路。

@@ -225,6 +225,7 @@ export interface Reply {
   data: Buffer;
   /** The command-echoed error text, when the status carries one. */
   message?: string;
+  /** True when the request produced no reply before its deadline. */
   timedOut?: boolean;
 }
 
@@ -315,26 +316,32 @@ export function readSstr(payload: Buffer, offset = 0): string {
 }
 
 /**
- * `UV_DBG_DSM_READ`: the disassembly window's content at an address.
+ * `UV_DBG_DSM_READ`: what the disassembly window holds at an address.
  *
- * Request is the same `AMEM` as a memory read. The measured reply for
- * `0x08006be0` is 24 bytes:
+ * The reply is an `AMEM` whose `aBytes` are **text**, not instruction words —
+ * the same record a memory read uses, with the bytes being the window's lines:
  *
- *   e0 6b 00 08 00 …    the echoed address
- *   00 00 00 00         length — 0 on this build
- *   20 c0 e3 0e         a single word: 0x0ee3c020, `b.w` to an address
+ *   nAddr(8)  nBytes(4)  ErrAddr(8)  nErr(4)  text…
  *
- * so this build answers with one instruction-sized word and no length. A zero
- * length is therefore reported as zero bytes, not as "nothing at that
- * address": the word is what the debugger holds.
+ * Measured at `0x08006be0`:
+ *
+ *   "    35:     HAL_Init();                     //初始化HAL库 \n"
+ *   "0x08006BE0 F7F9FF38  BL.W          0x08000A54 HAL_Init\n"
+ *
+ * An earlier version read the body as 32-bit instruction words and reported
+ * `0x30307830` ("0x00" as ASCII) as an opcode — a number that looks like an
+ * instruction and is not. There is no decode step: the debugger has already
+ * done it, and its own text is the answer.
  */
-export function readDisassembly(payload: Buffer): { address: number; words: number[]; bytes: number } | null {
+export function readDisassemblyText(payload: Buffer): { address: number; bytes: number; text: string; errorAddress?: number } | null {
   if (payload.length < 24) return null;
   const address = Number(payload.readBigUInt64LE(0));
-  const bytes = payload.readUInt32LE(8);
-  const words: number[] = [];
-  for (let at = 24; at + 4 <= payload.length; at += 4) words.push(payload.readUInt32LE(at));
-  return { address, bytes, words };
+  const count = payload.readUInt32LE(8);
+  const errorAddress = Number(payload.readBigUInt64LE(12));
+  // The count is what the debugger says it filled; a line can be cut short at
+  // the end of the record, so the slice is clamped rather than trusted.
+  const text = payload.subarray(24, Math.min(24 + count, payload.length)).toString("latin1");
+  return { address, bytes: count, text, ...(payload.readUInt32LE(20) > 0 ? { errorAddress } : {}) };
 }
 
 /**
@@ -372,10 +379,43 @@ export function readVset(payload: Buffer): { type: number; value: bigint; text: 
 
 /** Build a `VSET` request carrying an expression. */
 export function vset(expression: string): Buffer {
+  return vsetWithValue(expression, 0, 0n);
+}
+
+/**
+ * A `VSET` request carrying both a name and a literal value.
+ *
+ * `VSET` is `{ TVAL val; SSTR str }` and the interface is compiled with
+ * `#pragma pack(1)`, so the record is `type(4) value(8) len(4) text(256)` — the
+ * value sits at 4, not at 8. The value field is what `REGISTER_SET` writes, and
+ * a request that left it zero was accepted with `SUCCESS` while the register
+ * kept its old value.
+ */
+export function vsetWithValue(name: string, type: number, value: bigint): Buffer {
   const buffer = Buffer.alloc(12 + 260);
-  buffer.writeInt32LE(0, 0); // no literal value; the expression is in the string
-  buffer.writeInt32LE(Buffer.byteLength(expression, "latin1") + 1, 12);
-  Buffer.from(expression, "latin1").copy(buffer, 16);
+  buffer.writeInt32LE(type, 0);
+  buffer.writeBigInt64LE(value, 4);
+  buffer.writeInt32LE(Buffer.byteLength(name, "latin1") + 1, 12);
+  Buffer.from(name, "latin1").copy(buffer, 16);
+  return buffer;
+}
+
+/** `IVARENUM`: `{ i32 nID, i32 nFrame, i32 nTask, u16 count, u16 flags }`. */
+export function ivarEnum(nID: number, nFrame: number, nTask: number, count: number): Buffer {
+  const buffer = Buffer.alloc(16);
+  buffer.writeInt32LE(nID, 0);
+  buffer.writeInt32LE(nFrame, 4);
+  buffer.writeInt32LE(nTask, 8);
+  buffer.writeUInt16LE(count, 12);
+  return buffer;
+}
+
+/** `VARVAL`: `{ IVARENUM variable; SSTR value }` — how `VARIABLE_SET` names its target. */
+export function varVal(nID: number, nFrame: number, nTask: number, value: string): Buffer {
+  const header = ivarEnum(nID, nFrame, nTask, 1);
+  const buffer = Buffer.alloc(16 + 260);
+  header.copy(buffer, 0);
+  sstr(value).copy(buffer, 16);
   return buffer;
 }
 
@@ -439,6 +479,13 @@ export function readCountedString(payload: Buffer, offset = 0): string {
 }
 
 /** `PRJDATA`: `{ u32 nLen, u32 nCode, char szNames[] }` with NUL-separated names. */
+/**
+ * `PRJDATA`: `{ u32 nLen, u32 nCode, char szNames[] }` with NUL-separated names.
+ *
+ * `nLen` counts the name block including the terminators. Measured against
+ * `PRJ_ADD_FILE` on MDK 5.43a: the file lands in the project as
+ * `<FileName>probe_new.c</FileName>` with the path it was given.
+ */
 export function prjData(...names: string[]): Buffer {
   const text = names.join("\0") + "\0";
   const buffer = Buffer.alloc(8 + Buffer.byteLength(text, "latin1"));

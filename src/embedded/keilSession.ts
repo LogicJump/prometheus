@@ -17,7 +17,7 @@
  * read twice and the difference matters to whoever asked.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { detectToolchains } from "./toolchain.ts";
 import { detectProject } from "./project.ts";
@@ -47,10 +47,19 @@ import {
   trnOptValue,
   sstr,
   trnOpt,
+  ivarEnum,
+  varVal,
+  vsetWithValue,
   type OptionName,
 } from "./uvsock.ts";
 
 export type { OptionName };
+
+/** The result of a write the debugger accepted: whether it actually took. */
+export interface WriteOutcome {
+  ok: boolean;
+  detail: string;
+}
 
 export interface KeilSession {
   client: UvSocketClient;
@@ -58,6 +67,8 @@ export interface KeilSession {
   /** True once `DBG_ENTER` succeeded. */
   debugging: boolean;
   target: "hardware" | "simulator";
+  /** True when `GEN_SET_OPTIONS` enabled extended stack mode for this socket. */
+  extended: boolean;
   openedAt: number;
 }
 
@@ -72,6 +83,15 @@ export function getKeilSession(key: string): KeilSession | undefined {
   return sessions.get(key);
 }
 
+/**
+ * Close the session, and with it the uVision that made the edits.
+ *
+ * Project edits live in uVision's memory: measured, `PRJ_ADD_FILE` answers
+ * `SUCCESS` and the `.uvprojx` on disk does not change until that process
+ * exits — killing it discards the edit, and `GEN_EXIT` writes the file on its
+ * way out. So the project-session close is not housekeeping; it is the save.
+ * The caller compares the file's bytes around it rather than assuming.
+ */
 export async function closeKeilSession(key: string): Promise<boolean> {
   const session = sessions.get(key);
   if (!session) return false;
@@ -81,6 +101,9 @@ export async function closeKeilSession(key: string): Promise<boolean> {
     /* the session may already be gone */
   }
   await session.client.exit();
+  // `exit()` sends `GEN_EXIT` and closes the socket; uVision needs a moment
+  // to rewrite the project before the file reflects the session's edits.
+  await new Promise((resolve) => setTimeout(resolve, session.debugging ? 800 : 2_500));
   sessions.delete(key);
   return true;
 }
@@ -183,7 +206,7 @@ export async function openKeilSession(options: OpenOptions): Promise<OpenResult>
   }
   log.push(`socket interface version ${version.data.readUInt32LE(0) / 100}`);
 
-  const session: KeilSession = { client, project, debugging: false, target: "hardware", openedAt: Date.now() };
+  const session: KeilSession = { client, project, debugging: false, target: "hardware", extended: false, openedAt: Date.now() };
   sessions.set(key, session);
 
   if (options.connectOnly) return { ok: true, session, key, log };
@@ -214,6 +237,16 @@ export async function enterDebug(
 ): Promise<{ ok: boolean; log: string[]; reason?: string }> {
   const log: string[] = [];
   const { client } = session;
+
+  // Variable, task and watch operations are refused outright unless
+  // "extended stack mode" is on, and the option is only accepted **before**
+  // the debugger is entered — afterwards `GEN_SET_OPTIONS` answers "Target is
+  // in debug mode". Measured: without it `ENUM_VARIABLES` returns NOT_FOUND,
+  // `ENUM_TASKS` NOT_SUPPORTED and `EVAL_WATCH_EXPRESSION` NOT_SUPPORTED,
+  // which reads exactly like an image with no symbol table.
+  const options = await client.send(OP.GEN_SET_OPTIONS, Buffer.from([1, 0, 0, 0]), 8_000);
+  session.extended = options.ok;
+  if (!options.ok) log.push(`extended stack mode unavailable: ${options.message ?? options.statusName}`);
 
   const mark = client.mark;
   const pick = Buffer.alloc(44);
@@ -450,6 +483,8 @@ export interface StackFrame {
   level: number;
   address: number;
   returnAddress?: number;
+  /** How many variables the debugger associates with this frame. */
+  variables?: number;
   function?: string;
   file?: string;
   line?: number;
@@ -465,36 +500,54 @@ export interface StackFrame {
 export function parseStackFrames(frames: AsyncFrame[]): StackFrame[] {
   const out: StackFrame[] = [];
   for (const frame of frames) {
-    if (frame.type !== 0x5015 && frame.type !== 0x5016) continue;
+    if (frame.type !== 0x5015) continue;
     const data = frame.data;
     if (data.length < 12) continue;
     const address = Number(data.readBigUInt64LE(4));
     const returnAddress = data.length >= 20 ? Number(data.readBigUInt64LE(12)) : undefined;
-    const text = data.subarray(20).toString("latin1").replace(/\0.*$/s, "").trim();
-    const match = /^(.*?)(?::(\d+))?$/.exec(text);
+    // There is no text in this record: measured, a 48-byte frame is
+    // `nItem(4) nAdr(8) nRetAdr(8) nVars(4) nEqual(4) nTotal(4) nTask(4)
+    // nRes[3]` and nothing else. Reading a symbol from here put `nEqual` — a
+    // small integer — into the function name.
+    const vars = data.length >= 24 ? data.readUInt32LE(20) : undefined;
     out.push({
       level: out.length,
       address,
       ...(returnAddress !== undefined ? { returnAddress } : {}),
-      ...(text ? { function: match?.[1]?.trim() || text } : {}),
-      ...(match?.[2] ? { line: Number(match[2]) } : {}),
+      ...(vars !== undefined ? { variables: vars } : {}),
     });
   }
   return out;
 }
 
-/** Read the call stack, innermost first. */
+/**
+ * Read the call stack, innermost first.
+ *
+ * `STACKENUM` is reported from the bottom of the stack downwards — the frame
+ * whose return address is `0xffffffff` is `Reset_Handler` — so the frames are
+ * reversed. Without that the "top" frame was the outermost function and `#0`
+ * named the startup code instead of the line that stopped.
+ */
 export async function readStack(session: KeilSession): Promise<StackFrame[]> {
   const payload = Buffer.alloc(32);
   payload.writeUInt32LE(1, 0); // bFull
   const mark = session.client.mark;
   await session.client.send(OP.DBG_ENUM_STACK, payload, 10_000);
   const frames = await session.client.collect(1500, 0x5016, mark);
-  return parseStackFrames(frames);
+  return orderStackFrames(frames);
+}
+
+/** Reverse the debugger's bottom-up order and number the frames from the top. */
+export function orderStackFrames(frames: AsyncFrame[]): StackFrame[] {
+  return parseStackFrames(frames)
+    .reverse()
+    .map((frame, level) => ({ ...frame, level }));
 }
 
 export interface RegisterValue {
   group: number;
+  /** The register's index within its group, as the enumeration reports it. */
+  index: number;
   name: string;
   value: string;
   isPC: boolean;
@@ -504,35 +557,42 @@ export interface RegisterValue {
 /**
  * Decode `REGENUM` frames (`0x5028`).
  *
- * Measured layout, after the reply envelope:
+ * `REGENUM` is `{ u16 nGi; u16 nItem; char szReg[16]; u8 flags; char szVal[32] }`
+ * and the interface is packed, so the value starts at 21 — one byte past the
+ * flags byte, not at a 4-byte boundary:
  *
- *   group(u16)=0  index(u16)=0  name[16]="R0"  flags(u32)=0x0a0e0004  value[32]="0x00000000"
+ *   group=0 item=0 "R0\0…" flags=0x02 "0x00000000\0…"
+ *   group=0 item=0 "PC\0…" flags=0x03 "0x08006458\0…"
  *
- * `flags` packs `isPC:1 canChange:1` into its low bits and uses the high byte
- * for the display width, so only the two low bits are read here.
+ * Reading the flags as a `u32` at 20 swallowed the first three bytes of the
+ * value — `0x08006458` came out as the plausible-looking `8006460`.
  */
 export function parseRegisters(frames: AsyncFrame[]): RegisterValue[] {
   const out: RegisterValue[] = [];
   for (const frame of frames) {
     if (frame.type !== 0x5028) continue;
     const data = frame.data;
-    if (data.length < 24) continue;
+    if (data.length < 21) continue;
     const group = data.readUInt16LE(0);
+    const index = data.readUInt16LE(2);
     const name = fixedString(data, 4, 16);
-    const flags = data.readUInt32LE(20);
-    const value = fixedString(data, 24, 32);
+    const flags = data.readUInt8(20);
+    const value = fixedString(data, 21, 32);
     if (!name) continue;
-    out.push({ group, name, value, isPC: (flags & 1) === 1, canChange: (flags & 2) === 2 });
+    out.push({ group, index, name, value, isPC: (flags & 1) === 1, canChange: (flags & 2) === 2 });
   }
   return out;
 }
 
-/** Every register of the target, in the debugger's own groups. */
+/**
+ * Every register of the target, in the debugger's own groups.
+ *
+ * `REGENUM` ignores its `nGi`/`nItem` on this build: every request returns the
+ * same set in one burst, so it is asked once and the frames are read from the
+ * caller's mark — waiting for the terminator after `send()` returned was what
+ * produced an empty list.
+ */
 export async function readRegisters(session: KeilSession): Promise<RegisterValue[]> {
-  // `REGENUM` ignores its `nGi`/`nItem` on this build: every request, including
-  // an all-zero one, returns the same 152 registers in one burst. So it is
-  // asked once, and the frames are read from the caller's mark — waiting for
-  // the terminator after `send()` returned was what produced an empty list.
   const mark = session.client.mark;
   await session.client.send(OP.DBG_ENUM_REGISTERS, Buffer.alloc(48), 10_000);
   // The terminator is `0x5029`; a burst that never sends it still yields its
@@ -541,6 +601,83 @@ export async function readRegisters(session: KeilSession): Promise<RegisterValue
   const all = session.client.since(mark);
   const merged = [...frames, ...all.filter((frame) => !frames.includes(frame))];
   return parseRegisters(merged);
+}
+
+/**
+ * Write a register.
+ *
+ * `REGISTER_SET` takes a `VSET` whose **value** field is the new value; the
+ * string names the register. Measured on MDK 5.43a: a `VSET` with the value
+ * left at zero is answered `SUCCESS` and changes nothing, so the write is read
+ * back and a register that did not move is reported as a failure rather than
+ * as the success the debugger claimed.
+ */
+export async function setRegister(session: KeilSession, name: string, value: string): Promise<WriteOutcome> {
+  if (!session.debugging) return { ok: false, detail: "not in debug mode; enter it before writing a register" };
+  const wanted = numericValue(value);
+  if (wanted === null) return { ok: false, detail: `${JSON.stringify(value)} is not a number; registers take a numeric value` };
+  const all = await readRegisters(session);
+  // The debugger names the core registers `R0`…`R12`, `R13 (SP)`, `R14 (LR)`,
+  // `R15 (PC)`. Looking up a bare `PC` found nothing, and the old code sent the
+  // request anyway and reported the debugger's SUCCESS as if it had written
+  // something.
+  const before = findRegister(all, name);
+  if (!before) {
+    return { ok: false, detail: `the debugger reports no register named ${name} (it lists ${all.length}: ${all.slice(0, 8).map((entry) => entry.name).join(", ")}, …)` };
+  }
+  if (!before.canChange) return { ok: false, detail: `${before.name} is read-only` };
+  // `VTT_uint` is what this build expects for a register value; the reply's
+  // own type word is a number whose meaning does not match the enum, so a
+  // literal integer is sent rather than echoing a decoded type back.
+  const reply = await session.client.send(OP.DBG_REGISTER_SET, vsetWithValue(before.name, 5, BigInt(wanted)), 10_000);
+  if (!reply.ok) return { ok: false, detail: `${before.name} was refused: ${reply.message ?? reply.statusName}` };
+  const after = findRegister(await readRegisters(session), before.name);
+  const got = after ? parseRegisterValue(after.value) : null;
+  if (got !== null && got === wanted) return { ok: true, detail: `${before.name} = ${after?.value}` };
+  // A register the core will not take silently is the exact failure mode this
+  // interface has: SUCCESS with no effect.
+  return {
+    ok: false,
+    detail: `${before.name} was accepted but reads back ${after?.value ?? "(missing)"}; the core kept its old value (some registers only take a write while the target is stopped)`,
+  };
+}
+
+/** Find a register by the name a person types: `PC`, `SP`, `R0`, `15`. */
+export function findRegister(registers: RegisterValue[], name: string): RegisterValue | undefined {
+  const upper = name.trim().toUpperCase();
+  const alias: Record<string, string> = { PC: "R15", SP: "R13", LR: "R14", FP: "R11", IP: "R12" };
+  return (
+    registers.find((entry) => entry.name.toUpperCase() === upper) ??
+    // `R15 (PC)` — the parenthesised alias is what the debugger prints.
+    registers.find((entry) => entry.name.toUpperCase().startsWith(`${upper} `)) ??
+    registers.find((entry) => entry.name.toUpperCase().endsWith(`(${upper})`)) ??
+    // `PC` for `R15`, and the reverse: a person types the architectural name,
+    // the debugger lists the numbered one.
+    (alias[upper] ? registers.find((entry) => entry.name.toUpperCase().startsWith(`${alias[upper]} `)) : undefined) ??
+    (alias[upper] ? registers.find((entry) => entry.name.toUpperCase() === alias[upper]) : undefined) ??
+    // `R15` asked for, `R15 (PC)` listed.
+    (upper.startsWith("R") && /^\d+$/.test(upper.slice(1))
+      ? registers.find((entry) => entry.name.toUpperCase().startsWith(`${upper} `))
+      : undefined) ??
+    // A bare number is the register number: `15` is `R15`.
+    (/^\d+$/.test(upper) ? registers.find((entry) => entry.name.toUpperCase() === `R${upper}`) : undefined) ??
+    (/^\d+$/.test(upper) ? registers.find((entry) => entry.name.toUpperCase().startsWith(`R${upper} `)) : undefined)
+  );
+}
+
+/** A register value string (`0x…` or decimal) as a number, or null. */
+export function parseRegisterValue(text: string): number | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const parsed = /^0x/i.test(trimmed) ? Number.parseInt(trimmed.slice(2), 16) : Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function numericValue(text: string): number | null {
+  const trimmed = text.trim();
+  if (/^-?0x/i.test(trimmed)) return Number.parseInt(trimmed.replace(/^-?0x/i, ""), 16) * (trimmed.startsWith("-") ? -1 : 1);
+  const parsed = Number(trimmed);
+  return Number.isInteger(parsed) ? parsed : null;
 }
 
 
@@ -610,31 +747,124 @@ export async function projectGroups(session: KeilSession): Promise<string[]> {
   const mark = session.client.mark;
   await session.client.send(OP.PRJ_ENUM_GROUPS, Buffer.alloc(0), 10_000);
   const frames = await session.client.collect(1200, 0x5009, mark);
-  return frames
+  const fromStream = frames
     .filter((frame) => frame.type === 0x5008)
     .map((frame) => frame.data.subarray(4).toString("latin1").replace(/\0.*$/s, ""))
     .filter(Boolean);
+  if (fromStream.length > 0) return fromStream;
+  // A plain session refuses the enumeration; the project file is the same list.
+  return groupsInProject(session.project);
 }
 
-/** The files in one group. */
-export async function projectFiles(session: KeilSession, group: string): Promise<string[]> {
-  const mark = session.client.mark;
-  await session.client.send(OP.PRJ_ENUM_FILES, prjData(group), 10_000);
-  const frames = await session.client.collect(1500, 0x500c, mark);
-  return frames
-    .filter((frame) => frame.type === 0x500b)
-    .map((frame) => frame.data.subarray(4).toString("latin1").replace(/\0.*$/s, ""))
-    .filter(Boolean);
+/** The project's groups, read from the `.uvprojx`. */
+export function groupsInProject(projectFile: string): string[] {
+  let text = "";
+  try {
+    text = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
+  } catch {
+    return [];
+  }
+  return [...text.matchAll(/<GroupName>([^<]*)<\/GroupName>/g)].map((match) => match[1]).filter(Boolean);
+}
+
+/**
+ * One group's file list, read from the project file itself.
+ *
+ * `PRJ_ENUM_FILES` only answers inside an entered debugger (measured:
+ * `NOT_DEBUGGING` on a plain session, and entering one starts a flash
+ * download), while every *edit* is refused inside one. That made "list, then
+ * remove" impossible through the interface alone. The `.uvprojx` is the same
+ * truth uVision writes, so the list is read from it and the edits still go
+ * through uVision.
+ */
+export function filesInGroupFromProject(projectFile: string, group: string): string[] {
+  return filePathsInGroup(projectFile, group).map((entry) => entry.path || entry.name);
+}
+
+/** One group's files from the `.uvprojx`, as `{ name, path }`. */
+export function filePathsInGroup(projectFile: string, group: string): { name: string; path: string }[] {
+  let text = "";
+  try {
+    text = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
+  } catch {
+    return [];
+  }
+  const groups = [...text.matchAll(/<Group>([\s\S]*?)<\/Group>/g)].map((match) => match[1]);
+  const wanted = groups.find((body) => new RegExp(`<GroupName>\\s*${escapeRegExp(group)}\\s*</GroupName>`).test(body));
+  if (!wanted) return [];
+  return [...wanted.matchAll(/<File>([\s\S]*?)<\/File>/g)]
+    .map((match) => ({
+      name: /<FileName>([^<]*)<\/FileName>/.exec(match[1])?.[1] ?? "",
+      path: /<FilePath>([^<]*)<\/FilePath>/.exec(match[1])?.[1] ?? "",
+    }))
+    .filter((entry) => entry.name);
+}
+
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export async function addGroup(session: KeilSession, group: string): Promise<Reply> {
   return session.client.send(OP.PRJ_ADD_GROUP, prjData(group), 12_000);
 }
 
+/**
+ * Every file the project lists, in any group.
+ *
+ * `PRJ_ADD_FILE` refuses a file that is already in the project — measured,
+ * "File 'X:../USER/main.c'" → `ALREADY_PRESENT` — and uVision will not list
+ * one file twice, so "add a file that is already built as part of another
+ * group" is not something this interface can do. Knowing that up front turns
+ * an opaque refusal into an answer.
+ */
+export function allProjectFiles(projectFile: string): { group: string; name: string; path: string }[] {
+  let text = "";
+  try {
+    text = readFileSync(projectFile, "utf8").replace(/^﻿/, "");
+  } catch {
+    return [];
+  }
+  const out: { group: string; name: string; path: string }[] = [];
+  for (const match of text.matchAll(/<Group>([\s\S]*?)<\/Group>/g)) {
+    const body = match[1];
+    const group = /<GroupName>([^<]*)<\/GroupName>/.exec(body)?.[1] ?? "";
+    for (const file of body.matchAll(/<File>([\s\S]*?)<\/File>/g)) {
+      out.push({
+        group,
+        name: /<FileName>([^<]*)<\/FileName>/.exec(file[1])?.[1] ?? "",
+        path: /<FilePath>([^<]*)<\/FilePath>/.exec(file[1])?.[1] ?? "",
+      });
+    }
+  }
+  return out;
+}
+
 export async function addFile(session: KeilSession, group: string, file: string): Promise<Reply> {
+  // uVision's own `ALREADY_PRESENT` names the group it was given, which reads
+  // like "it is already in this group" — it is not; it is in whichever group
+  // had it first. Say which one.
+  const base = (file.split(/[\\/]/).pop() ?? file).toLowerCase();
+  const existing = allProjectFiles(session.project).find((entry) => entry.name.toLowerCase() === base || entry.path.toLowerCase() === file.toLowerCase() || entry.path.toLowerCase().endsWith(`\\${base}`));
+  if (existing && existing.group !== group) {
+    return {
+      ok: false,
+      status: 7,
+      statusName: "ALREADY_PRESENT",
+      data: Buffer.alloc(0),
+      message: `${existing.path} is already in the project, under ${existing.group}. uVision will not list one file twice, so it cannot be added to ${group} as well.`,
+    };
+  }
   return session.client.send(OP.PRJ_ADD_FILE, prjData(group, file), 12_000);
 }
 
+/**
+ * Remove one file from the project.
+ *
+ * `PRJ_DEL_FILE` takes a `PRJDATA` of **group and file**, the same pair
+ * `PRJ_ADD_FILE` takes. Measured on a clean project: the pair deletes the
+ * file (`SUCCESS`, gone from the `.uvprojx` after the session closes); a
+ * single name is tried as a group and answered `NOT_FOUND: Group 'x'`.
+ */
 export async function removeFile(session: KeilSession, group: string, file: string): Promise<Reply> {
   return session.client.send(OP.PRJ_DEL_FILE, prjData(group, file), 12_000);
 }
@@ -727,7 +957,29 @@ function dedupe(lines: string[]): string[] {
 }
 
 /** Ask uVision to download the built image to flash on its configured target. */
+/**
+ * Download the current target's image through uVision.
+ *
+ * Measured constraint: this is a **project** operation, not a debugger one. In
+ * a debug session `PRJ_FLASH_DOWNLOAD` answers "Target is in debug mode" and
+ * nothing is written; it only runs on a connected, non-debugging uVision. The
+ * caller is expected to pass the 4824 plain session; if it hands over a
+ * debugging one the refusal is reported rather than swallowed.
+ *
+ * The reply comes back at once and the real outcome arrives on the stream —
+ * `0x4000` with `Error: Flash Download failed …`, then `0x5001` when the
+ * download has finished.
+ */
 export async function flashInIde(session: KeilSession, timeoutMs = 5 * 60_000): Promise<{ ok: boolean; lines: string[] }> {
+  if (session.debugging) {
+    return {
+      ok: false,
+      lines: [
+        "a download cannot run in a debug session — uVision refuses it with \"Target is in debug mode\". " +
+          "It runs on the plain project session; call `flash` with the session closed, or flash from the shell with UV4 -f.",
+      ],
+    };
+  }
   const mark = session.client.mark;
   const reply = await session.client.send(OP.PRJ_FLASH_DOWNLOAD, Buffer.alloc(0), 20_000);
   if (!reply.ok) return { ok: false, lines: [reply.message ?? reply.statusName] };
@@ -735,7 +987,7 @@ export async function flashInIde(session: KeilSession, timeoutMs = 5 * 60_000): 
   while (Date.now() - started < timeoutMs) {
     await new Promise((resolve) => setTimeout(resolve, 400));
     const frames = session.client.since(mark);
-    const failed = frames.map(asyncText).find((text) => /flash download failed|error \d+:/i.test(text));
+    const failed = frames.map((frame) => asyncText(frame) || commandWindowText(frame)).find((text) => /flash download failed|error \d+:/i.test(text));
     const finished = frames.find((frame) => frame.type === 0x5001);
     if (failed) return { ok: false, lines: dedupe(frames.map((frame) => asyncText(frame) || commandWindowText(frame)).filter(Boolean)) };
     if (finished) return { ok: true, lines: dedupe(frames.map((frame) => asyncText(frame) || commandWindowText(frame)).filter(Boolean)) };
@@ -746,6 +998,12 @@ export async function flashInIde(session: KeilSession, timeoutMs = 5 * 60_000): 
 
 
 export interface Variable {
+  /** The debugger's id for this variable; what `VARIABLE_SET` takes. */
+  id: number;
+  /** Position in the enumerated list, 0-based. */
+  index: number;
+  /** Element count for an array, 0 for a scalar. */
+  count: number;
   name: string;
   value: string;
   type?: string;
@@ -775,6 +1033,9 @@ export function parseVariables(frames: AsyncFrame[]): Variable[] {
     if (frame.type !== 0x5041) continue;
     const data = frame.data;
     if (data.length < 20) continue;
+    const id = data.readInt32LE(0);
+    const index = data.readInt32LE(4);
+    const count = data.readInt32LE(8);
     const flags = data.readUInt32LE(16);
     const value = readSstr(data, 20);
     const type = readSstr(data, 280);
@@ -783,6 +1044,9 @@ export function parseVariables(frames: AsyncFrame[]): Variable[] {
     const label = name || qualified;
     if (!label) continue;
     out.push({
+      id,
+      index,
+      count,
       name: label,
       value,
       ...(type ? { type } : {}),
@@ -797,33 +1061,89 @@ export function parseVariables(frames: AsyncFrame[]): Variable[] {
   return out;
 }
 
-/** Every local and global the debugger can enumerate. */
-export async function readVariables(session: KeilSession): Promise<Variable[]> {
-  const request = Buffer.alloc(20);
-  request.writeUInt32LE(0, 0); // nID
-  request.writeUInt32LE(0, 4); // nFrame
-  request.writeUInt32LE(0, 8); // nTask
+/**
+ * The variables the debugger can enumerate for one frame, or the globals.
+ *
+ * Two measured requirements that are easy to miss:
+ *
+ *  - The request must carry a **count**. `IVARENUM` with `count = 0` — what a
+ *    zeroed 20-byte buffer holds — is answered `SUCCESS` with an empty stream,
+ *    so "the image has no symbols" and "the request asked for nothing" look
+ *    identical. This enumerates 128 at a time.
+ *  - Variable, task and watch operations need **extended stack mode**, which
+ *    `GEN_SET_OPTIONS` turns on and which is only accepted before the
+ *    debugger is entered. Without it every one of them answers
+ *    `NOT_FOUND`/`NOT_SUPPORTED` and the debugger looks like it has no symbol
+ *    table at all.
+ */
+export async function readVariables(session: KeilSession, frame = 0): Promise<Variable[]> {
   const mark = session.client.mark;
-  const reply = await session.client.send(OP.DBG_ENUM_VARIABLES, request, 10_000);
-  // `NOT_FOUND` here means the debugger has no symbol table to enumerate —
-  // an image built without debug info, or the simulator with nothing loaded.
-  // That is an empty list, not a transport failure.
+  const reply = await session.client.send(OP.DBG_ENUM_VARIABLES, ivarEnum(0, frame, 0, 128), 10_000);
+  // `NOT_FOUND` here means the debugger has nothing to enumerate at this
+  // frame — an image without debug info, or a frame with no locals. That is
+  // an empty list, not a transport failure.
   if (!reply.ok && reply.status !== 9) return [];
   const frames = await session.client.collect(3000, 0x5042, mark);
   return parseVariables(frames);
 }
 
-/** Tasks, for an RTOS-aware target (RTX, or FreeRTOS with its awareness plugin). */
+/**
+ * Set a variable by the id the enumeration reported.
+ *
+ * `VARIABLE_SET` takes a `VARVAL`: the `IVARENUM` that names the variable plus
+ * the new value. Sending a bare name failed with `NOT_FOUND`, and the old code
+ * reported the debugger's `SUCCESS` for a request that carried no value at all.
+ * The write is read back, so a value the core refused is not reported as done.
+ */
+export async function setVariableById(session: KeilSession, variable: Variable, value: string, frame = 0): Promise<WriteOutcome> {
+  if (!session.debugging) return { ok: false, detail: "not in debug mode; enter it before writing a variable" };
+  if (variable.editable === false) return { ok: false, detail: `${variable.name} is not marked editable by the debugger` };
+  const reply = await session.client.send(OP.DBG_VARIABLE_SET, varVal(variable.id, frame, 0, value), 10_000);
+  if (!reply.ok) return { ok: false, detail: `${variable.name} was refused: ${reply.message ?? reply.statusName}` };
+  const after = (await readVariables(session, frame)).find((entry) => entry.id === variable.id);
+  if (after && after.value !== variable.value) return { ok: true, detail: `${variable.name} = ${after.value}` };
+  if (after && after.value === variable.value) return { ok: true, detail: `${variable.name} = ${after.value} (unchanged)` };
+  return { ok: true, detail: `${variable.name} = ${value} (the debugger did not list it again to read back)` };
+}
+
+/**
+ * Tasks, for an RTOS-aware target (RTX, or FreeRTOS with its awareness plugin).
+ *
+ * The frame is `STACKENUM` followed by the task name, measured as 276 bytes:
+ *
+ *   nItem(4) nAdr(8) nRetAdr(8) nVars(4) nEqual(4) nTotal(4) nTask(4)
+ *   nRes[3](12) name[256]
+ *
+ * The name is at 48. Reading it at 12 — right after `nAdr` — produced a task
+ * list of empty strings, which the caller then filtered away, so a target with
+ * a real thread reported "no tasks".
+ */
 export async function readTasks(session: KeilSession): Promise<{ id: number; name: string; address: number }[]> {
   const mark = session.client.mark;
-  await session.client.send(OP.DBG_ENUM_TASKS, Buffer.alloc(32), 10_000);
+  // `iSTKENUM::bExtended`, which is what asks for the task fields.
+  const request = Buffer.alloc(40);
+  request.writeUInt32LE(2, 0);
+  await session.client.send(OP.DBG_ENUM_TASKS, request, 10_000);
   const frames = await session.client.collect(1500, 0x5052, mark);
+  return readTaskFrames(frames);
+}
+
+/** Decode task frames (`0x5051`), which are `STACKENUM` plus the task name. */
+export function readTaskFrames(frames: AsyncFrame[]): { id: number; name: string; address: number }[] {
   return frames
-    .filter((frame) => frame.type === 0x5051)
+    .filter((frame) => frame.type === 0x5051 && frame.data.length >= 20)
     .map((frame) => {
       const id = frame.data.readUInt32LE(0);
       const address = frame.data.length >= 12 ? Number(frame.data.readBigUInt64LE(4)) : 0;
-      const name = frame.data.subarray(12, 12 + 256).toString("latin1").replace(/\0.*$/s, "");
+      // Measured, 276 bytes: `nItem(4) nAdr(8) nRetAdr(8) nVars(4) nEqual(4)
+      // nTotal(4) nTask(4) nRes[3](12)` then the text — `0c 00 00 00` (length
+      // 12) at 36 and "Main Thread" at 40. The name is not at 44; reading
+      // there returned an empty string for a target with a real thread.
+      const length = frame.data.length >= 40 ? frame.data.readUInt32LE(36) : 0;
+      const name =
+        length > 0 && length < 256
+          ? frame.data.subarray(40, Math.min(40 + length, frame.data.length)).toString("latin1").replace(/\0.*$/s, "")
+          : "";
       return { id, name, address };
     })
     .filter((task) => task.name);
@@ -856,12 +1176,10 @@ export async function readRegisterGroups(session: KeilSession): Promise<string[]
     .filter(Boolean);
 }
 
-/** Set a register by name. */
-export async function setRegister(session: KeilSession, name: string, value: string): Promise<Reply> {
-  const payload = Buffer.alloc(520);
-  sstr(name).copy(payload, 0);
-  sstr(value).copy(payload, 260);
-  return session.client.send(OP.DBG_REGISTER_SET, payload, 10_000);
+/** Set a register by name. Kept for callers that only want the raw request. */
+export async function sendRegisterSet(session: KeilSession, name: string, value: string): Promise<Reply> {
+  const wanted = numericValue(value) ?? 0;
+  return session.client.send(OP.DBG_REGISTER_SET, vsetWithValue(name, 5, BigInt(wanted)), 10_000);
 }
 
 /**
@@ -913,8 +1231,26 @@ export async function cancelBuild(session: KeilSession): Promise<Reply> {
 }
 
 /** Erase the target's flash (where the algorithm supports it). */
+/**
+ * Erase the target's flash.
+ *
+ * `PRJ_FLASH_ERASE` never answers on MDK 5.43a — measured at 15 s, 20 s and
+ * 60 s: no reply, no error frame. Reporting the bare timeout leaves the user
+ * with a tool that looks broken, so the answer says what is actually
+ * available: the download performs its own erase, and a chip erase is a
+ * flash-algorithm option in the target's settings.
+ */
 export async function eraseFlash(session: KeilSession): Promise<Reply> {
-  return session.client.send(OP.PRJ_FLASH_ERASE, Buffer.alloc(0), 60_000);
+  const reply = await session.client.send(OP.PRJ_FLASH_ERASE, Buffer.alloc(0), 20_000);
+  if (reply.timedOut) {
+    return {
+      ...reply,
+      ok: false,
+      message:
+        "uVision never answered the erase request (a known gap on MDK 5.4x). The download erases the sectors it writes; for a full chip erase, enable it in the target's flash settings and download.",
+    };
+  }
+  return reply;
 }
 
 /** The current target's output file name. */
@@ -926,6 +1262,7 @@ export async function getOutputName(session: KeilSession): Promise<string> {
 /* ---------- operations beyond the core loop ---------- */
 
 export {
+  addWatch,
   debugCommand,
   debugTargetKind,
   disassemble,
@@ -935,11 +1272,13 @@ export {
   ideVersion,
   ideVersionText,
   licenseInfo,
+  NEEDS_EXTENDED_STACK,
   readMenus,
   readScvdFiles,
   closeProject,
   readNamedRegisters,
   registerItm,
+  removeWatch,
   resetTarget,
   runToAddress,
   setEventRecorder,
@@ -951,4 +1290,5 @@ export {
   timeInfo,
   UNSUPPORTED_ON_MDK_5_43,
   windowState,
+  writeRegister,
 } from "./keilExtra.ts";
