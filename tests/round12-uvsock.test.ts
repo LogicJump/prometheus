@@ -40,7 +40,7 @@ import {
   type AsyncFrame,
 } from "../src/embedded/uvsock.ts";
 import { NEEDS_EXTENDED_STACK, UNSUPPORTED_ON_MDK_5_43 } from "../src/embedded/keilExtra.ts";
-import { findRegister, orderStackFrames, parseRegisters, parseStackFrames, parseVariables, readTaskFrames } from "../src/embedded/keilSession.ts";
+import { findRegister, orderStackFrames, parseIntelHex, parseRegisters, parseStackFrames, parseVariables, readTaskFrames } from "../src/embedded/keilSession.ts";
 
 /* ---------- framing ---------- */
 
@@ -345,21 +345,35 @@ test("a variable frame keeps its id, index and count", () => {
   assert.equal(variable?.editable, true);
 });
 
-test("a task's name is read from its counted slot, not straight after the address", () => {
-  // Measured STACKENUM task frame, 276 bytes: nItem, nAdr, nRetAdr, nVars,
-  // nEqual, nTotal, nTask, nRes[3], then a counted name — `0c 00 00 00` at 36
-  // and "Main Thread" at 40. Reading at 12 gave an empty string for a target
-  // with a real thread, which the caller then filtered away.
+test("a task frame's name is a counted string after its fields", () => {
+  // Measured, 276 bytes: nItem(4) nAdr(4) nRetAdr(4) nVars(4) len(4) text…
+  // `00 00 00 00 00 00 00 00 00 00 00 00 02 00 00 00 0c 00 00 00 "Main Thread"`.
+  // Reading at 12 (the fields) and at 40 (past the text) both produced an
+  // empty list for a target that does report a thread.
   const body = Buffer.alloc(276);
-  body.writeUInt32LE(2, 0);
-  body.writeBigUInt64LE(0n, 4);
-  body.writeBigUInt64LE(0n, 12);
-  body.writeUInt32LE(12, 36);
-  body.write("Main Thread\0", 40, "latin1");
+  body.writeUInt32LE(2, 12);
+  body.writeUInt32LE(12, 16);
+  body.write("Main Thread\0", 20, "latin1");
   const frame: AsyncFrame = { type: 0x5051, echoed: 0, data: body, raw: Buffer.alloc(0) };
   const task = readTaskFrames([frame])[0];
   assert.equal(task?.name, "Main Thread");
-  assert.equal(task?.id, 2);
+  assert.equal(task?.id, 0);
+});
+
+test("an Intel HEX image is read at its own addresses", () => {
+  // The chip comparison starts at the image's load address. Reading an `.axf`
+  // from byte zero starts at `7f 45 4c 46` — the ELF header, not the vector
+  // table — and reports a mismatch on a flash that is perfectly correct.
+  const lines = [
+    ":020000040800F2",
+    ":04000000" + "A8090020" + "D4",
+    ":00000001FF",
+  ];
+  const records = parseIntelHex(lines.join(String.fromCharCode(10)));
+  const data = records.filter((record) => record.bytes.length > 0);
+  assert.equal(data.length, 1);
+  assert.equal(data[0].address, 0x08000000, "the extended address record is applied");
+  assert.deepEqual(data[0].bytes, [0xa8, 0x09, 0x00, 0x20]);
 });
 
 test("the stack is reported innermost first", () => {

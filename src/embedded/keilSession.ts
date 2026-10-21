@@ -296,6 +296,12 @@ export async function enterDebug(
       }
       session.debugging = true;
       log.push(`entered ${target} debug mode`);
+      // What a hardware session logs varies with the adapter. Measured on this
+      // machine: an ST-Link session logs no adapter line at all, while a
+      // ULink/other adapter does ("… DLL loaded"). So a missing message is not
+      // evidence that no board answered, and it is **not** reported as one —
+      // the download path carries the real evidence, and a claim made on this
+      // guess would be a false alarm on a working setup.
       return { ok: true, log };
     }
     if (status.status === 6 /* NOT_DEBUGGING */ && Date.now() - started > 8_000 && frames.length === 0) {
@@ -689,19 +695,28 @@ export async function readMemory(session: KeilSession, address: number, bytes: n
   return decoded ? { bytes: decoded.bytes, ...(decoded.errorAddress !== undefined ? { errorAddress: decoded.errorAddress } : {}) } : null;
 }
 
-/** Write memory through the debugger, then read it back. */
+/**
+ * Write memory through the debugger, then read it back.
+ *
+ * The write is only reported as done when the read-back matches. A mismatch
+ * means the region refused the bytes (read-only, write-protected, or a
+ * register with masked bits), and calling that "wrote" is the failure mode
+ * this interface produces most often: `SUCCESS` with no effect.
+ */
 export async function writeMemory(session: KeilSession, address: number, bytes: number[]): Promise<{ ok: boolean; readBack: number[] | null; detail: string }> {
   const wrote = await session.client.send(OP.DBG_MEM_WRITE, memoryWrite(address, bytes), 12_000);
   if (!wrote.ok) return { ok: false, readBack: null, detail: wrote.message ?? wrote.statusName };
   const back = await readMemory(session, address, bytes.length);
   const readBack = back?.bytes ?? null;
-  const same = readBack !== null && readBack.every((byte, index) => byte === bytes[index]);
+  const same = readBack !== null && readBack.length >= bytes.length && bytes.every((byte, index) => readBack[index] === byte);
   return {
-    ok: true,
+    ok: same,
     readBack,
     detail: same
       ? `wrote ${bytes.length} byte(s) and read them back`
-      : `wrote ${bytes.length} byte(s) but the read-back differs — the region may be read-only or mask bits`,
+      : readBack === null
+        ? `wrote ${bytes.length} byte(s) but could not read them back; the write is unconfirmed`
+        : `wrote ${bytes.length} byte(s) but the read-back differs (${readBack.map((byte) => byte.toString(16).padStart(2, "0")).join(" ")}) — the region may be read-only or mask bits`,
   };
 }
 
@@ -962,15 +977,17 @@ function dedupe(lines: string[]): string[] {
  *
  * Measured constraint: this is a **project** operation, not a debugger one. In
  * a debug session `PRJ_FLASH_DOWNLOAD` answers "Target is in debug mode" and
- * nothing is written; it only runs on a connected, non-debugging uVision. The
- * caller is expected to pass the 4824 plain session; if it hands over a
- * debugging one the refusal is reported rather than swallowed.
+ * nothing is written; it only runs on a connected, non-debugging uVision.
  *
- * The reply comes back at once and the real outcome arrives on the stream —
- * `0x4000` with `Error: Flash Download failed …`, then `0x5001` when the
- * download has finished.
+ * The reply comes back at once and the real outcome arrives on the stream:
+ * progress frames on `0x4000`, `Flashed OK` when the debugger considers the
+ * download done, then `0x5001` carrying `Flash Load finished at HH:MM:SS`.
+ *
+ * **`0x5001` alone is not the verdict.** It is the same frame a failed
+ * download ends with, so the text frames are read for a failure before the
+ * finish is accepted — and `verifyFlash` cross-checks the chip.
  */
-export async function flashInIde(session: KeilSession, timeoutMs = 5 * 60_000): Promise<{ ok: boolean; lines: string[] }> {
+export async function flashInIde(session: KeilSession, timeoutMs = 5 * 60_000): Promise<{ ok: boolean; lines: string[]; verified?: boolean }> {
   if (session.debugging) {
     return {
       ok: false,
@@ -983,16 +1000,97 @@ export async function flashInIde(session: KeilSession, timeoutMs = 5 * 60_000): 
   const mark = session.client.mark;
   const reply = await session.client.send(OP.PRJ_FLASH_DOWNLOAD, Buffer.alloc(0), 20_000);
   if (!reply.ok) return { ok: false, lines: [reply.message ?? reply.statusName] };
+  const text = () => dedupe(session.client.since(mark).map((frame) => asyncText(frame) || commandWindowText(frame)).filter(Boolean));
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     await new Promise((resolve) => setTimeout(resolve, 400));
     const frames = session.client.since(mark);
-    const failed = frames.map((frame) => asyncText(frame) || commandWindowText(frame)).find((text) => /flash download failed|error \d+:/i.test(text));
+    const failed = frames
+      .map((frame) => asyncText(frame) || commandWindowText(frame))
+      .find((line) => /flash download failed|error \d+:|cannot access target|target dll has been cancelled/i.test(line));
+    if (failed) return { ok: false, lines: text() };
     const finished = frames.find((frame) => frame.type === 0x5001);
-    if (failed) return { ok: false, lines: dedupe(frames.map((frame) => asyncText(frame) || commandWindowText(frame)).filter(Boolean)) };
-    if (finished) return { ok: true, lines: dedupe(frames.map((frame) => asyncText(frame) || commandWindowText(frame)).filter(Boolean)) };
+    if (finished) {
+      // The finish frame carries the same "Flash Load finished at …" line a
+      // successful run does; the difference is whether a failure line came
+      // first, which was checked above.
+      const reported = (asyncText(finished) || finished.data.subarray(8).toString("latin1").replace(/\0.*$/s, "")).trim();
+      return { ok: true, lines: [...text(), ...(reported ? [reported] : [])] };
+    }
   }
-  return { ok: false, lines: dedupe(session.client.since(mark).map((frame) => asyncText(frame) || commandWindowText(frame)).filter(Boolean)) };
+  return { ok: false, lines: text() };
+}
+
+/**
+ * Read the image back from flash and compare it with the file that was built.
+ *
+ * The downloader reporting `Verify OK` is the debugger's claim; this is the
+ * chip's. Measured on this bench: after a download the first 16 bytes at the
+ * image's load address match the `.hex` record byte for byte, which is what
+ * turns "the log said OK" into "the flash holds this image".
+ *
+ * The comparison starts at the image's own start address (from the `.hex`
+ * record), not at byte zero of the file — an `.axf` is an ELF and its first
+ * bytes are `7f 45 4c 46`, not the vector table.
+ */
+export async function verifyFlash(session: KeilSession, hexPath: string, bytes = 64): Promise<{ ok: boolean; detail: string; expected?: string; got?: string }> {
+  let records: { address: number; bytes: number[] }[] = [];
+  try {
+    records = parseIntelHex(readFileSync(hexPath, "latin1"));
+  } catch {
+    return { ok: false, detail: `could not read ${hexPath} to compare against flash` };
+  }
+  if (records.length === 0) return { ok: false, detail: `${hexPath} has no data records` };
+  const image = new Map<number, number>();
+  for (const record of records) record.bytes.forEach((byte, index) => image.set(record.address + index, byte));
+  // Compare a contiguous run from the lowest address; the image is laid out
+  // from there and a gap would be its own answer.
+  const all = [...image.keys()].sort((a, b) => a - b);
+  const start = all[0];
+  const addresses: number[] = [];
+  for (let offset = 0; offset < Math.min(bytes, all.length); offset++) {
+    if (!image.has(start + offset)) break;
+    addresses.push(start + offset);
+  }
+  const memory = await readMemory(session, addresses[0], addresses[addresses.length - 1] - addresses[0] + 1);
+  if (!memory) return { ok: false, detail: `the debugger could not read flash at 0x${addresses[0].toString(16)}` };
+  const got = memory.bytes;
+  const mismatched = addresses.findIndex((address, index) => got[index] !== image.get(address));
+  const expectedText = addresses.map((address) => image.get(address)!.toString(16).padStart(2, "0")).join(" ");
+  const gotText = addresses.map((_, index) => (got[index] ?? -1).toString(16).padStart(2, "0")).join(" ");
+  if (mismatched >= 0) {
+    return {
+      ok: false,
+      detail: `flash differs from ${hexPath} at 0x${addresses[mismatched].toString(16)} (byte ${mismatched + 1} of ${addresses.length})`,
+      expected: expectedText,
+      got: gotText,
+    };
+  }
+  return {
+    ok: true,
+    detail: `flash at 0x${addresses[0].toString(16)} matches ${hexPath} for ${addresses.length} byte(s)`,
+    expected: expectedText,
+    got: gotText,
+  };
+}
+
+/** Intel HEX records that carry data, with their load addresses. */
+export function parseIntelHex(text: string): { address: number; bytes: number[] }[] {
+  const records: { address: number; bytes: number[] }[] = [];
+  let upper = 0;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line.startsWith(":") || line.length < 11) continue;
+    const count = parseInt(line.slice(1, 3), 16);
+    const address = parseInt(line.slice(3, 7), 16);
+    const type = parseInt(line.slice(7, 9), 16);
+    const data: number[] = [];
+    for (let index = 0; index < count; index++) data.push(parseInt(line.slice(9 + index * 2, 11 + index * 2), 16));
+    if (type === 0) records.push({ address: upper + address, bytes: data });
+    else if (type === 4) upper = parseInt(line.slice(9, 13), 16) << 16;
+    else if (type === 2) upper = parseInt(line.slice(9, 13), 16) << 4;
+  }
+  return records;
 }
 
 
@@ -1118,7 +1216,7 @@ export async function setVariableById(session: KeilSession, variable: Variable, 
  * list of empty strings, which the caller then filtered away, so a target with
  * a real thread reported "no tasks".
  */
-export async function readTasks(session: KeilSession): Promise<{ id: number; name: string; address: number }[]> {
+export async function readTasks(session: KeilSession): Promise<{ id: number; name: string }[]> {
   const mark = session.client.mark;
   // `iSTKENUM::bExtended`, which is what asks for the task fields.
   const request = Buffer.alloc(40);
@@ -1129,22 +1227,33 @@ export async function readTasks(session: KeilSession): Promise<{ id: number; nam
 }
 
 /** Decode task frames (`0x5051`), which are `STACKENUM` plus the task name. */
-export function readTaskFrames(frames: AsyncFrame[]): { id: number; name: string; address: number }[] {
+/**
+ * Decode task frames (`0x5051`).
+ *
+ * Measured on MDK 5.43a, a 276-byte frame:
+ *
+ *   nItem(4)=0  nAdr(4)=0  nRetAdr(4)=0  nVars(4)=2  len(4)=12  "Main Thread\0"
+ *
+ * so the name is a counted string at 16 and its text at 20. Two earlier
+ * readings were wrong in different ways — at 12 (the fields) and at 40 (past
+ * the text) — and both produced an empty list for a target that does report a
+ * thread, which then read as "this board has no RTOS tasks".
+ */
+export function readTaskFrames(frames: AsyncFrame[]): { id: number; name: string }[] {
   return frames
     .filter((frame) => frame.type === 0x5051 && frame.data.length >= 20)
     .map((frame) => {
-      const id = frame.data.readUInt32LE(0);
-      const address = frame.data.length >= 12 ? Number(frame.data.readBigUInt64LE(4)) : 0;
-      // Measured, 276 bytes: `nItem(4) nAdr(8) nRetAdr(8) nVars(4) nEqual(4)
-      // nTotal(4) nTask(4) nRes[3](12)` then the text — `0c 00 00 00` (length
-      // 12) at 36 and "Main Thread" at 40. The name is not at 44; reading
-      // there returned an empty string for a target with a real thread.
-      const length = frame.data.length >= 40 ? frame.data.readUInt32LE(36) : 0;
+      const data = frame.data;
+      // This build leaves the address words zero for the main thread; the
+      // name and the variable count are what it fills. Reporting 0 as an
+      // address would be inventing one.
+      const id = data.readUInt32LE(0);
+      const length = data.readUInt32LE(16);
       const name =
         length > 0 && length < 256
-          ? frame.data.subarray(40, Math.min(40 + length, frame.data.length)).toString("latin1").replace(/\0.*$/s, "")
+          ? data.subarray(20, Math.min(20 + length, data.length)).toString("latin1").replace(/\0.*$/s, "")
           : "";
-      return { id, name, address };
+      return { id, name };
     })
     .filter((task) => task.name);
 }

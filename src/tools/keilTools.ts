@@ -22,8 +22,9 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { basename, extname, join } from "node:path";
 import type { Tool, ToolResult } from "../types.ts";
-import { detectProject } from "../embedded/project.ts";
+import { detectProject, keilOutputDirs } from "../embedded/project.ts";
 import {
   addAccessBreakpoint,
   addBreakpoint,
@@ -36,6 +37,7 @@ import {
   cancelBuild,
   changeBreakpoint,
   closeKeilSession,
+  verifyFlash,
   currentLocation,
   currentTarget,
   eraseFlash,
@@ -438,6 +440,7 @@ const keilDebugTool: Tool = {
         const outcome = await writeMemory(session, address, bytes);
         lines.push(outcome.detail);
         if (outcome.readBack) lines.push(`read back: ${outcome.readBack.map((byte) => byte.toString(16).padStart(2, "0")).join(" ")}`);
+        if (!outcome.ok) return { isError: true, content: lines.join("\n"), display: "write not confirmed" };
       } else if (action === "evaluate") {
         const expression = input.expression ? String(input.expression) : "";
         if (!expression) return { isError: true, content: "evaluate needs an `expression`.", display: "missing expression" };
@@ -530,7 +533,11 @@ const keilDebugTool: Tool = {
         lines.push(reply.ok ? `trace variable ${name} enabled` : `could not enable it: ${reply.message ?? reply.statusName}`);
       } else if (action === "tasks") {
         const tasks = await readTasks(session);
-        lines.push(tasks.length ? tasks.map((task) => `#${task.id} ${task.name} @ ${hex(task.address)}`).join("\n") : "no RTOS tasks reported (bare-metal target, or no awareness plugin)");
+        lines.push(
+          tasks.length
+            ? tasks.map((task) => `#${task.id} ${task.name}`).join("\n")
+            : "the debugger reported no tasks. On a bare-metal image that is the honest answer; with an RTOS it means the awareness plugin is not enabled for this target.",
+        );
       } else if (action === "trace") {
         const items = await readVtr(session);
         lines.push(items.length ? items.map((item) => item.name).join(", ") : "no trace variables reported");
@@ -570,7 +577,31 @@ const keilDebugTool: Tool = {
         const flashed = await flashInIde(session);
         lines.push(...flashed.lines.slice(-30));
         if (!flashed.ok) lines.push("the download did not finish cleanly");
-        else lines.push("downloaded to flash");
+        else {
+          lines.push("downloaded to flash");
+          // The downloader says "Verify OK"; this is the chip's own answer.
+          // The 4824 session is not a debug session, so the comparison needs
+          // the debugger — a second session on the debug port, read-only.
+          const hexName = `${basename(session.project, extname(session.project))}.hex`;
+          const hex = keilOutputDirs(session.project, ctx.cwd)
+            .map((dir) => join(dir, hexName))
+            .find((path) => existsSync(path));
+          if (hex) {
+            const check = await openKeilSession({ cwd: ctx.cwd, project: session.project, target: "hardware", port: 4823, timeoutMs: 40_000 });
+            if (check.ok && check.session) {
+              const compared = await verifyFlash(check.session, hex);
+              lines.push(`flash check: ${compared.detail}`);
+              if (!compared.ok && compared.expected && compared.got) {
+                lines.push(`  image: ${compared.expected}`, `  chip:  ${compared.got}`);
+              }
+              await closeKeilSession(check.key!);
+            } else {
+              lines.push(`flash check: skipped — the debugger could not be opened to read the chip back (${check.reason ?? "no session"})`);
+            }
+          } else {
+            lines.push("flash check: skipped — the build produced no .hex to compare against");
+          }
+        }
       } else if (action === "erase") {
         const erased = await eraseFlash(session);
         lines.push(erased.ok ? "flash erase accepted by the configured algorithm" : `erase failed: ${erased.message ?? erased.statusName}`);
